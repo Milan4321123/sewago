@@ -14,8 +14,13 @@ const state = {
   transactions: [],
   showRestForm: false,
   showHotelForm: false,
-  showWithdraw: false
+  showWithdraw: false,
+  showPhoneEdit: false // re-open the OTP form to change a verified phone
 };
+
+// Remembers which KYC decision the partner has already dismissed, so the
+// "approved/rejected" banner survives reloads until they acknowledge it.
+const KYC_ACK_KEY = 'sewago_partner_kyc_ack';
 
 const REST_ICONS = ['🍽️', '🥟', '🍛', '🍕', '🍔', '🍚', '🍜', '🥘', '🍗', '🍮'];
 const HOTEL_ICONS = ['🏨', '🏡', '🏙️', '🌅', '⛰️', '🐘', '🏰', '🛖'];
@@ -82,8 +87,25 @@ let eventSource = null;
 function connectEvents() {
   if (eventSource || !state.token || typeof EventSource === 'undefined') return;
   eventSource = new EventSource(`/api/events?role=partner&token=${encodeURIComponent(state.token)}`);
-  eventSource.onmessage = async () => {
-    await reloadOrders();
+  eventSource.onmessage = async (e) => {
+    let msg = {};
+    try { msg = JSON.parse(e.data); } catch (err) { /* bare nudge */ }
+    if (msg.topic === 'kyc') {
+      // The SewaGo team just reviewed our KYC — refetch and announce the outcome.
+      const prev = state.partner && state.partner.businessKycStatus;
+      await reload().catch(() => {});
+      const status = state.partner && state.partner.businessKycStatus;
+      if (status !== prev) {
+        if (status === 'approved') toast('🎉 Your business KYC was approved — you can now list and withdraw!');
+        else if (status === 'rejected') toast('Your business KYC was rejected — see the note in the KYC card.', true);
+      }
+    } else if (msg.topic === 'wallet') {
+      await reload().catch(() => {});
+      if (msg.event === 'withdrawal_paid') toast('🏦 Your payout was approved and sent.');
+      if (msg.event === 'withdrawal_rejected') toast('Your payout was rejected — the amount is back in your earnings.', true);
+    } else {
+      await reloadOrders();
+    }
     render();
   };
   eventSource.onerror = () => { /* EventSource retries on its own */ };
@@ -412,6 +434,7 @@ function render() {
       <div class="muted small" style="margin-bottom:14px">
         New listings go to the <b style="color:var(--text)">SewaGo review team</b> first (we verify your documents and may call you). Once approved they appear in the customer app — restaurants in <b style="color:var(--text)">Food</b>, hotels in <b style="color:var(--text)">Stays</b>.
       </div>
+      ${kycNotice()}
       ${kycCard()}
       ${ordersSection()}
       ${earningsCard()}
@@ -476,9 +499,61 @@ function partnerReady() {
   return !!p && !!p.phoneVerified && p.businessKycStatus === 'approved';
 }
 
+// One-time banner announcing the KYC decision. Shows until the partner
+// dismisses it (acknowledgement is remembered per partner + status).
+function kycNotice() {
+  const p = state.partner;
+  const status = p.businessKycStatus || 'pending';
+  if (status !== 'approved' && status !== 'rejected') return '';
+  if (localStorage.getItem(KYC_ACK_KEY) === `${p.id}:${status}`) return '';
+  if (status === 'approved') {
+    return `
+    <div class="card" style="border-color:var(--accent)">
+      <div class="row">
+        <div>
+          <div style="font-weight:900">🎉 Business KYC approved!</div>
+          <div class="muted small">Your documents were verified — you can now add restaurants and hotels, and withdraw earnings.</div>
+        </div>
+        <button class="btn ghost compact" onclick="ackKycNotice()">Got it</button>
+      </div>
+    </div>`;
+  }
+  return `
+  <div class="card" style="border-color:var(--danger)">
+    <div class="row">
+      <div>
+        <div style="font-weight:900">❌ Business KYC rejected</div>
+        <div class="muted small">${p.businessKycNote ? esc(p.businessKycNote) : 'Fix your details in the KYC card below and resubmit.'}</div>
+      </div>
+      <button class="btn ghost compact" onclick="ackKycNotice()">Got it</button>
+    </div>
+  </div>`;
+}
+
+window.ackKycNotice = () => {
+  localStorage.setItem(KYC_ACK_KEY, `${state.partner.id}:${state.partner.businessKycStatus || 'pending'}`);
+  render();
+};
+
 function kycCard() {
   const p = state.partner;
   const status = p.businessKycStatus || 'pending';
+  const showPhoneForm = !p.phoneVerified || state.showPhoneEdit;
+  // Fully verified: everything is done, so hide the forms — resubmitting KYC
+  // would put the account back into review and lock listings.
+  if (!showPhoneForm && status === 'approved') {
+    return `
+  <div class="card">
+    <div class="row">
+      <div>
+        <div style="font-weight:900">Business KYC</div>
+        <div class="muted small">📱 ${esc(p.phone)} — verified · ${esc(p.regNo || '')} approved. You're all set.</div>
+      </div>
+      <span class="badge">APPROVED</span>
+    </div>
+    <button class="btn ghost compact" style="margin-top:12px" onclick="togglePhoneEdit(true)">Change phone number</button>
+  </div>`;
+  }
   return `
   <div class="card">
     <div class="row">
@@ -493,6 +568,7 @@ function kycCard() {
       <span class="badge ${status === 'approved' ? '' : 'amber'}">BUSINESS ${esc(status.toUpperCase())}</span>
     </div>
     ${p.businessKycNote ? `<div class="muted small" style="color:var(--danger);margin-top:8px">${esc(p.businessKycNote)}</div>` : ''}
+    ${showPhoneForm ? `
     <label class="field" style="margin-top:12px"><span>Phone</span>
       <input id="partner-phone" value="${esc(p.phone || '')}" placeholder="e.g. 9841000000" />
     </label>
@@ -501,6 +577,9 @@ function kycCard() {
       <label class="field"><span>OTP code</span><input id="partner-otp" placeholder="123456" /></label>
     </div>
     <button class="btn" onclick="partnerVerifyOtp()">Verify phone</button>
+    ${state.showPhoneEdit ? `<button class="btn ghost" style="margin-top:8px" onclick="togglePhoneEdit(false)">Cancel</button>` : ''}` : `
+    <div class="muted small" style="margin-top:12px">📱 ${esc(p.phone)} — verified. <button class="link" onclick="togglePhoneEdit(true)">Change</button></div>`}
+    ${status !== 'approved' ? `
     <div class="divider"></div>
     <label class="field"><span>Legal business name</span>
       <input id="kyc-name" value="${esc(p.name || '')}" placeholder="Registered business name" />
@@ -511,9 +590,14 @@ function kycCard() {
     <label class="field"><span>Document reference / upload link</span>
       <input id="kyc-doc" value="${esc(p.businessKycDocumentRef || '')}" placeholder="Certificate file ID or secure link" />
     </label>
-    <button class="btn" onclick="submitPartnerKyc()">Submit KYC for review</button>
+    <button class="btn" onclick="submitPartnerKyc()">${status === 'rejected' ? 'Fix & resubmit KYC' : 'Submit KYC for review'}</button>` : ''}
   </div>`;
 }
+
+window.togglePhoneEdit = (show) => {
+  state.showPhoneEdit = show;
+  render();
+};
 
 function earningsCard() {
   const p = state.partner;
@@ -529,8 +613,10 @@ function earningsCard() {
     <div class="muted small" style="margin-top:6px">
       You receive <b style="color:var(--text)">85%</b> of food subtotals and <b style="color:var(--text)">90%</b> of bookings, credited instantly (reversed on cancellations).
     </div>
-    <button class="btn ghost" style="margin-top:12px" onclick="toggleWithdraw()">🏦 Withdraw earnings</button>
-    ${state.showWithdraw ? `
+    ${partnerReady() ? `
+    <button class="btn ${state.showWithdraw ? '' : 'ghost'}" aria-pressed="${!!state.showWithdraw}" style="margin-top:12px" onclick="toggleWithdraw()">🏦 Withdraw earnings</button>`
+    : `<div class="muted small" style="margin-top:12px">🔒 Withdrawals unlock once your phone is verified and business KYC is approved.</div>`}
+    ${state.showWithdraw && partnerReady() ? `
     <div class="divider"></div>
     <div class="grid2">
       <label class="field"><span>Amount (Rs)</span><input id="pw-amount" type="number" placeholder="1000" min="100" /></label>
@@ -577,6 +663,7 @@ window.partnerVerifyOtp = async () => {
       body: { code: $('#partner-otp').value.trim() }
     });
     state.partner = data.partner;
+    state.showPhoneEdit = false;
     toast('Phone verified.');
     render();
   } catch (e) {

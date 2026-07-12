@@ -40,6 +40,7 @@ const state = {
   txns: [],
   payUi: null,
   payment: null,
+  showPhoneEdit: false, // profile: re-open the OTP form to change a verified phone
   // tasks
   tasksBoard: [],
   myTasks: { posted: [], working: [] },
@@ -207,7 +208,7 @@ function authView() {
       <label class="field"><span>Password</span>
         <input id="auth-password" type="password" placeholder="At least 6 characters" />
       </label>
-      <button class="btn" onclick="submitAuth()">${isLogin ? 'Log in' : 'Create account — get Rs 5,000 free credit'}</button>
+      <button class="btn" onclick="submitAuth()">${isLogin ? 'Log in' : 'Create account'}</button>
       ${isLogin ? `<button class="btn ghost" style="margin-top:8px" onclick="setAuthMode('otp')">Log in with phone OTP</button>` : ''}
       <div style="text-align:center;margin-top:14px">
         <button class="link" onclick="toggleAuthMode()">
@@ -1594,6 +1595,21 @@ function txnSection() {
 
 function securityCard() {
   const u = state.user;
+  // Verified accounts don't need the OTP form — just the badge and a way to
+  // change the number (which restarts verification).
+  if (u.phoneVerified && !state.showPhoneEdit) {
+    return `
+  <div class="card">
+    <div class="row">
+      <div>
+        <div style="font-weight:900">Account security</div>
+        <div class="muted small">📱 ${esc(u.phone)} — verified. This protects payouts, rides and account recovery.</div>
+      </div>
+      <span class="badge">PHONE VERIFIED</span>
+    </div>
+    <button class="btn ghost compact" style="margin-top:12px" onclick="togglePhoneEdit(true)">Change phone number</button>
+  </div>`;
+  }
   return `
   <div class="card">
     <div class="row">
@@ -1611,8 +1627,14 @@ function securityCard() {
       <label class="field"><span>OTP code</span><input id="sec-otp" placeholder="123456" /></label>
     </div>
     <button class="btn" onclick="verifyUserOtp()">Verify phone</button>
+    ${state.showPhoneEdit ? `<button class="btn ghost" style="margin-top:8px" onclick="togglePhoneEdit(false)">Cancel</button>` : ''}
   </div>`;
 }
+
+window.togglePhoneEdit = (show) => {
+  state.showPhoneEdit = show;
+  render();
+};
 
 function profileView() {
   const u = state.user;
@@ -1631,8 +1653,10 @@ function profileView() {
       <span style="font-size:30px">👛</span>
     </div>
     <div class="grid2" style="margin-top:14px">
-      <button class="btn" onclick="openPay('topup')">➕ Add money</button>
-      <button class="btn ghost" onclick="openPay('withdraw')">🏦 Withdraw</button>
+      <button class="btn ${state.payUi === 'topup' || state.payUi === 'topup-confirm' ? '' : 'ghost'}"
+        aria-pressed="${state.payUi === 'topup' || state.payUi === 'topup-confirm'}" onclick="openPay('topup')">➕ Add money</button>
+      <button class="btn ${state.payUi === 'withdraw' ? '' : 'ghost'}"
+        aria-pressed="${state.payUi === 'withdraw'}" onclick="openPay('withdraw')">🏦 Withdraw</button>
     </div>
   </div>
   ${securityCard()}
@@ -1721,6 +1745,7 @@ window.verifyUserOtp = async () => {
       body: { code: $('#sec-otp').value.trim() }
     });
     setUser(data.user);
+    state.showPhoneEdit = false;
     toast('Phone verified.');
     render();
   } catch (e) {
@@ -1860,6 +1885,15 @@ function connectEvents() {
     if (msg.topic === 'ride') syncActiveRideUI().catch(() => {});
     if (msg.topic === 'order' && state.tab === 'food') {
       api('/api/orders').then((o) => { state.orders = o.orders; render(); }).catch(() => {});
+    }
+    if (msg.topic === 'wallet') {
+      // A withdrawal was decided — refetch balance + ledger, then tell the user.
+      Promise.all([api('/api/auth/me'), loadTxns()]).then(([me]) => {
+        setUser(me.user);
+        render();
+      }).catch(() => {});
+      if (msg.event === 'withdrawal_paid') toast('🏦 Your withdrawal was approved and paid out.');
+      if (msg.event === 'withdrawal_rejected') toast('Your withdrawal was rejected — the amount is back in your wallet.', true);
     }
   };
   // EventSource reconnects on its own; nothing to do on error.

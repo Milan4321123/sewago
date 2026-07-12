@@ -47,6 +47,15 @@ async function wallet(token) {
   return data.user.wallet;
 }
 
+// Withdrawals are only sent from phone-verified accounts.
+async function verifyPhone(token) {
+  const phone = `+9779${String(Date.now()).slice(-6)}${String(Math.floor(Math.random() * 1000)).padStart(3, '0')}`;
+  const otp = await api('/auth/phone/request-otp', { method: 'POST', token, body: { phone } });
+  assert.equal(otp.status, 200, JSON.stringify(otp.data));
+  const verified = await api('/auth/phone/verify', { method: 'POST', token, body: { code: otp.data.devCode } });
+  assert.equal(verified.status, 200, JSON.stringify(verified.data));
+}
+
 before(async () => {
   dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sewago-test-'));
   server = spawn(process.execPath, [path.join(__dirname, '..', 'server', 'index.js')], {
@@ -165,8 +174,21 @@ test('task beyond the wallet balance is refused', async () => {
   assert.equal(await wallet(token), 5000);
 });
 
+test('withdrawal requires a verified phone', async () => {
+  const { token } = await registerUser('unverified-withdrawer');
+  const wd = await api('/payments/withdraw', {
+    method: 'POST',
+    token,
+    body: { amount: 1000, channel: 'esewa', account: '9841000000' }
+  });
+  assert.equal(wd.status, 400);
+  assert.match(wd.data.error, /verify/i);
+  assert.equal(await wallet(token), 5000);
+});
+
 test('withdrawal charges amount plus fee; admin rejection refunds both', async () => {
   const { token } = await registerUser('withdrawer');
+  await verifyPhone(token);
   const wd = await api('/payments/withdraw', {
     method: 'POST',
     token,
@@ -194,6 +216,7 @@ test('withdrawal charges amount plus fee; admin rejection refunds both', async (
 
 test('withdrawal larger than the balance is refused', async () => {
   const { token } = await registerUser('overdrawer');
+  await verifyPhone(token);
   const wd = await api('/payments/withdraw', {
     method: 'POST',
     token,
@@ -201,6 +224,26 @@ test('withdrawal larger than the balance is refused', async () => {
   });
   assert.equal(wd.status, 400);
   assert.equal(await wallet(token), 5000);
+});
+
+test('withdrawal requests are capped per day', async () => {
+  const { token } = await registerUser('serial-withdrawer');
+  await verifyPhone(token);
+  for (let i = 0; i < 5; i += 1) {
+    const wd = await api('/payments/withdraw', {
+      method: 'POST',
+      token,
+      body: { amount: 100, channel: 'esewa', account: '9841000002' }
+    });
+    assert.equal(wd.status, 200, JSON.stringify(wd.data));
+  }
+  const sixth = await api('/payments/withdraw', {
+    method: 'POST',
+    token,
+    body: { amount: 100, channel: 'esewa', account: '9841000002' }
+  });
+  assert.equal(sixth.status, 400);
+  assert.match(sixth.data.error, /limit/i);
 });
 
 test('account deletion is blocked while money is in escrow, allowed after', async () => {
@@ -419,6 +462,19 @@ test('live food order: restaurant confirms, courier delivers, everyone is paid',
 
   const take = await api(`/driver/deliveries/${order.id}/accept`, { method: 'POST', token: courierToken });
   assert.equal(take.status, 200, JSON.stringify(take.data));
+
+  // A courier mid-delivery cannot delete their account (even after going
+  // offline) — the order would be stranded.
+  await api('/driver/online', { method: 'POST', token: courierToken, body: { online: false } });
+  const strandedDelete = await api('/driver/account/delete', {
+    method: 'POST',
+    token: courierToken,
+    body: { password: 'driver-secret' }
+  });
+  assert.equal(strandedDelete.status, 400);
+  assert.match(strandedDelete.data.error, /delivery/i, 'deletion must be blocked by the active delivery');
+  await api('/driver/online', { method: 'POST', token: courierToken, body: { online: true } });
+
   const pickup = await api(`/driver/deliveries/${order.id}/pickup`, { method: 'POST', token: courierToken });
   assert.equal(pickup.status, 200, JSON.stringify(pickup.data));
   assert.equal(pickup.data.delivery.status, 'out_for_delivery');

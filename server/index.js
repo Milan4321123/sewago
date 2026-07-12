@@ -119,6 +119,18 @@ app.use(
     '/api/admin/login'],
   authLimiter
 );
+// Money movement and phone-verification endpoints get their own strict budget:
+// legitimate users touch these a handful of times a day, so a tight cap costs
+// them nothing while blunting brute-force OTP guessing and drain-the-wallet loops.
+const moneyLimiter = makeLimiter(10 * 60 * 1000, 40);
+app.use(
+  ['/api/payments/withdraw', '/api/payments/topup/initiate', '/api/payments/topup/confirm',
+    '/api/partner/withdraw', '/api/driver/withdraw',
+    '/api/auth/phone/request-otp', '/api/auth/phone/verify',
+    '/api/partner/phone/request-otp', '/api/partner/phone/verify',
+    '/api/driver/phone/request-otp', '/api/driver/phone/verify'],
+  moneyLimiter
+);
 
 // Tells the download page whether a real native app is available to install.
 app.get('/api/app-info', (req, res) => {

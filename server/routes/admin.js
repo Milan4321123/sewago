@@ -5,8 +5,15 @@ const sessionTokens = require('../sessionTokens');
 const metrics = require('../metrics');
 const { payoutFor, withStatus, driverIsAvailable, driverHasFreshLocation, driverLocation } = require('../rideLogic');
 const { recordTxn, recordPlatformRevenue, platformRevenueTotals, WITHDRAW_CHANNELS } = require('../payments');
+const events = require('../events');
+const { logAudit } = require('../audit');
 
 const router = express.Router();
+
+// Actor identity for the audit trail (single staff account for now).
+function adminActor() {
+  return { role: 'admin', id: 'admin', email: ADMIN_EMAIL };
+}
 
 // Platform staff credentials come from the environment in production.
 const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || 'admin@sewago.app').toLowerCase();
@@ -273,6 +280,20 @@ router.post('/admin/withdrawals/:id/:action(approve|reject)', authAdmin, (req, r
     });
   }
   save();
+  logAudit({
+    actor: adminActor(),
+    action: `withdrawal_${req.params.action}`,
+    targetType: 'withdrawal',
+    targetId: withdrawal.id,
+    meta: { ownerKind: withdrawal.ownerKind, ownerId: withdrawal.ownerId, amount: withdrawal.amount, channel: withdrawal.channel },
+    ip: req.ip
+  });
+  // Nudge the owner's app so the decision shows up instantly (topic only — the
+  // client refetches its own data; no amounts ride the stream).
+  events.publish(`${withdrawal.ownerKind}:${withdrawal.ownerId}`, {
+    topic: 'wallet',
+    event: req.params.action === 'approve' ? 'withdrawal_paid' : 'withdrawal_rejected'
+  });
   res.json({ withdrawal });
 });
 
@@ -323,6 +344,16 @@ router.post('/admin/partners/:id/kyc/:action(approve|reject)', authAdmin, (req, 
   }
   partner.businessKyc.reviewedAt = Date.now();
   save();
+  logAudit({
+    actor: adminActor(),
+    action: `partner_kyc_${req.params.action}`,
+    targetType: 'partner',
+    targetId: partner.id,
+    meta: { regNo: partner.regNo || '' },
+    ip: req.ip
+  });
+  // Tell the partner portal the review landed; it refetches and notifies.
+  events.publish(`partner:${partner.id}`, { topic: 'kyc' });
   res.json({ partner });
 });
 

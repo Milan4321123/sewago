@@ -4,6 +4,7 @@ const { db, uid } = require('./db');
 // so swapping in eSewa/Khalti/Stripe SDKs later only touches this file.
 const SANDBOX_PIN = process.env.PAYMENT_SANDBOX_PIN || '1234';
 const WITHDRAW_FEE = 10; // flat fee per withdrawal (platform revenue)
+const MAX_WITHDRAWALS_PER_DAY = 5; // caps how fast a hijacked account can be drained
 const TOPUP_METHODS = { esewa: 'eSewa', khalti: 'Khalti', card: 'Debit / credit card' };
 const WITHDRAW_CHANNELS = { esewa: 'eSewa', khalti: 'Khalti', bank: 'Bank transfer' };
 
@@ -59,7 +60,19 @@ function platformRevenueTotals() {
 }
 
 // Deducts immediately; the payout stays "processing" until admin approves it.
+// Payouts move money out of the platform, so they carry extra guards: the
+// account must be phone-verified and can only request a few per day.
 function createWithdrawal(kind, entity, { amount, channel, account }) {
+  if (!entity.phoneVerified) {
+    return { error: 'Verify your phone number first — payouts are only sent from phone-verified accounts.' };
+  }
+  const dayAgo = Date.now() - 24 * 60 * 60 * 1000;
+  const recent = db.withdrawals.filter(
+    (w) => w.ownerKind === kind && w.ownerId === entity.id && w.createdAt > dayAgo
+  );
+  if (recent.length >= MAX_WITHDRAWALS_PER_DAY) {
+    return { error: `Withdrawal limit reached (${MAX_WITHDRAWALS_PER_DAY} per day) — please try again tomorrow.` };
+  }
   const amt = Math.round(Number(amount));
   if (!(amt >= 100 && amt <= 200000)) return { error: 'Withdrawal must be between Rs 100 and Rs 200,000.' };
   if (!WITHDRAW_CHANNELS[channel]) return { error: 'Pick a valid payout channel.' };

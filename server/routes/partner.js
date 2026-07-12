@@ -254,6 +254,10 @@ router.post('/partner/kyc', authPartner, (req, res) => {
 });
 
 router.post('/partner/withdraw', authPartner, (req, res) => {
+  // Earnings only ever leave the platform through KYC-approved businesses.
+  if (req.partner.businessKycStatus !== 'approved') {
+    return res.status(403).json({ error: 'Business KYC must be approved before earnings can be withdrawn.' });
+  }
   const result = createWithdrawal('partner', req.partner, req.body || {});
   if (result.error) return res.status(400).json({ error: result.error });
   save();
