@@ -1,0 +1,25 @@
+{
+  "name": "sewago",
+  "version": "0.1.0",
+  "private": true,
+  "description": "SewaGo — rides, food delivery and hotel booking in one app",
+  "main": "server/index.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server/index.js",
+    "test": "node --test test/",
+    "demo:seed": "node scripts/seed-demo.js",
+    "supabase:push": "node scripts/supabase-push.js",
+    "supabase:pull": "node scripts/supabase-pull.js",
+    "verify": "node --check server/index.js && node --check server/db.js && node --check server/logger.js && node --check server/payments.js && node --check server/fees.js && node --check server/orderLogic.js && node --check server/email.js && node --check server/accountDeletion.js && node --check server/accountSecurity.js && node --check server/sessionTokens.js && node --check server/routes/payments.js && node --check server/gateways/khalti.js && node --check server/gateways/esewa.js && node --check server/storage/supabaseStateStore.js && node --check server/storage/rowSync.js && node --check server/storage/supabaseRowStore.js && node --check public/app.js && node --check public/driver.js && node --check public/partner.js && node --check public/admin.js && node --check public/pwa.js && node --check public/sw.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.109.0",
+    "compression": "^1.8.1",
+    "dotenv": "^17.4.2",
+    "express": "^4.19.2",
+    "ws": "^8.21.0"
+  }
+}

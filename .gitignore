@@ -1,0 +1,8 @@
+node_modules/
+data/
+*.log
+.env
+mobile/node_modules/
+mobile/.expo/
+supabase/.temp/
+.DS_Store

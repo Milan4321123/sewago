@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#0b0d12" />
+  <title>Install SewaGo</title>
+  <link rel="manifest" href="/manifest.webmanifest" />
+  <link rel="icon" href="/icon.svg" />
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="app" class="phone">
+    <main>
+      <div class="auth-hero" style="margin-top:20px">
+        <img src="/icon-192.png" alt="" width="76" height="76" style="border-radius:22px" />
+        <h1>Sewa<em>Go</em></h1>
+        <p>Install the app on this phone, then choose your workspace.</p>
+      </div>
+
+      <!-- Real native app download (shown when an APK / store build is available). -->
+      <div id="native-card" class="card hidden">
+        <div style="font-weight:900;margin-bottom:8px">Get the app</div>
+        <a id="native-btn" class="btn" href="#">Download the SewaGo app</a>
+        <div id="native-note" class="muted small" style="margin-top:10px;text-align:center"></div>
+      </div>
+
+      <!-- Fallback: install the web app (PWA) to the home screen. -->
+      <div id="pwa-card" class="card">
+        <div id="pwa-title" style="font-weight:900;margin-bottom:8px">Install as web app</div>
+        <button id="install-btn" class="btn ghost">Install SewaGo</button>
+        <div id="install-note" class="muted small" style="margin-top:10px;text-align:center"></div>
+      </div>
+
+      <div class="section-title">Open app</div>
+      <div class="grid2">
+        <a class="btn ghost" href="/">Customer</a>
+        <a class="btn ghost" href="/driver">Driver</a>
+        <a class="btn ghost" href="/partner">Partner</a>
+        <a class="btn ghost" href="/admin">Admin</a>
+      </div>
+
+      <div class="card" style="margin-top:14px">
+        <div style="font-weight:900;margin-bottom:8px">Phone link</div>
+        <div id="app-url" class="muted small" style="word-break:break-all"></div>
+      </div>
+
+      <div class="muted small" style="text-align:center;margin-top:16px">
+        <a class="link" href="/privacy">Privacy policy</a> · <a class="link" href="/terms">Terms of service</a>
+      </div>
+    </main>
+  </div>
+  <div id="toast" class="toast hidden"></div>
+  <script src="pwa.js"></script>
+  <script src="download.js"></script>
+</body>
+</html>

@@ -1,0 +1,66 @@
+services:
+  - type: web
+    name: sewago
+    runtime: node
+    plan: starter
+    # HARD CONSTRAINT: exactly one instance. App state lives in process memory
+    # (flushed to the state store); a second instance would fork and corrupt it.
+    # Scaling out requires the Postgres migration first.
+    numInstances: 1
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: TRUST_PROXY
+        value: "true"
+      # Per-row Supabase store for real traffic.
+      # The app auto-imports the existing blob on first boot; blob is kept for rollback.
+      - key: DATA_STORE
+        value: supabase_rows
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: SUPABASE_STATE_ID
+        value: production
+      - key: PUBLIC_APP_URL
+        sync: false
+      - key: ADMIN_EMAIL
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: DRIVER_LICENSE_DEMO_CODE
+        sync: false
+      - key: ALLOW_DEMO_VERIFICATION_IN_PRODUCTION
+        value: "true"
+      - key: OTP_PROVIDER
+        value: twilio
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_FROM_NUMBER
+        sync: false
+      # Password-reset email delivery: resend | sendgrid | webhook.
+      - key: EMAIL_PROVIDER
+        value: resend
+      - key: EMAIL_PROVIDER_API_KEY
+        sync: false
+      - key: EMAIL_FROM
+        sync: false
+      # Payment gateways go live automatically once their keys are present.
+      - key: KHALTI_SECRET_KEY
+        sync: false
+      - key: KHALTI_MODE
+        value: live
+      - key: ESEWA_PRODUCT_CODE
+        sync: false
+      - key: ESEWA_SECRET
+        sync: false
+      - key: ESEWA_MODE
+        value: live
+      # Remove this override once Twilio + email + gateway keys are real.
+      - key: ALLOW_SANDBOX_PROVIDERS_IN_PRODUCTION
+        value: "true"
