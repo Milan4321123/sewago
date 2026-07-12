@@ -16,6 +16,9 @@ const USER_AGENT = `SewaGo/0.1 (${config.publicAppUrl || 'https://sewago.example
 const VALLEY = { west: 85.15, south: 27.55, east: 85.55, north: 27.82 };
 
 function insideServiceArea(lat, lng) {
+  // SERVICE_AREA=global (the dev default) accepts coordinates anywhere, so the
+  // whole ride/delivery flow can be tested with real GPS outside Nepal.
+  if (config.serviceArea !== 'kathmandu') return true;
   return lat >= VALLEY.south && lat <= VALLEY.north && lng >= VALLEY.west && lng <= VALLEY.east;
 }
 
@@ -131,11 +134,15 @@ async function searchPlaces(query) {
     q,
     format: 'jsonv2',
     addressdetails: '1',
-    limit: '8',
-    countrycodes: 'np',
-    viewbox: `${VALLEY.west},${VALLEY.north},${VALLEY.east},${VALLEY.south}`,
-    bounded: '1'
+    limit: '8'
   });
+  // Kathmandu mode pins search to the valley; global mode searches the world
+  // so testers outside Nepal can find their own streets.
+  if (config.serviceArea === 'kathmandu') {
+    params.set('countrycodes', 'np');
+    params.set('viewbox', `${VALLEY.west},${VALLEY.north},${VALLEY.east},${VALLEY.south}`);
+    params.set('bounded', '1');
+  }
   const rows = await politeFetch(`${NOMINATIM_BASE}/search?${params}`);
   // POIs/roads before administrative boundaries; ties broken by OSM importance.
   const osm = (Array.isArray(rows) ? rows : [])

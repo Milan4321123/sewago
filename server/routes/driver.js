@@ -77,6 +77,10 @@ function profile(d) {
     locationFresh,
     locationUpdatedAt: d.locationUpdatedAt || null,
     locationAccuracy: d.locationAccuracy || null,
+    // The driver's own last-sent coordinates, so the app can show that the
+    // GPS feed really is being received and where the server thinks they are.
+    currentLat: Number.isFinite(d.currentLat) ? d.currentLat : null,
+    currentLng: Number.isFinite(d.currentLng) ? d.currentLng : null,
     earnings: d.earnings || 0,
     tripsCompleted: d.tripsCompleted || 0
   };

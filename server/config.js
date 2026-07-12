@@ -16,6 +16,14 @@ const config = {
   esewaProductCode: process.env.ESEWA_PRODUCT_CODE || '',
   esewaSecret: process.env.ESEWA_SECRET || '',
   esewaMode: process.env.ESEWA_MODE === 'live' ? 'live' : 'test',
+  // Where GPS pins and address search are accepted. 'kathmandu' locks rides
+  // and deliveries to the valley (the launch market); 'global' accepts any
+  // coordinates on earth so the full flow can be tested from anywhere.
+  // Development defaults to global; production stays Kathmandu-only unless
+  // SERVICE_AREA=global is set explicitly (e.g. for a remote pilot/test).
+  serviceArea: ['kathmandu', 'global'].includes(process.env.SERVICE_AREA)
+    ? process.env.SERVICE_AREA
+    : (isProduction ? 'kathmandu' : 'global'),
   otpProvider: process.env.OTP_PROVIDER || 'sandbox',
   emailProvider: process.env.EMAIL_PROVIDER || 'sandbox',
   publicAppUrl: process.env.PUBLIC_APP_URL || '',

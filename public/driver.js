@@ -73,7 +73,15 @@ function locationLine(driver = state.driver) {
   if (!driver) return '';
   if (locationFresh(driver)) {
     const acc = driver.locationAccuracy ? ` · ±${driver.locationAccuracy}m` : '';
-    return `Live GPS active${acc}`;
+    // Show the coordinates the server actually received and how old they are,
+    // so a tester can watch their live position land update by update.
+    const coords = driver.currentLat != null && driver.currentLng != null
+      ? ` · 📍 ${driver.currentLat.toFixed(5)}, ${driver.currentLng.toFixed(5)}`
+      : '';
+    const age = driver.locationUpdatedAt
+      ? ` · updated ${Math.max(0, Math.round((Date.now() - driver.locationUpdatedAt) / 1000))}s ago`
+      : '';
+    return `Live GPS active${acc}${coords}${age}`;
   }
   return 'Live GPS needed before going online';
 }
@@ -116,6 +124,9 @@ async function sendLocation(position) {
   state.driver = data.driver;
   state.job = data.job || state.job;
   state.locationError = '';
+  // Patch the GPS status line in place (a full render would steal input focus).
+  const line = $('#gps-line');
+  if (line) line.textContent = locationLine(state.driver);
   return data;
 }
 
@@ -572,7 +583,7 @@ function render() {
           ${phoneBadge(d)}
           <span class="badge ${locationFresh(d) ? '' : 'amber'}">${locationFresh(d) ? '📍 GPS LIVE' : '📍 GPS NEEDED'}</span>
         </div>
-        <div class="muted small" style="margin-top:8px">${esc(locationLine(d))}</div>
+        <div class="muted small" style="margin-top:8px" id="gps-line">${esc(locationLine(d))}</div>
         ${state.locationError ? `<div class="muted small" style="color:#fca5a5;margin-top:6px">${esc(state.locationError)}</div>` : ''}
         <button class="btn ghost" style="margin-top:12px" onclick="updateGps()" ${state.locationBusy ? 'disabled' : ''}>
           ${state.locationBusy ? 'Reading GPS…' : 'Update live GPS'}

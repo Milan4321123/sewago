@@ -28,11 +28,14 @@ body {
   max-width: 480px;
   margin: 0 auto;
   min-height: 100vh;
+  min-height: 100dvh; /* mobile browsers: don't count the collapsing URL bar */
   display: flex;
   flex-direction: column;
 }
 
 /* ---------- top bar ---------- */
+/* Installed PWAs draw underneath the phone's status bar (time / wifi); the
+   safe-area inset pushes the bar's content below it. Zero in normal browsers. */
 .topbar {
   position: sticky;
   top: 0;
@@ -40,7 +43,7 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 14px 18px;
+  padding: calc(14px + env(safe-area-inset-top, 0px)) 18px 14px;
   background: rgba(11, 13, 18, 0.85);
   backdrop-filter: blur(12px);
   border-bottom: 1px solid var(--border);
@@ -151,7 +154,10 @@ a.btn { text-decoration: none; }
 a.link { text-decoration: none; }
 
 /* ---------- auth ---------- */
-.auth-wrap { flex: 1; display: flex; flex-direction: column; justify-content: center; padding: 32px 24px; }
+.auth-wrap {
+  flex: 1; display: flex; flex-direction: column; justify-content: center;
+  padding: calc(32px + env(safe-area-inset-top, 0px)) 24px calc(32px + env(safe-area-inset-bottom, 0px));
+}
 .auth-hero { text-align: center; margin-bottom: 28px; }
 .auth-hero .logo { font-size: 44px; }
 .auth-hero h1 { font-size: 30px; font-weight: 900; letter-spacing: -1px; margin-top: 6px; }
@@ -274,7 +280,7 @@ a.link { text-decoration: none; }
 /* ---------- cart bar ---------- */
 .cartbar {
   position: fixed;
-  bottom: 78px;
+  bottom: calc(78px + env(safe-area-inset-bottom, 0px));
   left: 50%;
   transform: translateX(-50%);
   width: calc(100% - 36px);
@@ -298,7 +304,7 @@ a.link { text-decoration: none; }
 /* ---------- toast ---------- */
 .toast {
   position: fixed;
-  bottom: 96px;
+  bottom: calc(96px + env(safe-area-inset-bottom, 0px));
   left: 50%;
   transform: translateX(-50%);
   background: #23293a;

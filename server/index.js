@@ -150,6 +150,7 @@ app.get('/api/health', (req, res) => {
     ok,
     env: config.nodeEnv,
     dataStore: config.dataStore,
+    serviceArea: config.serviceArea,
     paymentGateways: {
       khalti: config.khaltiSecretKey ? config.khaltiMode : 'off',
       esewa: config.esewaProductCode && config.esewaSecret ? config.esewaMode : 'off'
