@@ -8,10 +8,11 @@
 const crypto = require('crypto');
 const { db } = require('./db');
 const { hashPassword } = require('./passwords');
+const { currentDelivery } = require('./orderLogic');
 const { logAudit } = require('./audit');
 
 const ACTIVE_RIDE_STATES = ['searching', 'driver_en_route', 'in_progress'];
-const FOOD_DELIVERY_WINDOW_MS = 75 * 1000; // matches DELIVERY_UNTIL in routes/food.js
+const FOOD_DELIVERY_WINDOW_MS = 75 * 1000; // matches the sim timers in orderLogic.js
 
 function rideActive(ride) {
   return ACTIVE_RIDE_STATES.includes(ride.status);
@@ -19,6 +20,9 @@ function rideActive(ride) {
 
 function orderActive(order) {
   if (order.status === 'delivered' || order.status === 'cancelled') return false;
+  // Live orders carry explicit statuses and stay active however long the
+  // kitchen takes; only simulated demo orders age out on the timer.
+  if (order.fulfillment === 'live') return true;
   return Date.now() - order.createdAt < FOOD_DELIVERY_WINDOW_MS;
 }
 
@@ -58,6 +62,9 @@ function deletionBlockers(kind, entity) {
     if (entity.online) blockers.push('go offline first');
     if (db.rides.some((r) => (r.driverId === id || (r.driver && r.driver.id === id)) && rideActive(r))) {
       blockers.push('you have an active trip — complete it first');
+    }
+    if (currentDelivery(id)) {
+      blockers.push('you have a food delivery in progress — hand it over first');
     }
     if ((entity.earnings || 0) > 0) {
       blockers.push(`withdraw your Rs ${entity.earnings} earnings first so you do not lose them`);

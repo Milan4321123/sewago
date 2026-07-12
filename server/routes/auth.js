@@ -17,6 +17,23 @@ const {
 
 const router = express.Router();
 
+// Signup credit. Rs 5,000 makes the local demo instantly usable, but in
+// production every rupee of it is real liability (spendable on rides that pay
+// real drivers), so it defaults to 0 there — set WELCOME_BONUS to run a real,
+// budgeted signup promotion.
+const { config } = require('../config');
+const WELCOME_BONUS = (() => {
+  const n = Math.round(Number(process.env.WELCOME_BONUS));
+  if (Number.isFinite(n) && n >= 0) return Math.min(n, 5000);
+  return config.isProduction ? 0 : 5000;
+})();
+
+function grantWelcomeBonus(user) {
+  if (WELCOME_BONUS <= 0) return;
+  user.wallet += WELCOME_BONUS;
+  recordTxn('user', user, { type: 'bonus', label: 'Welcome bonus 🎁', amount: WELCOME_BONUS, sign: 1 });
+}
+
 function publicUser(user) {
   return {
     id: user.id,
@@ -67,11 +84,11 @@ router.post('/register', (req, res) => {
     phone: cleanPhone,
     phoneVerified: false,
     password: hashPassword(password),
-    wallet: 5000,
+    wallet: 0,
     createdAt: Date.now()
   };
   db.users.push(user);
-  recordTxn('user', user, { type: 'bonus', label: 'Welcome bonus 🎁', amount: 5000, sign: 1 });
+  grantWelcomeBonus(user);
   const token = issueToken(user.id);
   save();
   res.json({ token, user: publicUser(user) });
@@ -171,11 +188,11 @@ router.post('/otp/verify', (req, res) => {
       phoneVerified: true,
       phoneVerifiedAt: Date.now(),
       password: hashPassword(crypto.randomBytes(18).toString('hex')),
-      wallet: 5000,
+      wallet: 0,
       createdAt: Date.now()
     };
     db.users.push(user);
-    recordTxn('user', user, { type: 'bonus', label: 'Welcome bonus 🎁', amount: 5000, sign: 1 });
+    grantWelcomeBonus(user);
   } else {
     user.phone = result.phone;
     user.phoneVerified = true;
@@ -190,16 +207,9 @@ router.get('/me', authRequired, (req, res) => {
   res.json({ user: publicUser(req.user) });
 });
 
-router.post('/wallet/topup', authRequired, (req, res) => {
-  const amount = Number((req.body || {}).amount) || 0;
-  if (amount <= 0 || amount > 100000) {
-    return res.status(400).json({ error: 'Top-up amount must be between 1 and 100,000.' });
-  }
-  req.user.wallet += amount;
-  recordTxn('user', req.user, { type: 'topup', label: 'Wallet top-up (demo)', amount, sign: 1, method: 'demo' });
-  save();
-  res.json({ user: publicUser(req.user) });
-});
+// NOTE: the old demo top-up route (POST /wallet/topup, free money on request)
+// was removed — real top-ups go through /api/payments/topup/* with
+// server-verified gateways, and the PIN sandbox there covers development.
 
 // Self-service deletion (app-store requirement). Confirm with the password, or
 // with a fresh SMS code for phone-only accounts that never chose a password

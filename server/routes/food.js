@@ -2,7 +2,13 @@ const express = require('express');
 const { db, save, uid } = require('../db');
 const { authRequired, publicUser } = require('./auth');
 const { recordTxn, recordPlatformRevenue } = require('../payments');
-const { FOOD_SERVICE_FEE, FOOD_DELIVERY_FREE_KM, FOOD_DELIVERY_PER_KM, deliveryFeeFor } = require('../fees');
+const {
+  FOOD_SERVICE_FEE,
+  FOOD_DELIVERY_FREE_KM,
+  FOOD_DELIVERY_PER_KM,
+  FOOD_DELIVERY_MAX_EXTRA,
+  deliveryFeeFor
+} = require('../fees');
 const { withStatus, refundOrder, isLive, applyRating } = require('../orderLogic');
 const { resolveLocation } = require('../geo');
 const events = require('../events');
@@ -19,7 +25,8 @@ router.get('/restaurants', authRequired, (req, res) => {
     // So the cart can preview the distance fee with the same formula the
     // server uses at checkout.
     deliveryFreeKm: FOOD_DELIVERY_FREE_KM,
-    deliveryPerKm: FOOD_DELIVERY_PER_KM
+    deliveryPerKm: FOOD_DELIVERY_PER_KM,
+    deliveryMaxExtra: FOOD_DELIVERY_MAX_EXTRA
   });
 });
 

@@ -2,6 +2,8 @@ const express = require('express');
 const { db, save, uid } = require('../db');
 const { coordsFor } = require('../places');
 const { withStatus: orderWithStatus, refundOrder } = require('../orderLogic');
+const { recordTxn, recordPlatformRevenue, createWithdrawal } = require('../payments');
+const { PROMOTE_WEEK_PRICE, PROMOTE_WEEK_MS } = require('../fees');
 const events = require('../events');
 const sessionTokens = require('../sessionTokens');
 const { hashPassword, verifyPassword } = require('../passwords');
@@ -195,7 +197,7 @@ router.get('/partner/me', authPartner, (req, res) => {
   res.json({
     partner: profile(req.partner),
     transactions,
-    promoteWeekPrice: require('../fees').PROMOTE_WEEK_PRICE,
+    promoteWeekPrice: PROMOTE_WEEK_PRICE,
     ...myListings(req.partner.id)
   });
 });
@@ -252,7 +254,6 @@ router.post('/partner/kyc', authPartner, (req, res) => {
 });
 
 router.post('/partner/withdraw', authPartner, (req, res) => {
-  const { createWithdrawal } = require('../payments');
   const result = createWithdrawal('partner', req.partner, req.body || {});
   if (result.error) return res.status(400).json({ error: result.error });
   save();
@@ -335,8 +336,6 @@ router.post('/partner/orders/:id/reject', authPartner, (req, res) => {
 // list for 7 days. Repeat purchases extend the window; the fee lands in the
 // platform ledger as its own revenue source.
 router.post('/partner/:type(restaurants|hotels)/:id/promote', authPartner, (req, res) => {
-  const { recordTxn, recordPlatformRevenue } = require('../payments');
-  const { PROMOTE_WEEK_PRICE, PROMOTE_WEEK_MS } = require('../fees');
   const list = req.params.type === 'restaurants' ? db.restaurants : db.hotels;
   const listing = list.find((x) => x.id === req.params.id && x.ownerId === req.partner.id);
   if (!listing) return res.status(404).json({ error: 'Listing not found.' });

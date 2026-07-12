@@ -359,7 +359,8 @@ router.get('/driver/requests', authDriver, (req, res) => {
   const requests = db.rides
     .filter((r) => r.mode === 'live' && r.tier === req.driver.tier)
     .map((r) => {
-      dispatch.refresh(r); // advance a lapsed offer before deciding whose it is
+      withStatus(r); // settle the 45s search timeout first — never offer a dead ride
+      dispatch.refresh(r); // then advance a lapsed offer before deciding whose it is
       return withStatus(r);
     })
     .filter((r) => r.status === 'searching' && r.offer && r.offer.driverId === req.driver.id)
@@ -430,7 +431,6 @@ router.post('/driver/rides/:id/accept', authDriver, (req, res) => {
   save();
   // Customer sees "driver on the way" instantly; other drivers drop the request.
   events.publish(`user:${ride.userId}`, { topic: 'ride' });
-  events.publish(`drivers:${ride.tier}`, { topic: 'ride_taken' });
   events.publish('admin', { topic: 'rides' });
   res.json({ job: currentJob(req.driver.id) });
 });

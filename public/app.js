@@ -416,6 +416,7 @@ window.setTab = async (tab) => {
       state.foodServiceFee = r.serviceFee || 0;
       state.deliveryFreeKm = r.deliveryFreeKm ?? 3;
       state.deliveryPerKm = r.deliveryPerKm ?? 15;
+      state.deliveryMaxExtra = r.deliveryMaxExtra ?? 300;
       state.orders = o.orders;
     } else if (tab === 'stays') {
       const [b, c] = await Promise.all([api('/api/bookings'), api('/api/cities')]);
@@ -982,7 +983,7 @@ function estimatedDeliveryFee(r) {
   if (!point) return { fee: base, exact: false }; // final fee fixed at checkout
   const km = Math.round(haversineKm(r.loc, point) * 1.3 * 10) / 10;
   const extraKm = Math.max(0, Math.ceil(km - (state.deliveryFreeKm ?? 3)));
-  return { fee: base + Math.min(300, extraKm * (state.deliveryPerKm ?? 15)), exact: true };
+  return { fee: base + Math.min(state.deliveryMaxExtra ?? 300, extraKm * (state.deliveryPerKm ?? 15)), exact: true };
 }
 
 function cartTotals() {
