@@ -610,7 +610,10 @@ function fareCard() {
       <span class="emoji">${o.icon}</span>
       <div>
         <div><b>${esc(o.label)}</b>${o.surge > 1 ? ` <span class="badge" style="background:#7c2d12;color:#fdba74">⚡ ${o.surge}× busy</span>` : ''}</div>
-        <div class="muted small">${o.etaMin} min · ${o.seats} seat${o.seats > 1 ? 's' : ''}</div>
+        <div class="muted small">${o.etaMin} min · ${o.seats} seat${o.seats > 1 ? 's' : ''} · ${
+          o.liveDrivers > 0
+            ? `<span style="color:var(--accent)">🟢 ${o.liveDrivers} live driver${o.liveDrivers > 1 ? 's' : ''} online</span>`
+            : '🤖 demo driver'}</div>
       </div>
       <div class="price">${money(o.fare)}</div>
     </div>`).join('')}
@@ -683,6 +686,18 @@ window.setPayMethod = (method) => {
   render();
 };
 
+window.boostFare = async (rideId, amount) => {
+  try {
+    const data = await api(`/api/rides/${rideId}/boost`, { method: 'POST', body: { amount } });
+    state.activeRide = data.ride;
+    setUser(data.user);
+    toast(`Fare raised to ${money(data.ride.fare)} — asking drivers again 📡`);
+    render();
+  } catch (e) {
+    toast(e.message, true);
+  }
+};
+
 window.bookRide = async (tier) => {
   try {
     const data = await api('/api/rides', {
@@ -721,10 +736,18 @@ function activeRideCard(ride) {
     ${ride.status === 'searching'
       ? `<div class="muted">${ride.mode === 'live'
           ? '📡 Requesting nearby drivers — waiting for one to accept…'
-          : 'Matching you with a nearby driver…'}</div>`
+          : '🤖 No real driver is online right now — a simulated demo driver will run this trip.'}</div>
+        ${ride.mode === 'live' ? `
+        <div class="muted small" style="margin-top:10px">No driver yet? Raise the fare to attract one — current fare <b style="color:var(--text)">${money(ride.fare)}</b>${ride.fareBoost ? ` (includes +${money(ride.fareBoost)} boost)` : ''}</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:8px">
+          <button class="btn ghost" onclick="boostFare('${ride.id}', 20)">+ Rs 20</button>
+          <button class="btn ghost" onclick="boostFare('${ride.id}', 50)">+ Rs 50</button>
+          <button class="btn ghost" onclick="boostFare('${ride.id}', 100)">+ Rs 100</button>
+        </div>` : ''}`
       : d ? `<div class="row">
           <div>
-            <div><b>${esc(d.name)}</b> <span class="badge">★ ${d.rating}</span></div>
+            <div><b>${esc(d.name)}</b> <span class="badge">★ ${d.rating}</span>
+              ${ride.mode === 'live' ? '<span class="badge">🟢 LIVE</span>' : '<span class="badge gray">🤖 DEMO</span>'}</div>
             <div class="muted small">${esc(d.vehicle)} · ${esc(d.plate)}</div>
           </div>
         </div>` : ''}
@@ -801,7 +824,8 @@ function updateRideMap(ride) {
 
 function rideKey() {
   const r = state.activeRide;
-  return r ? r.id + ':' + r.status : (state.fare ? 'fare' : 'form');
+  // fare is part of the key so a boost rebuilds the searching card.
+  return r ? r.id + ':' + r.status + ':' + r.fare : (state.fare ? 'fare' : 'form');
 }
 
 function etaLineText(ride) {

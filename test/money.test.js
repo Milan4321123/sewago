@@ -624,6 +624,48 @@ test('parcel delivery: bike courier carries it, receiver named, driver paid, sen
   await api('/driver/online', { method: 'POST', token: courierToken, body: { online: false } });
 });
 
+test('fare boost: searching customer raises the fare, driver sees the boosted offer', async () => {
+  const driverToken = await onboardDriver('bike', 27.7152, 85.3123); // Thamel
+  const { token } = await registerUser('booster');
+
+  const booked = await api('/rides', {
+    method: 'POST',
+    token,
+    body: { pickup: 'Thamel', dropoff: 'Patan Durbar Square', tier: 'bike', payment: 'wallet' }
+  });
+  assert.equal(booked.status, 200, JSON.stringify(booked.data));
+  assert.equal(booked.data.ride.mode, 'live');
+  const baseFare = booked.data.ride.fare;
+  const walletAfterBooking = booked.data.user.wallet;
+
+  // Invalid boost amounts are refused.
+  const bad = await api(`/rides/${booked.data.ride.id}/boost`, { method: 'POST', token, body: { amount: 33 } });
+  assert.equal(bad.status, 400);
+
+  const boosted = await api(`/rides/${booked.data.ride.id}/boost`, { method: 'POST', token, body: { amount: 50 } });
+  assert.equal(boosted.status, 200, JSON.stringify(boosted.data));
+  assert.equal(boosted.data.ride.fare, baseFare + 50);
+  assert.equal(boosted.data.ride.fareBoost, 50);
+  assert.equal(boosted.data.user.wallet, walletAfterBooking - 50, 'wallet boost is charged up-front');
+
+  // The driver's offer carries the boosted fare and the 80% payout of it.
+  const requests = await api('/driver/requests', { token: driverToken });
+  const offer = requests.data.requests.find((r) => r.id === booked.data.ride.id);
+  assert.ok(offer, 'driver must be re-offered the boosted ride');
+  assert.equal(offer.fare, baseFare + 50);
+  assert.equal(offer.fareBoost, 50);
+  assert.equal(offer.payout, Math.round((baseFare + 50) * 0.8));
+
+  // Once accepted, the fare can no longer be raised.
+  const accepted = await api(`/driver/rides/${booked.data.ride.id}/accept`, { method: 'POST', token: driverToken });
+  assert.equal(accepted.status, 200, JSON.stringify(accepted.data));
+  const late = await api(`/rides/${booked.data.ride.id}/boost`, { method: 'POST', token, body: { amount: 20 } });
+  assert.equal(late.status, 400);
+
+  await api(`/rides/${booked.data.ride.id}/cancel`, { method: 'POST', token });
+  await api('/driver/online', { method: 'POST', token: driverToken, body: { online: false } });
+});
+
 test('sequential dispatch: nearest driver gets an exclusive offer, decline cascades', async () => {
   // Near driver waits in Thamel (the pickup), far driver in Kalanki.
   const nearToken = await onboardDriver('bike', 27.7154, 85.3123);

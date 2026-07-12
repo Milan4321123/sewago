@@ -379,6 +379,7 @@ router.get('/driver/requests', authDriver, (req, res) => {
       dropoffLoc: r.dropoffLoc,
       distanceKm: r.distanceKm,
       fare: r.fare,
+      fareBoost: r.fareBoost || 0,
       payment: r.payment || 'wallet',
       payout: payoutFor(r),
       etaToPickupMin: etaToPickupMin(req.driver, r.pickupLoc, r.tier),

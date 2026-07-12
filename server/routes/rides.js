@@ -1,7 +1,7 @@
 const express = require('express');
 const { db, save, uid } = require('../db');
 const { authRequired, publicUser } = require('./auth');
-const { withStatus, driverPublic, etaToPickupMin, driverIsAvailable, ROAD_FACTOR } = require('../rideLogic');
+const { withStatus, driverPublic, etaToPickupMin, driverIsAvailable, ROAD_FACTOR, SEARCH_TIMEOUT_SECONDS } = require('../rideLogic');
 const { PLACES, haversineKm } = require('../places');
 const { searchPlaces, reverseGeocode, insideServiceArea, resolveLocation } = require('../geo');
 const { recordTxn, recordPlatformRevenue } = require('../payments');
@@ -36,7 +36,10 @@ function estimateFor(pickup, dropoff) {
       seats: t.seats,
       surge,
       fare: Math.round((t.base + t.perKm * distanceKm) * surge),
-      etaMin: Math.max(2, Math.round((distanceKm / t.speedKmh) * 60))
+      etaMin: Math.max(2, Math.round((distanceKm / t.speedKmh) * 60)),
+      // Real online drivers of this tier right now — tells the customer (and a
+      // tester) whether booking will go live or fall back to a simulated trip.
+      liveDrivers: db.drivers.filter((d) => driverIsAvailable(d, tier)).length
     };
   });
   return { distanceKm, pickupPlace, dropoffPlace, options, serviceFee: RIDE_SERVICE_FEE };
@@ -300,6 +303,53 @@ router.post('/rides/:id/cancel', authRequired, (req, res) => {
   dispatch.clearOffer(ride);
   save();
   if (ride.driverId) events.publish(`driver:${ride.driverId}`, { topic: 'ride' });
+  events.publish('admin', { topic: 'rides' });
+  res.json({ ride: withStatus(ride), user: publicUser(req.user) });
+});
+
+// While a live ride is still searching, the customer can raise the fare to
+// attract a driver. The boost restarts dispatch with a clean slate (drivers who
+// declined the old price get offered the new one) and resets the 45s search
+// window. Wallet rides pay the extra up-front; cash boosts are collected by
+// the driver at the end like the rest of the fare.
+const FARE_BOOST_STEPS = [20, 50, 100];
+const FARE_BOOST_MAX = 500;
+
+router.post('/rides/:id/boost', authRequired, (req, res) => {
+  const ride = db.rides.find((r) => r.id === req.params.id && r.userId === req.user.id);
+  if (!ride) return res.status(404).json({ error: 'Ride not found.' });
+  const current = withStatus(ride);
+  if (ride.mode !== 'live' || current.status !== 'searching') {
+    return res.status(400).json({ error: 'The fare can only be raised while we are still looking for a driver.' });
+  }
+  const amount = Math.round(Number((req.body || {}).amount));
+  if (!FARE_BOOST_STEPS.includes(amount)) {
+    return res.status(400).json({ error: `Fare boost must be Rs ${FARE_BOOST_STEPS.join(', Rs ')}.` });
+  }
+  if ((ride.fareBoost || 0) + amount > FARE_BOOST_MAX) {
+    return res.status(400).json({ error: `The fare can be raised by at most Rs ${FARE_BOOST_MAX} in total.` });
+  }
+  if (ride.payment !== 'cash') {
+    if (req.user.wallet < amount) {
+      return res.status(402).json({ error: 'Not enough wallet balance to raise the fare.' });
+    }
+    req.user.wallet -= amount;
+    recordTxn('user', req.user, {
+      type: 'ride',
+      label: `Fare raised (+Rs ${amount}): ${ride.pickup} → ${ride.dropoff}`,
+      amount,
+      sign: -1,
+      refId: ride.id
+    });
+  }
+  ride.fare += amount;
+  ride.total = (ride.total ?? ride.fare) + amount;
+  ride.fareBoost = (ride.fareBoost || 0) + amount;
+  // Fresh 45s search window from now, then a clean dispatch pass at the new price.
+  ride.searchTimeoutSeconds = Math.round((Date.now() - ride.createdAt) / 1000) + SEARCH_TIMEOUT_SECONDS;
+  dispatch.clearOffer(ride);
+  dispatch.startDispatch(ride);
+  save();
   events.publish('admin', { topic: 'rides' });
   res.json({ ride: withStatus(ride), user: publicUser(req.user) });
 });

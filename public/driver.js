@@ -162,6 +162,40 @@ function stopLocationWatch() {
   state.locationWatchId = null;
 }
 
+/* Keep the phone awake while online: a locked/backgrounded screen stops the
+   GPS watch, the location goes stale, and the driver silently drops out of
+   dispatch. Best-effort — browsers without the API just ignore it. */
+let wakeLock = null;
+async function acquireWakeLock() {
+  try {
+    if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen');
+  } catch (e) { /* denied (e.g. low battery) — heartbeat still helps */ }
+}
+function releaseWakeLock() {
+  if (wakeLock) {
+    wakeLock.release().catch(() => {});
+    wakeLock = null;
+  }
+}
+
+// The OS silently releases the wake lock when the tab is hidden; coming back,
+// re-arm it and push a fresh position immediately so availability recovers.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible') return;
+  if (state.driver && state.driver.online) {
+    acquireWakeLock();
+    ensureLocation().catch(() => {});
+  }
+});
+
+// watchPosition only fires on movement — a driver parked at a stand would go
+// "stale" without this. Re-send the last position every minute while online.
+setInterval(() => {
+  if (state.driver && state.driver.online && state.locationWatchId != null) {
+    ensureLocation().catch(() => {});
+  }
+}, 60000);
+
 /* ---------------- auth views ---------------- */
 
 function authView() {
@@ -744,7 +778,7 @@ function requestsSection() {
     <div class="card" style="border-color:var(--accent)">
       <div class="row">
         <div>
-          <div>${r.kind === 'parcel' ? '<span class="badge">📦 PARCEL</span> ' : ''}<b>${esc(r.pickup)} → ${esc(r.dropoff)}</b></div>
+          <div>${r.kind === 'parcel' ? '<span class="badge">📦 PARCEL</span> ' : ''}${r.fareBoost ? `<span class="badge" style="background:#7c2d12;color:#fdba74">⚡ +${money(r.fareBoost)} BOOSTED</span> ` : ''}<b>${esc(r.pickup)} → ${esc(r.dropoff)}</b></div>
           <div class="muted small">${esc(r.customerName)}${r.recipientName ? ` → hand to ${esc(r.recipientName)}` : ''} · ${r.distanceKm} km</div>
           <div class="small" style="margin-top:2px">🕐 pickup is ~${r.etaToPickupMin} min from your live GPS</div>
         </div>
@@ -929,8 +963,12 @@ window.toggleOnline = async () => {
     }
     const data = await api('/api/driver/online', { method: 'POST', body: { online: !state.driver.online } });
     state.driver = data.driver;
-    if (!data.driver.online) stopLocationWatch();
-    toast(data.driver.online ? 'You are online — waiting for requests 🟢' : 'You are offline.');
+    if (data.driver.online) acquireWakeLock();
+    else {
+      stopLocationWatch();
+      releaseWakeLock();
+    }
+    toast(data.driver.online ? 'You are online — waiting for requests 🟢 Keep this screen on.' : 'You are offline.');
     await refresh();
     render();
   } catch (e) {
@@ -1035,7 +1073,11 @@ setInterval(() => {
   if (state.token) {
     try {
       await refresh();
-      if (state.driver && state.driver.online) startLocationWatch(true);
+      if (state.driver && state.driver.online) {
+        startLocationWatch(true);
+        acquireWakeLock();
+        ensureLocation().catch(() => {}); // freshen availability right away
+      }
       connectEvents();
     } catch (e) {
       state.token = null;

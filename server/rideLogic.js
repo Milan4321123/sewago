@@ -6,7 +6,14 @@ const MATCH_SECONDS = 6;
 const PICKUP_SECONDS = 18;
 // Live rides: how long a request waits for a real driver before auto-refund.
 const SEARCH_TIMEOUT_SECONDS = 45;
-const LOCATION_FRESH_MS = 2 * 60 * 1000;
+// How recent a driver's GPS ping must be to count them as available. Default is
+// generous (10 min) because a single-phone tester switches between the driver
+// and customer tabs, and a backgrounded tab stops sending GPS; the driver app
+// also re-pings every minute while the screen is on.
+const LOCATION_FRESH_MS = (() => {
+  const min = Number(process.env.DRIVER_LOCATION_FRESH_MIN);
+  return (Number.isFinite(min) && min >= 1 && min <= 60 ? min : 10) * 60 * 1000;
+})();
 // Driver keeps 80% of the fare; SewaGo takes 20%.
 const DRIVER_SHARE = 0.8;
 // Average city speeds (km/h) per tier, used for driver-arrival ETAs.
