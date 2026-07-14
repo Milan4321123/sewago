@@ -1,6 +1,47 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
-  <rect width="512" height="512" rx="112" fill="#0b0d12"/>
-  <circle cx="256" cy="256" r="176" fill="#22c55e"/>
-  <path fill="#04130a" d="M156 277c0-67 44-113 106-113 43 0 76 19 95 54l-55 29c-9-17-22-25-40-25-28 0-48 22-48 55 0 34 20 56 50 56 19 0 33-9 42-26l53 30c-20 34-53 53-96 53-64 0-107-45-107-113Z"/>
-  <path fill="#04130a" d="M184 402h144c20 0 36 16 36 36v8H148v-8c0-20 16-36 36-36Z"/>
+  <!-- SewaGo mark: an S-shaped road from where you are (hollow ring, bottom)
+       to where you're going (glowing pin, top) — rides, food, stays, tasks:
+       everything on the app travels this road. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0e1626"/>
+      <stop offset="0.55" stop-color="#080c16"/>
+      <stop offset="1" stop-color="#060911"/>
+    </linearGradient>
+    <linearGradient id="road" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0" stop-color="#0ea371"/>
+      <stop offset="1" stop-color="#6ee7b7"/>
+    </linearGradient>
+    <radialGradient id="aurora" cx="0.75" cy="0.12" r="0.9">
+      <stop offset="0" stop-color="#34d399" stop-opacity="0.28"/>
+      <stop offset="0.5" stop-color="#34d399" stop-opacity="0.06"/>
+      <stop offset="1" stop-color="#34d399" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="16"/>
+    </filter>
+  </defs>
+
+  <rect width="512" height="512" rx="116" fill="url(#bg)"/>
+  <rect width="512" height="512" rx="116" fill="url(#aurora)"/>
+
+  <!-- soft light under the road -->
+  <path d="M186 428 C186 322 348 334 348 240 C348 158 214 170 214 96"
+        fill="none" stroke="#34d399" stroke-width="72" stroke-linecap="round"
+        opacity="0.35" filter="url(#glow)"/>
+  <!-- the road -->
+  <path d="M186 428 C186 322 348 334 348 240 C348 158 214 170 214 96"
+        fill="none" stroke="url(#road)" stroke-width="56" stroke-linecap="round"/>
+  <!-- dashed centre line makes it read as a road at a glance -->
+  <path d="M186 428 C186 322 348 334 348 240 C348 158 214 170 214 96"
+        fill="none" stroke="#04130a" stroke-width="7" stroke-linecap="round"
+        stroke-dasharray="1 46" opacity="0.85"/>
+
+  <!-- you are here: hollow start ring -->
+  <circle cx="186" cy="428" r="26" fill="#060911" stroke="#6ee7b7" stroke-width="13"/>
+
+  <!-- destination pin, planted on the road's end -->
+  <circle cx="214" cy="92" r="48" fill="#34d399" opacity="0.35" filter="url(#glow)"/>
+  <path d="M214 30c-32 0-58 25-58 56 0 41 58 100 58 100s58-59 58-100c0-31-26-56-58-56z" fill="#6ee7b7"/>
+  <circle cx="214" cy="88" r="20" fill="#060911"/>
 </svg>

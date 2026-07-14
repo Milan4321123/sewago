@@ -344,7 +344,7 @@ function authView() {
   return `
   <div class="auth-wrap">
     <div class="auth-hero">
-      <div class="logo">🏪</div>
+      <img class="logo-img" src="/icon.svg" alt="SewaGo Partner" />
       <h1>Sewa<em>Go</em> Partner</h1>
       <p>List your restaurant or hotel once — customers see it in the app instantly.</p>
       <div class="auth-services">
@@ -600,7 +600,7 @@ function render() {
   const ready = partnerReady();
   app.innerHTML = `
     <header class="topbar">
-      <div class="brand">Sewa<em>Go</em> <span class="muted" style="font-size:13px;font-weight:700">PARTNER</span></div>
+      <div class="brand"><img class="brand-mark" src="/icon.svg" alt="" />Sewa<em>Go</em> <span class="muted" style="font-size:13px;font-weight:700">PARTNER</span></div>
       <span class="badge">${esc(state.partner.name)}</span>
     </header>
     <main>

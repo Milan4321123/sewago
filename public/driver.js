@@ -17,6 +17,7 @@ const state = {
   locationBusy: false,
   locationError: '',
   showWithdraw: false,
+  showPhoneEdit: false, // re-open the OTP form to change a verified phone
   _uiKey: null
 };
 
@@ -246,7 +247,7 @@ function authView() {
   return `
   <div class="auth-wrap">
     <div class="auth-hero">
-      <div class="logo">🛵</div>
+      <img class="logo-img" src="/icon.svg" alt="SewaGo Driver" />
       <h1>Sewa<em>Go</em> Driver</h1>
       <p>Go online, accept requests, earn 80% of every fare.</p>
     </div>
@@ -646,7 +647,7 @@ function uiKey() {
   const d = state.driver;
   return JSON.stringify([
     !!d, state.authMode, d && d.online, d && d.earnings,
-    d && d.licenseVerified, d && d.phoneVerified, d && d.locationFresh, state.showWithdraw,
+    d && d.licenseVerified, d && d.phoneVerified, d && d.locationFresh, state.showWithdraw, state.showPhoneEdit,
     state.job && state.job.id, state.job && state.job.status,
     state.delivery && state.delivery.id, state.delivery && state.delivery.status,
     state.requests.map((r) => r.id), state.deliveries.map((d) => d.id), state.history.length
@@ -656,6 +657,22 @@ function uiKey() {
 /* ---------------- dashboard ---------------- */
 
 function kycCard(d) {
+  // Fully verified drivers don't need this card at all — the dashboard badges
+  // already say it. It only reappears to change the number or fix a rejection.
+  const showPhoneForm = !d.phoneVerified || state.showPhoneEdit;
+  if (!showPhoneForm && d.licenseVerified && !d.kycNote) {
+    return `
+  <div class="card">
+    <div class="row">
+      <div>
+        <div style="font-weight:900">Driver verification</div>
+        <div class="muted small">📱 ${esc(d.phone)} — verified · license approved. You're all set.</div>
+      </div>
+      <span class="badge">APPROVED</span>
+    </div>
+    <button class="btn ghost compact" style="margin-top:12px" onclick="togglePhoneEdit(true)">Change phone number</button>
+  </div>`;
+  }
   return `
   <div class="card">
     <div class="row">
@@ -671,6 +688,7 @@ function kycCard(d) {
       <span class="badge ${locationFresh(d) ? '' : 'amber'}">${locationFresh(d) ? '📍 GPS LIVE' : '📍 GPS NEEDED'}</span>
     </div>
     ${d.kycNote ? `<div class="muted small" style="color:var(--danger);margin-top:8px">${esc(d.kycNote)}</div>` : ''}
+    ${showPhoneForm ? `
     <label class="field" style="margin-top:12px"><span>Phone</span>
       <input id="driver-phone" value="${esc(d.phone || '')}" placeholder="e.g. 9841000000" />
     </label>
@@ -679,8 +697,15 @@ function kycCard(d) {
       <label class="field"><span>OTP code</span><input id="driver-otp" placeholder="123456" /></label>
     </div>
     <button class="btn" onclick="driverVerifyOtp()">Verify phone</button>
+    ${state.showPhoneEdit ? `<button class="btn ghost" style="margin-top:8px" onclick="togglePhoneEdit(false)">Cancel</button>` : ''}` : `
+    <div class="muted small" style="margin-top:12px">📱 ${esc(d.phone)} — verified. <button class="link" onclick="togglePhoneEdit(true)">Change</button></div>`}
   </div>`;
 }
+
+window.togglePhoneEdit = (show) => {
+  state.showPhoneEdit = show;
+  render();
+};
 
 function render() {
   const app = $('#app');
@@ -691,7 +716,7 @@ function render() {
   const d = state.driver;
   app.innerHTML = `
     <header class="topbar">
-      <div class="brand">Sewa<em>Go</em> <span class="muted" style="font-size:13px;font-weight:700">DRIVER</span></div>
+      <div class="brand"><img class="brand-mark" src="/icon.svg" alt="" />Sewa<em>Go</em> <span class="muted" style="font-size:13px;font-weight:700">DRIVER</span></div>
       <span class="badge ${d.online ? '' : 'gray'}">${d.online ? '🟢 ONLINE' : '⚫ OFFLINE'}</span>
     </header>
     <main>
@@ -1031,6 +1056,7 @@ window.driverVerifyOtp = async () => {
       body: { code: $('#driver-otp').value.trim() }
     });
     state.driver = data.driver;
+    state.showPhoneEdit = false;
     toast('Phone verified.');
     render();
   } catch (e) {

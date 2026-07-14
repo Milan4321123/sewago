@@ -535,7 +535,7 @@ function render() {
   }
   app.innerHTML = `
     <header class="topbar">
-      <div class="brand">Sewa<em>Go</em> <span class="muted" style="font-size:13px;font-weight:700">ADMIN</span></div>
+      <div class="brand"><img class="brand-mark" src="/icon.svg" alt="" />Sewa<em>Go</em> <span class="muted" style="font-size:13px;font-weight:700">ADMIN</span></div>
       <div style="display:flex;gap:8px;align-items:center">
         <button class="btn ghost compact" onclick="refresh()">↻ Refresh</button>
         <button class="btn danger compact" onclick="doLogout()">Log out</button>

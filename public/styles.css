@@ -95,11 +95,24 @@ button, .tile, .fare-option, .chip, .geo-opt, a.btn, label.btn {
   box-shadow: var(--glass-hi);
 }
 
-.brand { font-size: 20px; font-weight: 800; letter-spacing: -0.5px; }
+.brand {
+  font-size: 20px;
+  font-weight: 800;
+  letter-spacing: -0.5px;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
 .brand em {
   color: var(--accent);
   font-style: normal;
   text-shadow: 0 0 18px rgba(52, 211, 153, 0.55);
+}
+.brand-mark {
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
+  box-shadow: 0 0 16px rgba(52, 211, 153, 0.3);
 }
 
 .wallet-chip {
@@ -116,7 +129,7 @@ button, .tile, .fare-option, .chip, .geo-opt, a.btn, label.btn {
 /* ---------- layout ---------- */
 main { flex: 1; padding: 18px 18px calc(112px + env(safe-area-inset-bottom, 0px)); }
 
-.section-title { font-size: 17px; font-weight: 800; margin: 20px 0 10px; }
+.section-title { font-size: 17px; font-weight: 800; letter-spacing: -0.3px; margin: 22px 2px 10px; }
 .section-title:first-child { margin-top: 0; }
 
 .card {
@@ -234,6 +247,13 @@ a.link { text-decoration: none; }
   font-size: 44px;
   filter: drop-shadow(0 6px 22px rgba(52, 211, 153, 0.35));
   display: inline-block;
+  animation: float-soft 5s ease-in-out infinite;
+}
+.auth-hero .logo-img {
+  width: 84px;
+  height: 84px;
+  border-radius: 22px;
+  filter: drop-shadow(0 10px 30px rgba(52, 211, 153, 0.35));
   animation: float-soft 5s ease-in-out infinite;
 }
 .auth-hero h1 { font-size: 30px; font-weight: 900; letter-spacing: -1px; margin-top: 6px; }
@@ -744,6 +764,19 @@ a.link { text-decoration: none; }
 ::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.12); border-radius: 999px; border: 3px solid transparent; background-clip: content-box; }
 ::-webkit-scrollbar-thumb:hover { background-color: rgba(255, 255, 255, 0.2); }
 ::-webkit-scrollbar-track { background: transparent; }
+
+/* Compact phones (SE, small Androids): tighten the frame so cards keep
+   comfortable inner space instead of squeezing their content. */
+@media (max-width: 380px) {
+  main { padding-left: 12px; padding-right: 12px; }
+  .card { padding: 14px; }
+  .grid2 { gap: 8px; }
+  .tile { padding: 12px; gap: 12px; }
+  .auth-wrap { padding-left: 16px; padding-right: 16px; }
+  .tabbar { width: calc(100% - 16px); }
+  .tabbar button { font-size: 10px; }
+  .brand { font-size: 18px; }
+}
 
 /* Accessibility: anyone who asked their OS for less motion gets a calm app. */
 @media (prefers-reduced-motion: reduce) {

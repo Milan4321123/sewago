@@ -216,7 +216,7 @@ function authView() {
   return `
   <div class="auth-wrap">
     <div class="auth-hero">
-      <div class="logo">🛺</div>
+      <img class="logo-img" src="/icon.svg" alt="SewaGo" />
       <h1>Sewa<em>Go</em></h1>
       <p>One app for getting around, eating well and sleeping easy.</p>
       <div class="auth-services">
@@ -408,7 +408,7 @@ function render() {
   }
   app.innerHTML = `
     <header class="topbar">
-      <div class="brand">Sewa<em>Go</em></div>
+      <div class="brand"><img class="brand-mark" src="/icon.svg" alt="" />Sewa<em>Go</em></div>
       <div class="wallet-chip" id="wallet-chip">👛 ${money(state.user.wallet)}</div>
     </header>
     <main id="view"></main>
