@@ -665,6 +665,87 @@ a.link { text-decoration: none; }
   background: var(--card2);
 }
 .photo-strip img:first-child { border-radius: var(--radius) 14px 14px var(--radius); }
+/* Gallery photos are tappable. */
+.photo-strip img, .thumb-strip img, .cover-img[data-gallery], .thumb[data-gallery] { cursor: zoom-in; }
+
+/* ---------- fullscreen photo viewer ---------- */
+.lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  flex-direction: column;
+  background: rgba(3, 5, 9, 0.92);
+  -webkit-backdrop-filter: blur(20px) saturate(140%);
+  backdrop-filter: blur(20px) saturate(140%);
+  animation: fade-in 0.2s ease;
+}
+.lightbox.hidden { display: none; }
+@keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
+.lightbox-top {
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: calc(14px + env(safe-area-inset-top, 0px)) 16px 10px;
+  background: linear-gradient(rgba(3, 5, 9, 0.7), transparent);
+  pointer-events: none;
+}
+.lightbox-count { font-size: 14px; font-weight: 800; color: var(--text); }
+.lightbox-close {
+  pointer-events: auto;
+  width: 40px; height: 40px;
+  border-radius: 50%;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text);
+  font-size: 17px;
+  cursor: pointer;
+}
+.lightbox-close:active { transform: scale(0.92); }
+.lightbox-track {
+  flex: 1;
+  display: flex;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scroll-snap-type: x mandatory;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+}
+.lightbox-track::-webkit-scrollbar { display: none; }
+.lightbox-slide {
+  min-width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  scroll-snap-align: center;
+  scroll-snap-stop: always;
+  padding: 56px 0 64px;
+}
+.lightbox-slide img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  border-radius: 6px;
+}
+.lightbox-dots {
+  position: absolute;
+  bottom: calc(22px + env(safe-area-inset-bottom, 0px));
+  left: 0; right: 0;
+  display: flex;
+  justify-content: center;
+  gap: 7px;
+}
+.lightbox-dots span {
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.28);
+  transition: background 0.2s ease, transform 0.2s ease;
+}
+.lightbox-dots span.on { background: var(--accent); transform: scale(1.25); }
+
 /* Inline mini gallery for menu items / room types. */
 .thumb-strip {
   display: flex;

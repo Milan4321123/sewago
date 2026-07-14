@@ -115,26 +115,95 @@ function photosOf(x) {
   return x.photo ? [x.photo] : [];
 }
 
+// Every gallery image carries its full photo set, so a tap opens the
+// fullscreen viewer at that photo with the rest one swipe away.
+function lightboxAttrs(urls, idx) {
+  return `data-gallery="${esc(JSON.stringify(urls))}" data-idx="${idx}" onclick="openLightboxFrom(this)" role="button"`;
+}
+
 // Swipeable gallery: one photo = full-width cover; several = a snap-scroll
-// strip you flick through like any listings app.
+// strip you flick through like any listings app. Tap = fullscreen.
 function photoStrip(urls, alt) {
   if (!urls.length) return '';
-  if (urls.length === 1) return `<img class="cover-img" src="${esc(urls[0])}" alt="${esc(alt)}" loading="lazy" />`;
+  if (urls.length === 1) {
+    return `<img class="cover-img" src="${esc(urls[0])}" alt="${esc(alt)}" loading="lazy" ${lightboxAttrs(urls, 0)} />`;
+  }
   return `
   <div class="photo-strip">
-    ${urls.map((u) => `<img src="${esc(u)}" alt="${esc(alt)}" loading="lazy" />`).join('')}
+    ${urls.map((u, i) => `<img src="${esc(u)}" alt="${esc(alt)}" loading="lazy" ${lightboxAttrs(urls, i)} />`).join('')}
   </div>`;
 }
 
-// Small inline variant for menu items / room types.
+// Small inline variant for menu items / room types. Tap = fullscreen too.
 function thumbStrip(urls, alt) {
   if (!urls.length) return '';
-  if (urls.length === 1) return `<img class="thumb" src="${esc(urls[0])}" alt="${esc(alt)}" loading="lazy" />`;
+  if (urls.length === 1) {
+    return `<img class="thumb" src="${esc(urls[0])}" alt="${esc(alt)}" loading="lazy" ${lightboxAttrs(urls, 0)} />`;
+  }
   return `
   <div class="thumb-strip">
-    ${urls.map((u) => `<img src="${esc(u)}" alt="${esc(alt)}" loading="lazy" />`).join('')}
+    ${urls.map((u, i) => `<img src="${esc(u)}" alt="${esc(alt)}" loading="lazy" ${lightboxAttrs(urls, i)} />`).join('')}
   </div>`;
 }
+
+/* Fullscreen viewer: native scroll-snap does the swiping, so it feels like
+   the iOS Photos app. Lives outside #app so re-renders never close it. */
+let lightboxEl = null;
+function ensureLightbox() {
+  if (lightboxEl) return lightboxEl;
+  lightboxEl = document.createElement('div');
+  lightboxEl.id = 'lightbox';
+  lightboxEl.className = 'lightbox hidden';
+  document.body.appendChild(lightboxEl);
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') closeLightbox();
+  });
+  return lightboxEl;
+}
+
+window.openLightboxFrom = (el) => {
+  try {
+    openLightbox(JSON.parse(el.dataset.gallery), Number(el.dataset.idx) || 0);
+  } catch (e) { /* malformed gallery — ignore the tap */ }
+};
+
+function openLightbox(urls, index) {
+  if (!urls || !urls.length) return;
+  const box = ensureLightbox();
+  box.innerHTML = `
+    <div class="lightbox-top">
+      <span class="lightbox-count" id="lb-count">${index + 1} / ${urls.length}</span>
+      <button class="lightbox-close" onclick="closeLightbox()" aria-label="Close">✕</button>
+    </div>
+    <div class="lightbox-track" id="lb-track">
+      ${urls.map((u) => `
+      <div class="lightbox-slide" onclick="if (event.target === this) closeLightbox()">
+        <img src="${esc(u)}" alt="photo" />
+      </div>`).join('')}
+    </div>
+    ${urls.length > 1 ? `<div class="lightbox-dots" id="lb-dots">
+      ${urls.map((u, i) => `<span class="${i === index ? 'on' : ''}"></span>`).join('')}
+    </div>` : ''}`;
+  box.classList.remove('hidden');
+  document.body.style.overflow = 'hidden';
+  const track = $('#lb-track');
+  // Jump to the tapped photo once the track has a size to measure.
+  requestAnimationFrame(() => { track.scrollLeft = track.clientWidth * index; });
+  track.addEventListener('scroll', () => {
+    const i = Math.min(urls.length - 1, Math.max(0, Math.round(track.scrollLeft / track.clientWidth)));
+    const count = $('#lb-count');
+    if (count) count.textContent = `${i + 1} / ${urls.length}`;
+    const dots = $('#lb-dots');
+    if (dots) [...dots.children].forEach((d, n) => d.classList.toggle('on', n === i));
+  }, { passive: true });
+}
+
+window.closeLightbox = () => {
+  if (!lightboxEl || lightboxEl.classList.contains('hidden')) return;
+  lightboxEl.classList.add('hidden');
+  lightboxEl.innerHTML = '';
+  document.body.style.overflow = '';
+};
 
 async function loadPlaces() {
   if (state.places.length) return;
