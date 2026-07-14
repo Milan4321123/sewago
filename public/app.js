@@ -395,6 +395,12 @@ function render() {
 
 function renderTab() {
   const view = $('#view');
+  // Glide-in only on real navigation (tab tap, menu open/close) — background
+  // re-renders from polling/SSE must not replay the animation.
+  if (state._pageAnim) {
+    view.classList.add('page-enter');
+    state._pageAnim = false;
+  }
   if (state.tab === 'rides') {
     view.innerHTML = ridesView();
     state._rideKey = rideKey();
@@ -409,6 +415,7 @@ function renderTab() {
 }
 
 window.setTab = async (tab) => {
+  state._pageAnim = state.tab !== tab;
   state.tab = tab;
   state.restaurant = null;
   try {
@@ -958,6 +965,7 @@ window.openRestaurant = (id) => {
   state.cart = {};
   state.deliverTo = '';
   state.deliverToLoc = null;
+  state._pageAnim = true;
   render();
 };
 
@@ -980,6 +988,7 @@ window.useGpsForDelivery = () => {
 
 window.closeMenu = () => {
   state.restaurant = null;
+  state._pageAnim = true;
   render();
 };
 

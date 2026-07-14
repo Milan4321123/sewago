@@ -1,16 +1,29 @@
+/* ============================================================
+   SewaGo "Midnight Glass" design system
+   Deep navy night sky with an emerald aurora; every surface is
+   translucent glass floating above it. Chrome (bars, sheets,
+   dropdowns) gets real backdrop blur; content cards use tinted
+   translucency only, so low-end phones stay at 60fps.
+   ============================================================ */
 :root {
-  --bg: #0b0d12;
-  --card: #151923;
-  --card2: #1c2230;
-  --border: #262e40;
-  --text: #e8ecf4;
-  --muted: #8b93a7;
-  --accent: #22c55e;
-  --accent-dark: #16a34a;
-  --accent-soft: rgba(34, 197, 94, 0.14);
-  --danger: #ef4444;
-  --amber: #f59e0b;
-  --radius: 16px;
+  --bg: #060911;
+  /* Glass surfaces: alpha over the aurora, not opaque paint. */
+  --card: rgba(255, 255, 255, 0.055);
+  --card2: rgba(255, 255, 255, 0.085);
+  --border: rgba(255, 255, 255, 0.09);
+  --glass-hi: inset 0 1px 0 rgba(255, 255, 255, 0.06); /* liquid top edge */
+  --glass-chrome: rgba(10, 14, 23, 0.66); /* bars that blur what scrolls under */
+  --shadow: 0 10px 30px rgba(0, 0, 0, 0.38);
+  --text: #eef2f8;
+  --muted: #93a0b4;
+  --accent: #34d399;
+  --accent-dark: #0ea371;
+  --accent-soft: rgba(52, 211, 153, 0.14);
+  --accent-glow: 0 6px 22px rgba(52, 211, 153, 0.28);
+  --danger: #f87171;
+  --amber: #fbbf24;
+  --radius: 18px;
+  --spring: cubic-bezier(0.22, 1, 0.36, 1); /* fast start, soft landing */
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -23,12 +36,27 @@ html {
 }
 
 body {
-  background: radial-gradient(1200px 500px at 50% -10%, #14351f 0%, var(--bg) 55%);
+  background: var(--bg);
   color: var(--text);
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   -webkit-font-smoothing: antialiased;
   /* App-like scrolling: no rubber-band chaining into the page background. */
   overscroll-behavior-y: contain;
+}
+
+/* Aurora: emerald overhead, cyan to the east, indigo low. Painted on a fixed
+   layer (not background-attachment, which iOS Safari ignores) so the glass
+   surfaces glide over a stationary sky while scrolling. */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background:
+    radial-gradient(900px 480px at 18% -8%, rgba(16, 185, 129, 0.20) 0%, transparent 60%),
+    radial-gradient(760px 420px at 92% 12%, rgba(34, 211, 238, 0.11) 0%, transparent 62%),
+    radial-gradient(820px 520px at 12% 108%, rgba(99, 102, 241, 0.14) 0%, transparent 60%);
 }
 
 /* Touch feel: kill the grey tap flash, remove the 300ms double-tap delay on
@@ -60,26 +88,33 @@ button, .tile, .fare-option, .chip, .geo-opt, a.btn, label.btn {
   align-items: center;
   justify-content: space-between;
   padding: calc(14px + env(safe-area-inset-top, 0px)) 18px 14px;
-  background: rgba(11, 13, 18, 0.85);
-  backdrop-filter: blur(12px);
+  background: var(--glass-chrome);
+  -webkit-backdrop-filter: blur(22px) saturate(170%);
+  backdrop-filter: blur(22px) saturate(170%);
   border-bottom: 1px solid var(--border);
+  box-shadow: var(--glass-hi);
 }
 
 .brand { font-size: 20px; font-weight: 800; letter-spacing: -0.5px; }
-.brand em { color: var(--accent); font-style: normal; }
+.brand em {
+  color: var(--accent);
+  font-style: normal;
+  text-shadow: 0 0 18px rgba(52, 211, 153, 0.55);
+}
 
 .wallet-chip {
   background: var(--accent-soft);
   color: var(--accent);
-  border: 1px solid rgba(34, 197, 94, 0.35);
+  border: 1px solid rgba(52, 211, 153, 0.35);
   padding: 6px 12px;
   border-radius: 999px;
   font-size: 13px;
   font-weight: 700;
+  box-shadow: var(--glass-hi), 0 0 16px rgba(52, 211, 153, 0.12);
 }
 
 /* ---------- layout ---------- */
-main { flex: 1; padding: 18px 18px 96px; }
+main { flex: 1; padding: 18px 18px calc(112px + env(safe-area-inset-bottom, 0px)); }
 
 .section-title { font-size: 17px; font-weight: 800; margin: 20px 0 10px; }
 .section-title:first-child { margin-top: 0; }
@@ -90,6 +125,7 @@ main { flex: 1; padding: 18px 18px 96px; }
   border-radius: var(--radius);
   padding: 16px;
   margin-bottom: 12px;
+  box-shadow: var(--glass-hi), var(--shadow);
 }
 
 .muted { color: var(--muted); font-size: 13px; }
@@ -104,16 +140,20 @@ label.field span { display: block; font-size: 12px; color: var(--muted); margin-
 input, select {
   width: 100%;
   padding: 12px 14px;
-  border-radius: 12px;
+  border-radius: 13px;
   border: 1px solid var(--border);
-  background: var(--card2);
+  background: rgba(255, 255, 255, 0.06);
   color: var(--text);
   /* 16px minimum — anything smaller makes iOS Safari zoom the page on focus. */
   font-size: 16px;
   outline: none;
-  transition: border-color 0.15s ease;
+  box-shadow: var(--glass-hi);
+  transition: border-color 0.18s ease, box-shadow 0.18s ease;
 }
-input:focus, select:focus { border-color: var(--accent); }
+input:focus, select:focus {
+  border-color: var(--accent);
+  box-shadow: var(--glass-hi), 0 0 0 3px rgba(52, 211, 153, 0.16);
+}
 
 /* Address search + GPS ---------------------------------------------------- */
 .geo-field { position: relative; }
@@ -127,9 +167,13 @@ input:focus, select:focus { border-color: var(--accent); }
 .geo-field input { padding-right: 52px; }
 .geo-ac {
   position: absolute; z-index: 30; left: 0; right: 0; top: calc(100% + 4px);
-  background: var(--card); border: 1px solid var(--border); border-radius: 12px;
-  overflow: hidden; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+  background: var(--glass-chrome);
+  -webkit-backdrop-filter: blur(20px) saturate(160%);
+  backdrop-filter: blur(20px) saturate(160%);
+  border: 1px solid var(--border); border-radius: 14px;
+  overflow: hidden; box-shadow: var(--glass-hi), 0 14px 38px rgba(0, 0, 0, 0.55);
   max-height: 260px; overflow-y: auto;
+  animation: pop-in 0.18s var(--spring);
 }
 .geo-ac.hidden { display: none; }
 .geo-opt {
@@ -148,23 +192,32 @@ input:focus, select:focus { border-color: var(--accent); }
   width: 100%;
   padding: 13px 16px;
   border: none;
-  border-radius: 12px;
+  border-radius: 13px;
   background: linear-gradient(135deg, var(--accent), var(--accent-dark));
   color: #04130a;
   font-size: 15px;
   font-weight: 800;
   cursor: pointer;
-  transition: transform 0.06s ease, opacity 0.15s ease;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.25), var(--accent-glow);
+  transition: transform 0.12s var(--spring), box-shadow 0.2s ease, opacity 0.15s ease;
 }
-.btn:active { transform: scale(0.98); }
-.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn:active { transform: scale(0.97); box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.25), 0 3px 10px rgba(52, 211, 153, 0.2); }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; box-shadow: none; }
 
 .btn.ghost {
-  background: transparent;
-  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.12);
   color: var(--text);
+  box-shadow: var(--glass-hi);
 }
-.btn.danger { background: transparent; border: 1px solid rgba(239, 68, 68, 0.5); color: var(--danger); }
+.btn.ghost:active { box-shadow: var(--glass-hi); }
+.btn.danger {
+  background: rgba(248, 113, 113, 0.07);
+  border: 1px solid rgba(248, 113, 113, 0.45);
+  color: var(--danger);
+  box-shadow: var(--glass-hi);
+}
+.btn.danger:active { box-shadow: var(--glass-hi); }
 .btn.compact { width: auto; padding: 9px 14px; font-size: 13px; }
 a.btn { text-decoration: none; }
 
@@ -176,8 +229,13 @@ a.link { text-decoration: none; }
   flex: 1; display: flex; flex-direction: column; justify-content: center;
   padding: calc(32px + env(safe-area-inset-top, 0px)) 24px calc(32px + env(safe-area-inset-bottom, 0px));
 }
-.auth-hero { text-align: center; margin-bottom: 28px; }
-.auth-hero .logo { font-size: 44px; }
+.auth-hero { text-align: center; margin-bottom: 28px; animation: page-in 0.5s var(--spring); }
+.auth-hero .logo {
+  font-size: 44px;
+  filter: drop-shadow(0 6px 22px rgba(52, 211, 153, 0.35));
+  display: inline-block;
+  animation: float-soft 5s ease-in-out infinite;
+}
 .auth-hero h1 { font-size: 30px; font-weight: 900; letter-spacing: -1px; margin-top: 6px; }
 .auth-hero h1 em { color: var(--accent); font-style: normal; }
 .auth-hero p { color: var(--muted); margin-top: 8px; font-size: 14px; }
@@ -185,24 +243,30 @@ a.link { text-decoration: none; }
 .auth-services span b { color: var(--text); }
 
 /* ---------- tab bar ---------- */
+/* Floating glass pill, detached from the screen edge like iOS. */
 .tabbar {
   position: fixed;
-  bottom: 0;
+  bottom: calc(10px + env(safe-area-inset-bottom, 0px));
   left: 50%;
   transform: translateX(-50%);
-  width: 100%;
-  max-width: 480px;
+  width: calc(100% - 24px);
+  max-width: 456px;
   display: flex;
-  background: rgba(15, 18, 26, 0.92);
-  backdrop-filter: blur(12px);
-  border-top: 1px solid var(--border);
-  padding: 8px 6px calc(10px + env(safe-area-inset-bottom));
+  background: var(--glass-chrome);
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  backdrop-filter: blur(24px) saturate(180%);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 26px;
+  padding: 8px 6px 9px;
   z-index: 10;
+  box-shadow: var(--glass-hi), 0 12px 32px rgba(0, 0, 0, 0.5);
 }
 .tabbar button {
   flex: 1;
   background: none;
   border: none;
+  border-radius: 18px;
+  padding: 5px 0 4px;
   color: var(--muted);
   font-size: 11px;
   font-weight: 700;
@@ -212,8 +276,14 @@ a.link { text-decoration: none; }
   align-items: center;
   gap: 3px;
 }
-.tabbar button .ico { font-size: 20px; }
-.tabbar button.active { color: var(--accent); }
+.tabbar button .ico { font-size: 20px; transition: transform 0.2s var(--spring); }
+.tabbar button.active {
+  color: var(--accent);
+  background: var(--accent-soft);
+  text-shadow: 0 0 14px rgba(52, 211, 153, 0.45);
+}
+.tabbar button.active .ico { transform: translateY(-1px) scale(1.12); }
+.tabbar button:active .ico { transform: scale(0.88); }
 
 /* ---------- tiles / list cards ---------- */
 .tile {
@@ -226,11 +296,11 @@ a.link { text-decoration: none; }
   padding: 14px;
   margin-bottom: 10px;
   cursor: pointer;
-  transition: border-color 0.15s ease;
+  box-shadow: var(--glass-hi), var(--shadow);
+  transition: border-color 0.18s ease, transform 0.14s var(--spring), box-shadow 0.2s ease;
 }
-.tile:hover { border-color: var(--accent); }
-.tile:active { transform: scale(0.985); border-color: var(--accent); }
-.tile { transition: border-color 0.15s ease, transform 0.06s ease; }
+.tile:hover { border-color: rgba(52, 211, 153, 0.55); box-shadow: var(--glass-hi), 0 10px 30px rgba(52, 211, 153, 0.1); }
+.tile:active { transform: scale(0.98); border-color: rgba(52, 211, 153, 0.55); }
 .tile .emoji {
   font-size: 26px;
   width: 52px;
@@ -271,9 +341,12 @@ a.link { text-decoration: none; }
   margin-bottom: 10px;
   cursor: pointer;
 }
-.fare-option:hover { border-color: var(--accent); }
-.fare-option:active { transform: scale(0.985); border-color: var(--accent); }
-.fare-option { transition: border-color 0.15s ease, transform 0.06s ease; }
+.fare-option:hover { border-color: rgba(52, 211, 153, 0.55); }
+.fare-option:active { transform: scale(0.98); border-color: rgba(52, 211, 153, 0.55); }
+.fare-option {
+  box-shadow: var(--glass-hi), var(--shadow);
+  transition: border-color 0.18s ease, transform 0.14s var(--spring);
+}
 .fare-option .emoji { font-size: 28px; }
 .fare-option .price { margin-left: auto; font-weight: 900; font-size: 16px; }
 
@@ -285,8 +358,12 @@ a.link { text-decoration: none; }
   background: var(--card2); border: 2px solid var(--border);
   margin: 0 auto 6px;
 }
+.step .dot { transition: background 0.3s ease, border-color 0.3s ease, box-shadow 0.3s ease; }
 .step.done .dot, .step.now .dot { background: var(--accent); border-color: var(--accent); }
-.step.now .dot { box-shadow: 0 0 0 5px var(--accent-soft); }
+.step.now .dot {
+  box-shadow: 0 0 0 5px var(--accent-soft), 0 0 18px rgba(52, 211, 153, 0.5);
+  animation: dot-breathe 2s ease-in-out infinite;
+}
 .step .lbl { font-size: 10.5px; color: var(--muted); font-weight: 700; }
 .step.now .lbl { color: var(--accent); }
 .step::before {
@@ -297,12 +374,18 @@ a.link { text-decoration: none; }
 .step:first-child::before { display: none; }
 
 .progress { height: 6px; background: var(--card2); border-radius: 999px; overflow: hidden; margin-top: 12px; }
-.progress > div { height: 100%; background: linear-gradient(90deg, var(--accent), #4ade80); border-radius: 999px; transition: width 1s linear; }
+.progress > div {
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent), #6ee7b7);
+  border-radius: 999px;
+  transition: width 1s linear;
+  box-shadow: 0 0 12px rgba(52, 211, 153, 0.55);
+}
 
 /* ---------- cart bar ---------- */
 .cartbar {
   position: fixed;
-  bottom: calc(78px + env(safe-area-inset-bottom, 0px));
+  bottom: calc(88px + env(safe-area-inset-bottom, 0px));
   left: 50%;
   transform: translateX(-50%);
   width: calc(100% - 36px);
@@ -328,10 +411,12 @@ a.link { text-decoration: none; }
 /* ---------- toast ---------- */
 .toast {
   position: fixed;
-  bottom: calc(96px + env(safe-area-inset-bottom, 0px));
+  bottom: calc(106px + env(safe-area-inset-bottom, 0px));
   left: 50%;
   transform: translateX(-50%);
-  background: #23293a;
+  background: var(--glass-chrome);
+  -webkit-backdrop-filter: blur(20px) saturate(160%);
+  backdrop-filter: blur(20px) saturate(160%);
   border: 1px solid var(--border);
   color: var(--text);
   padding: 11px 18px;
@@ -446,8 +531,10 @@ a.link { text-decoration: none; }
   font-weight: 800;
   font-size: 13px;
   padding: 9px 12px;
-  border-radius: 10px;
+  border-radius: 12px;
   text-align: center;
+  border: 1px solid rgba(52, 211, 153, 0.22);
+  box-shadow: var(--glass-hi), 0 0 20px rgba(52, 211, 153, 0.1);
 }
 
 .chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 2px 0 12px; }
@@ -502,7 +589,11 @@ a.link { text-decoration: none; }
   border: 1px solid var(--border);
 }
 
-.divider { height: 1px; background: var(--border); margin: 12px 0; }
+.divider {
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.12), transparent);
+  margin: 12px 0;
+}
 
 .amenity {
   display: inline-block;
@@ -544,3 +635,45 @@ a.link { text-decoration: none; }
 .live-head .muted { font-size: 12px; }
 .live-map { height: 380px; border-radius: 14px; overflow: hidden; border: 1px solid var(--border); margin-bottom: 6px; background: var(--card2); }
 .map-legend { margin: 0 2px 14px; }
+
+/* ============================================================
+   Motion system
+   One spring curve everywhere so the whole app moves like one
+   material. Entry animations only fire on real navigation
+   (#view gets .page-enter from setTab), never on background
+   re-renders — that's what keeps it smooth instead of jittery.
+   ============================================================ */
+@keyframes page-in {
+  from { opacity: 0; transform: translateY(14px) scale(0.992); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+@keyframes pop-in {
+  from { opacity: 0; transform: translateY(-4px) scale(0.98); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+@keyframes float-soft {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-5px); }
+}
+@keyframes dot-breathe {
+  0%, 100% { box-shadow: 0 0 0 5px var(--accent-soft), 0 0 14px rgba(52, 211, 153, 0.35); }
+  50% { box-shadow: 0 0 0 7px var(--accent-soft), 0 0 24px rgba(52, 211, 153, 0.6); }
+}
+
+/* Tab / page transition: content glides up as it appears. */
+.page-enter { animation: page-in 0.34s var(--spring); }
+
+/* Desktop scrollbars that match the glass. */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.12); border-radius: 999px; border: 3px solid transparent; background-clip: content-box; }
+::-webkit-scrollbar-thumb:hover { background-color: rgba(255, 255, 255, 0.2); }
+::-webkit-scrollbar-track { background: transparent; }
+
+/* Accessibility: anyone who asked their OS for less motion gets a calm app. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
