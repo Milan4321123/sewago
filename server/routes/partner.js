@@ -4,7 +4,17 @@ const { coordsFor } = require('../places');
 const { withStatus: orderWithStatus, refundOrder } = require('../orderLogic');
 const { recordTxn, recordPlatformRevenue, createWithdrawal } = require('../payments');
 const { PROMOTE_WEEK_PRICE, PROMOTE_WEEK_MS } = require('../fees');
-const { savePartnerPhoto, ownedPhoto } = require('../photos');
+const { savePartnerPhoto, ownedPhotos } = require('../photos');
+
+// Accept either the legacy single `photo` or a `photos` gallery (max 5);
+// `.photo` stays mirrored to the first entry so older clients keep working.
+function galleryFrom(partner, body) {
+  const photos = ownedPhotos(partner, [
+    ...(Array.isArray(body.photos) ? body.photos : []),
+    ...(body.photo ? [body.photo] : [])
+  ]);
+  return { photos, photo: photos[0] || '' };
+}
 const events = require('../events');
 const sessionTokens = require('../sessionTokens');
 const { hashPassword, verifyPassword } = require('../passwords');
@@ -263,16 +273,16 @@ router.post('/partner/photos', authPartner, express.raw({ type: 'image/*', limit
   res.json({ url: result.url });
 });
 
-// Set / change the cover photo of an existing listing.
+// Replace the photo gallery of an existing listing (max 5; first = cover).
 router.post('/partner/:type(restaurants|hotels)/:id/photo', authPartner, (req, res) => {
   const list = req.params.type === 'restaurants' ? db.restaurants : db.hotels;
   const listing = list.find((x) => x.id === req.params.id && x.ownerId === req.partner.id);
   if (!listing) return res.status(404).json({ error: 'Listing not found.' });
-  const photo = ownedPhoto(req.partner, (req.body || {}).photo);
-  if ((req.body || {}).photo && !photo) return res.status(400).json({ error: 'Upload the photo first.' });
+  const { photos, photo } = galleryFrom(req.partner, req.body || {});
+  listing.photos = photos;
   listing.photo = photo;
   save();
-  res.json({ ok: true, photo });
+  res.json({ ok: true, photos, photo });
 });
 
 router.post('/partner/withdraw', authPartner, (req, res) => {
@@ -394,8 +404,9 @@ router.post('/partner/:type(restaurants|hotels)/:id/promote', authPartner, (req,
 
 router.post('/partner/restaurants', authPartner, (req, res) => {
   if (!requirePartnerKyc(req, res)) return;
-  const { name, cuisine, icon, etaMinutes, deliveryFee, area, photo } = req.body || {};
+  const { name, cuisine, icon, etaMinutes, deliveryFee, area } = req.body || {};
   if (!name || !cuisine) return res.status(400).json({ error: 'Restaurant name and cuisine are required.' });
+  const gallery = galleryFrom(req.partner, req.body || {});
   const eta = Math.min(120, Math.max(5, Number(etaMinutes) || 30));
   const fee = Math.min(500, Math.max(0, Number(deliveryFee) || 50));
   // Pickup point for couriers: the area resolves through the gazetteer.
@@ -409,7 +420,8 @@ router.post('/partner/restaurants', authPartner, (req, res) => {
     etaMinutes: eta,
     deliveryFee: fee,
     icon: (icon || '🍽️').slice(0, 8),
-    photo: ownedPhoto(req.partner, photo),
+    photo: gallery.photo,
+    photos: gallery.photos,
     loc: { name: spot.name, lat: spot.lat, lng: spot.lng },
     menu: [],
     status: 'pending', // SewaGo staff review every listing before it goes live
@@ -424,18 +436,20 @@ router.post('/partner/restaurants', authPartner, (req, res) => {
 router.post('/partner/restaurants/:id/menu', authPartner, (req, res) => {
   const restaurant = db.restaurants.find((r) => r.id === req.params.id && r.ownerId === req.partner.id);
   if (!restaurant) return res.status(404).json({ error: 'Restaurant not found.' });
-  const { name, price, desc, photo } = req.body || {};
+  const { name, price, desc } = req.body || {};
   const p = Number(price);
   if (!name || !(p >= 10 && p <= 10000)) {
     return res.status(400).json({ error: 'Item needs a name and a price between Rs 10 and Rs 10,000.' });
   }
   if (restaurant.menu.length >= 30) return res.status(400).json({ error: 'Menu is limited to 30 items.' });
+  const gallery = galleryFrom(req.partner, req.body || {});
   const item = {
     id: uid(),
     name: name.trim(),
     price: Math.round(p),
     desc: String(desc || '').trim(),
-    photo: ownedPhoto(req.partner, photo)
+    photo: gallery.photo,
+    photos: gallery.photos
   };
   restaurant.menu.push(item);
   save();
@@ -462,8 +476,9 @@ router.delete('/partner/restaurants/:id', authPartner, (req, res) => {
 
 router.post('/partner/hotels', authPartner, (req, res) => {
   if (!requirePartnerKyc(req, res)) return;
-  const { name, city, area, desc, icon, photo } = req.body || {};
+  const { name, city, area, desc, icon } = req.body || {};
   if (!name || !city) return res.status(400).json({ error: 'Hotel name and city are required.' });
+  const gallery = galleryFrom(req.partner, req.body || {});
   const hotel = {
     id: uid(),
     ownerId: req.partner.id,
@@ -473,7 +488,8 @@ router.post('/partner/hotels', authPartner, (req, res) => {
     desc: String(desc || '').trim(),
     rating: null, // shows as NEW until it earns reviews
     icon: (icon || '🏨').slice(0, 8),
-    photo: ownedPhoto(req.partner, photo),
+    photo: gallery.photo,
+    photos: gallery.photos,
     rooms: [],
     status: 'pending', // SewaGo staff review every listing before it goes live
     reviewNote: '',
@@ -487,7 +503,8 @@ router.post('/partner/hotels', authPartner, (req, res) => {
 router.post('/partner/hotels/:id/rooms', authPartner, (req, res) => {
   const hotel = db.hotels.find((h) => h.id === req.params.id && h.ownerId === req.partner.id);
   if (!hotel) return res.status(404).json({ error: 'Hotel not found.' });
-  const { type, pricePerNight, count, sleeps, amenities, photo } = req.body || {};
+  const { type, pricePerNight, count, sleeps, amenities } = req.body || {};
+  const gallery = galleryFrom(req.partner, req.body || {});
   const price = Number(pricePerNight);
   const n = Number(count);
   const s = Number(sleeps);
@@ -502,7 +519,8 @@ router.post('/partner/hotels/:id/rooms', authPartner, (req, res) => {
     pricePerNight: Math.round(price),
     count: Math.round(n),
     sleeps: Math.min(10, Math.max(1, Math.round(s) || 2)),
-    photo: ownedPhoto(req.partner, photo),
+    photo: gallery.photo,
+    photos: gallery.photos,
     amenities: String(amenities || '')
       .split(',')
       .map((a) => a.trim())

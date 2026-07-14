@@ -653,6 +653,15 @@ test('partner photo upload: validated, served, and attached to listings', async 
   assert.equal(item.status, 200);
   assert.equal(item.data.restaurant.menu[0].photo, '', 'unowned photo refs must be dropped');
 
+  // Gallery update: duplicates and unowned refs are dropped, order kept.
+  const gallery = await api(`/partner/restaurants/${rest.data.restaurant.id}/photo`, {
+    method: 'POST', token,
+    body: { photos: [ok.data.url, ok.data.url, '/uploads/not-mine.png'] }
+  });
+  assert.equal(gallery.status, 200, JSON.stringify(gallery.data));
+  assert.deepEqual(gallery.data.photos, [ok.data.url], 'gallery keeps only owned, deduped photos');
+  assert.equal(gallery.data.photo, ok.data.url, 'cover mirrors the first gallery photo');
+
   // Customers see the photo once the listing is approved.
   await api(`/admin/restaurants/${rest.data.restaurant.id}/approve`, { method: 'POST', token: admin.data.token });
   const { token: customerToken } = await registerUser('photo-viewer');
@@ -660,6 +669,7 @@ test('partner photo upload: validated, served, and attached to listings', async 
   const seen = list.data.restaurants.find((r) => r.id === rest.data.restaurant.id);
   assert.ok(seen, 'approved restaurant must be listed');
   assert.equal(seen.photo, ok.data.url);
+  assert.deepEqual(seen.photos, [ok.data.url]);
 });
 
 test('surge applies when riders outnumber online drivers', async () => {

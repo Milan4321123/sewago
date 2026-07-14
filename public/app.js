@@ -108,6 +108,34 @@ function fmtDateTime(ts) {
   return new Date(ts).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 }
 
+/* ---------------- listing photo galleries ---------------- */
+
+function photosOf(x) {
+  if (Array.isArray(x.photos) && x.photos.length) return x.photos;
+  return x.photo ? [x.photo] : [];
+}
+
+// Swipeable gallery: one photo = full-width cover; several = a snap-scroll
+// strip you flick through like any listings app.
+function photoStrip(urls, alt) {
+  if (!urls.length) return '';
+  if (urls.length === 1) return `<img class="cover-img" src="${esc(urls[0])}" alt="${esc(alt)}" loading="lazy" />`;
+  return `
+  <div class="photo-strip">
+    ${urls.map((u) => `<img src="${esc(u)}" alt="${esc(alt)}" loading="lazy" />`).join('')}
+  </div>`;
+}
+
+// Small inline variant for menu items / room types.
+function thumbStrip(urls, alt) {
+  if (!urls.length) return '';
+  if (urls.length === 1) return `<img class="thumb" src="${esc(urls[0])}" alt="${esc(alt)}" loading="lazy" />`;
+  return `
+  <div class="thumb-strip">
+    ${urls.map((u) => `<img src="${esc(u)}" alt="${esc(alt)}" loading="lazy" />`).join('')}
+  </div>`;
+}
+
 async function loadPlaces() {
   if (state.places.length) return;
   try {
@@ -1069,7 +1097,7 @@ function menuView() {
     <span class="badge">${r.rating ? '★ ' + r.rating : 'NEW'} · ${r.etaMinutes} min</span>
   </div>
   <div class="card">
-    ${r.photo ? `<img class="cover-img" src="${esc(r.photo)}" alt="${esc(r.name)}" />` : ''}
+    ${photoStrip(photosOf(r), r.name)}
     <div class="row">
       <div>
         <div style="font-size:19px;font-weight:900">${r.icon} ${esc(r.name)}</div>
@@ -1079,10 +1107,11 @@ function menuView() {
   </div>
   ${r.menu.map((m) => {
     const qty = state.cart[m.id] || 0;
+    const mPhotos = photosOf(m);
     return `
     <div class="card">
       <div class="row">
-        ${m.photo ? `<img class="thumb" src="${esc(m.photo)}" alt="${esc(m.name)}" loading="lazy" />` : ''}
+        ${mPhotos.length === 1 ? thumbStrip(mPhotos, m.name) : ''}
         <div class="grow">
           <div><b>${esc(m.name)}</b></div>
           <div class="muted small">${esc(m.desc)}</div>
@@ -1093,6 +1122,7 @@ function menuView() {
           <button onclick="cartAdd('${m.id}', 1)">+</button>
         </div>
       </div>
+      ${mPhotos.length > 1 ? thumbStrip(mPhotos, m.name) : ''}
     </div>`;
   }).join('')}
   ${r.ownerId && count > 0 ? `
@@ -1216,7 +1246,7 @@ function hotelResults() {
   return `<div class="section-title">${state.hotels.length} hotels · ${nights} night${nights > 1 ? 's' : ''}</div>` +
     state.hotels.map((h) => `
     <div class="card">
-      ${h.photo ? `<img class="cover-img" src="${esc(h.photo)}" alt="${esc(h.name)}" loading="lazy" />` : ''}
+      ${photoStrip(photosOf(h), h.name)}
       <div class="row">
         <div>
           <div style="font-weight:900">${h.icon} ${esc(h.name)}${h.promotedUntil > Date.now() ? ' <span class="badge" style="background:#713f12;color:#fde68a">⭐ Featured</span>' : ''}</div>
@@ -1225,18 +1255,24 @@ function hotelResults() {
         <span class="badge">${h.rating ? '★ ' + h.rating : 'NEW'}</span>
       </div>
       <div class="divider"></div>
-      ${h.rooms.map((room) => `
-        <div class="row" style="margin-bottom:12px">
-          ${room.photo ? `<img class="thumb" src="${esc(room.photo)}" alt="${esc(room.type)}" loading="lazy" />` : ''}
-          <div class="grow">
-            <div><b>${esc(room.type)}</b> <span class="muted small">· sleeps ${room.sleeps}</span></div>
-            <div style="margin:4px 0 2px">${room.amenities.map((a) => `<span class="amenity">${esc(a)}</span>`).join('')}</div>
-            <div class="small"><b>${money(room.pricePerNight)}</b><span class="muted"> /night · ${money(room.pricePerNight * nights)} total</span></div>
+      ${h.rooms.map((room) => {
+        const rPhotos = photosOf(room);
+        return `
+        <div style="margin-bottom:12px">
+          <div class="row">
+            ${rPhotos.length === 1 ? thumbStrip(rPhotos, room.type) : ''}
+            <div class="grow">
+              <div><b>${esc(room.type)}</b> <span class="muted small">· sleeps ${room.sleeps}</span></div>
+              <div style="margin:4px 0 2px">${room.amenities.map((a) => `<span class="amenity">${esc(a)}</span>`).join('')}</div>
+              <div class="small"><b>${money(room.pricePerNight)}</b><span class="muted"> /night · ${money(room.pricePerNight * nights)} total</span></div>
+            </div>
+            ${room.available > 0
+              ? `<button class="btn compact" style="width:auto" onclick="bookRoom('${h.id}','${room.id}')">Book</button>`
+              : `<span class="badge red">Sold out</span>`}
           </div>
-          ${room.available > 0
-            ? `<button class="btn compact" style="width:auto" onclick="bookRoom('${h.id}','${room.id}')">Book</button>`
-            : `<span class="badge red">Sold out</span>`}
-        </div>`).join('')}
+          ${rPhotos.length > 1 ? thumbStrip(rPhotos, room.type) : ''}
+        </div>`;
+      }).join('')}
     </div>`).join('');
 }
 

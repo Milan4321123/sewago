@@ -60,4 +60,22 @@ function ownedPhoto(partner, value) {
   return rec ? url : '';
 }
 
-module.exports = { savePartnerPhoto, ownedPhoto, UPLOADS_DIR };
+const MAX_PHOTOS_PER_LISTING = 5;
+
+// Same ownership rule for a whole gallery: keep only this partner's uploads,
+// de-duplicated, capped at 5.
+function ownedPhotos(partner, list) {
+  const seen = new Set();
+  const out = [];
+  for (const value of Array.isArray(list) ? list : []) {
+    const url = ownedPhoto(partner, value);
+    if (url && !seen.has(url)) {
+      seen.add(url);
+      out.push(url);
+      if (out.length >= MAX_PHOTOS_PER_LISTING) break;
+    }
+  }
+  return out;
+}
+
+module.exports = { savePartnerPhoto, ownedPhoto, ownedPhotos, MAX_PHOTOS_PER_LISTING, UPLOADS_DIR };

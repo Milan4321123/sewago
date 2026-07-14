@@ -602,13 +602,67 @@ a.link { text-decoration: none; }
   flex-shrink: 0;
   background: var(--card2);
 }
-/* Partner upload field: preview + pick button side by side. */
+/* Partner upload field: preview thumbnails + pick button side by side. */
 .photo-field { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; flex-wrap: wrap; }
 .photo-field .photo-preview {
   width: 72px; height: 72px;
   border-radius: 12px;
   object-fit: cover;
   border: 1px solid var(--border);
+  display: block;
+}
+.photo-cell { position: relative; display: inline-block; }
+.photo-cell .photo-x {
+  position: absolute;
+  top: -6px; right: -6px;
+  width: 22px; height: 22px;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: var(--glass-chrome);
+  color: var(--text);
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+}
+/* Customer gallery: flick through up to 5 photos, iOS snap feel. */
+.photo-strip {
+  display: flex;
+  gap: 8px;
+  margin: -16px -16px 12px;
+  padding: 0 16px;
+  overflow-x: auto;
+  scroll-snap-type: x mandatory;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+}
+.photo-strip::-webkit-scrollbar { display: none; }
+.photo-strip img {
+  height: 150px;
+  min-width: 82%;
+  object-fit: cover;
+  border-radius: 14px;
+  scroll-snap-align: center;
+  background: var(--card2);
+}
+.photo-strip img:first-child { border-radius: var(--radius) 14px 14px var(--radius); }
+/* Inline mini gallery for menu items / room types. */
+.thumb-strip {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+  overflow-x: auto;
+  scroll-snap-type: x proximity;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+}
+.thumb-strip::-webkit-scrollbar { display: none; }
+.thumb-strip img {
+  width: 92px; height: 72px;
+  object-fit: cover;
+  border-radius: 12px;
+  scroll-snap-align: start;
+  flex-shrink: 0;
+  background: var(--card2);
 }
 
 .divider {

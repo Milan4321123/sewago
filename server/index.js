@@ -56,7 +56,9 @@ const CSP = [
   "default-src 'self'",
   "script-src 'self' 'unsafe-inline' https://unpkg.com",
   "style-src 'self' 'unsafe-inline' https://unpkg.com",
-  "img-src 'self' data: https://unpkg.com https://*.basemaps.cartocdn.com",
+  // blob: lets the partner portal preview/downscale a picked photo locally
+  // (URL.createObjectURL) before uploading it.
+  "img-src 'self' data: blob: https://unpkg.com https://*.basemaps.cartocdn.com",
   "connect-src 'self'",
   "manifest-src 'self'",
   "worker-src 'self'",

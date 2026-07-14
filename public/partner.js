@@ -105,21 +105,32 @@ async function uploadPhotoBlob(blob) {
   return data.url;
 }
 
-// Reusable "add photo" field: preview thumbnail + hidden file input. The
-// uploaded URL parks in state.photos[slot] until the form that owns the slot
-// is submitted.
-function photoField(slot, label = '📷 Add photo') {
-  const url = state.photos[slot];
+const MAX_PHOTOS = 5;
+
+function slotPhotos(slot) {
+  if (!Array.isArray(state.photos[slot])) state.photos[slot] = [];
+  return state.photos[slot];
+}
+
+// Reusable gallery field: up to 5 photos, tap ✕ on any to drop it. Uploaded
+// URLs park in state.photos[slot] until the form that owns the slot submits.
+function photoField(slot, label = '📷 Add photos') {
+  const urls = slotPhotos(slot);
   const busy = state.photoBusy === slot;
   return `
   <div class="photo-field">
-    ${url ? `<img class="photo-preview" src="${esc(url)}" alt="photo" />` : ''}
+    ${urls.map((url) => `
+      <span class="photo-cell">
+        <img class="photo-preview" src="${esc(url)}" alt="photo" />
+        <button class="photo-x" onclick="clearPhoto('${slot}', '${esc(url)}')">✕</button>
+      </span>`).join('')}
+    ${urls.length < MAX_PHOTOS ? `
     <label class="btn ghost compact" style="margin:0">
-      ${busy ? 'Uploading…' : url ? '🔁 Change photo' : label}
-      <input type="file" accept="image/*" style="display:none" ${busy ? 'disabled' : ''}
+      ${busy ? 'Uploading…' : label}
+      <input type="file" accept="image/*" multiple style="display:none" ${busy ? 'disabled' : ''}
         onchange="pickPhoto(event, '${slot}')" />
-    </label>
-    ${url && !busy ? `<button class="link" onclick="clearPhoto('${slot}')">remove</button>` : ''}
+    </label>` : ''}
+    ${urls.length ? `<span class="muted small">${urls.length}/${MAX_PHOTOS}</span>` : ''}
   </div>`;
 }
 
@@ -138,14 +149,21 @@ function renderKeepingForms() {
 }
 
 window.pickPhoto = async (event, slot) => {
-  const file = event.target.files && event.target.files[0];
-  if (!file) return;
+  const files = Array.from(event.target.files || []);
+  if (!files.length) return;
+  const urls = slotPhotos(slot);
   state.photoBusy = slot;
   renderKeepingForms();
   try {
-    const blob = await downscaleImage(file);
-    state.photos[slot] = await uploadPhotoBlob(blob);
-    toast('Photo uploaded 📷');
+    for (const file of files) {
+      if (urls.length >= MAX_PHOTOS) {
+        toast(`Up to ${MAX_PHOTOS} photos each.`, true);
+        break;
+      }
+      const blob = await downscaleImage(file);
+      urls.push(await uploadPhotoBlob(blob));
+    }
+    toast(`${urls.length} photo${urls.length > 1 ? 's' : ''} ready 📷`);
   } catch (e) {
     toast(e.message, true);
   } finally {
@@ -154,22 +172,65 @@ window.pickPhoto = async (event, slot) => {
   }
 };
 
-window.clearPhoto = (slot) => {
-  delete state.photos[slot];
+window.clearPhoto = (slot, url) => {
+  state.photos[slot] = slotPhotos(slot).filter((u) => u !== url);
   render();
 };
 
-// Change the cover photo of an already-created listing in one step.
-window.changeCover = async (event, type, id) => {
-  const file = event.target.files && event.target.files[0];
-  if (!file) return;
+function photosOf(x) {
+  if (Array.isArray(x.photos) && x.photos.length) return x.photos;
+  return x.photo ? [x.photo] : [];
+}
+
+// Gallery manager on an already-live listing: add appends (max 5), ✕ removes.
+function listingGallery(type, x) {
+  const urls = photosOf(x);
+  return `
+  <div class="photo-field" style="margin-top:10px">
+    ${urls.map((url) => `
+      <span class="photo-cell">
+        <img class="photo-preview" src="${esc(url)}" alt="photo" />
+        <button class="photo-x" onclick="removeListingPhoto('${type}', '${x.id}', '${esc(url)}')">✕</button>
+      </span>`).join('')}
+    ${urls.length < MAX_PHOTOS ? `
+    <label class="btn ghost compact" style="margin:0">📷 Add photos
+      <input type="file" accept="image/*" multiple style="display:none"
+        onchange="addListingPhotos(event, '${type}', '${x.id}')" />
+    </label>` : ''}
+  </div>`;
+}
+
+window.addListingPhotos = async (event, type, id) => {
+  const files = Array.from(event.target.files || []);
+  if (!files.length) return;
   try {
-    toast('Uploading photo…');
-    const blob = await downscaleImage(file);
-    const url = await uploadPhotoBlob(blob);
-    await api(`/api/partner/${type}/${id}/photo`, { method: 'POST', body: { photo: url } });
+    toast('Uploading…');
+    const list = type === 'restaurants' ? state.restaurants : state.hotels;
+    const photos = photosOf(list.find((x) => x.id === id) || {});
+    for (const file of files) {
+      if (photos.length >= MAX_PHOTOS) {
+        toast(`Up to ${MAX_PHOTOS} photos each.`, true);
+        break;
+      }
+      const blob = await downscaleImage(file);
+      photos.push(await uploadPhotoBlob(blob));
+    }
+    await api(`/api/partner/${type}/${id}/photo`, { method: 'POST', body: { photos } });
     await reload();
-    toast('Cover photo updated 📷');
+    toast('Photos updated 📷');
+    render();
+  } catch (e) {
+    toast(e.message, true);
+  }
+};
+
+window.removeListingPhoto = async (type, id, url) => {
+  try {
+    const list = type === 'restaurants' ? state.restaurants : state.hotels;
+    const photos = photosOf(list.find((x) => x.id === id) || {}).filter((u) => u !== url);
+    await api(`/api/partner/${type}/${id}/photo`, { method: 'POST', body: { photos } });
+    await reload();
+    toast('Photo removed.');
     render();
   } catch (e) {
     toast(e.message, true);
@@ -860,7 +921,7 @@ window.addRestaurant = async () => {
         etaMinutes: $('#r-eta').value,
         deliveryFee: $('#r-fee').value,
         icon: $('#r-icon').value,
-        photo: state.photos['new-rest'] || ''
+        photos: state.photos['new-rest'] || []
       }
     });
     delete state.photos['new-rest'];
@@ -928,9 +989,7 @@ function restaurantCard(r) {
       </div>
       <button class="btn danger compact" onclick="deleteRestaurant('${r.id}')">Remove</button>
     </div>
-    <label class="link" style="cursor:pointer">${r.photo ? '🔁 Change cover photo' : '📷 Add a cover photo'}
-      <input type="file" accept="image/*" style="display:none" onchange="changeCover(event, 'restaurants', '${r.id}')" />
-    </label>
+    ${listingGallery('restaurants', r)}
     ${reviewStatusLine(r, 'restaurants')}
     ${promoBlock('restaurants', r)}
     <div class="divider"></div>
@@ -964,7 +1023,7 @@ window.addMenuItem = async (rid) => {
         name: $(`#mi-name-${rid}`).value.trim(),
         price: $(`#mi-price-${rid}`).value,
         desc: $(`#mi-desc-${rid}`).value.trim(),
-        photo: state.photos[`menu-${rid}`] || ''
+        photos: state.photos[`menu-${rid}`] || []
       }
     });
     delete state.photos[`menu-${rid}`];
@@ -1029,7 +1088,7 @@ window.addHotel = async () => {
         area: $('#h-area').value.trim(),
         desc: $('#h-desc').value.trim(),
         icon: $('#h-icon').value,
-        photo: state.photos['new-hotel'] || ''
+        photos: state.photos['new-hotel'] || []
       }
     });
     delete state.photos['new-hotel'];
@@ -1053,9 +1112,7 @@ function hotelCard(h) {
       </div>
       <button class="btn danger compact" onclick="deleteHotel('${h.id}')">Remove</button>
     </div>
-    <label class="link" style="cursor:pointer">${h.photo ? '🔁 Change cover photo' : '📷 Add a cover photo'}
-      <input type="file" accept="image/*" style="display:none" onchange="changeCover(event, 'hotels', '${h.id}')" />
-    </label>
+    ${listingGallery('hotels', h)}
     ${reviewStatusLine(h, 'hotels')}
     ${promoBlock('hotels', h)}
     <div class="divider"></div>
@@ -1095,7 +1152,7 @@ window.addRoom = async (hid) => {
         count: $(`#ro-count-${hid}`).value,
         sleeps: $(`#ro-sleeps-${hid}`).value,
         amenities: $(`#ro-amen-${hid}`).value,
-        photo: state.photos[`room-${hid}`] || ''
+        photos: state.photos[`room-${hid}`] || []
       }
     });
     delete state.photos[`room-${hid}`];
