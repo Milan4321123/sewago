@@ -9,7 +9,7 @@ const {
   FOOD_DELIVERY_MAX_EXTRA,
   deliveryFeeFor
 } = require('../fees');
-const { withStatus, refundOrder, isLive, applyRating } = require('../orderLogic');
+const { withStatus, refundOrder, isLive, applyRating, addReview, reviewsFor } = require('../orderLogic');
 const { resolveLocation } = require('../geo');
 const events = require('../events');
 
@@ -180,9 +180,31 @@ router.post('/orders/:id/rate', authRequired, (req, res) => {
   order.ratingStars = stars;
   order.ratedAt = Date.now();
   const restaurant = db.restaurants.find((r) => r.id === order.restaurantId);
-  if (restaurant) applyRating(restaurant, stars);
+  if (restaurant) {
+    applyRating(restaurant, stars);
+    // The rating doubles as a public review other customers can read.
+    addReview({
+      kind: 'restaurant',
+      listingId: restaurant.id,
+      user: req.user,
+      stars,
+      text: (req.body || {}).text,
+      refId: order.id
+    });
+  }
   save();
   res.json({ order: { ...order } });
+});
+
+// Reviews from past diners, newest first — every order rating lands here.
+router.get('/restaurants/:id/reviews', authRequired, (req, res) => {
+  const restaurant = db.restaurants.find((r) => r.id === req.params.id && isLive(r));
+  if (!restaurant) return res.status(404).json({ error: 'Restaurant not found.' });
+  res.json({
+    reviews: reviewsFor('restaurant', restaurant.id),
+    rating: restaurant.rating,
+    ratingCount: restaurant.ratingCount || 0
+  });
 });
 
 module.exports = router;

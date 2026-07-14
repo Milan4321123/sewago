@@ -592,6 +592,11 @@ a.link { text-decoration: none; }
 }
 .chip:hover { color: var(--accent); border-color: var(--accent); }
 
+/* ---------- reviews ---------- */
+.review-row { padding: 9px 0; border-bottom: 1px solid rgba(255, 255, 255, 0.06); }
+.review-row:last-child { border-bottom: none; }
+.review-stars { color: var(--amber); font-size: 12px; letter-spacing: 1px; margin-left: 6px; }
+
 .empty { text-align: center; color: var(--muted); padding: 30px 10px; font-size: 14px; }
 .empty .big { font-size: 34px; margin-bottom: 8px; }
 

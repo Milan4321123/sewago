@@ -179,6 +179,8 @@ function migrate(data) {
   data.platformLedger = data.platformLedger || [];
   data.otpCodes = data.otpCodes || [];
   data.passwordResetTokens = data.passwordResetTokens || [];
+  data.uploads = data.uploads || [];
+  data.reviews = data.reviews || [];
   for (const user of data.users) {
     if (user.phone === undefined) user.phone = '';
     if (user.phoneVerified === undefined) user.phoneVerified = false;

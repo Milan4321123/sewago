@@ -2,6 +2,7 @@ const express = require('express');
 const { db, save, uid } = require('../db');
 const { authRequired, publicUser } = require('./auth');
 const { recordTxn, recordPlatformRevenue } = require('../payments');
+const { applyRating, addReview, reviewsFor } = require('../orderLogic');
 const events = require('../events');
 
 const router = express.Router();
@@ -132,6 +133,50 @@ router.post('/bookings', authRequired, (req, res) => {
 router.get('/bookings', authRequired, (req, res) => {
   const bookings = db.bookings.filter((b) => b.userId === req.user.id).slice().reverse();
   res.json({ bookings });
+});
+
+// A guest can review a hotel exactly once, and only for a stay they actually
+// finished: the booking must be theirs, still active (not cancelled), and the
+// check-out date must have passed.
+router.post('/bookings/:id/rate', authRequired, (req, res) => {
+  const booking = db.bookings.find((b) => b.id === req.params.id && b.userId === req.user.id);
+  if (!booking) return res.status(404).json({ error: 'Booking not found.' });
+  const stars = Number((req.body || {}).stars);
+  if (!(stars >= 1 && stars <= 5)) return res.status(400).json({ error: 'Rating must be 1-5 stars.' });
+  if (booking.status !== 'active') {
+    return res.status(400).json({ error: 'Cancelled bookings cannot be reviewed.' });
+  }
+  if (booking.checkOut > todayStr()) {
+    return res.status(400).json({ error: 'You can review your stay after check-out.' });
+  }
+  if (booking.ratingStars) return res.status(409).json({ error: 'You already reviewed this stay.' });
+  booking.ratingStars = stars;
+  booking.ratedAt = Date.now();
+  const hotel = db.hotels.find((h) => h.id === booking.hotelId);
+  if (hotel) {
+    applyRating(hotel, stars);
+    addReview({
+      kind: 'hotel',
+      listingId: hotel.id,
+      user: req.user,
+      stars,
+      text: (req.body || {}).text,
+      refId: booking.id
+    });
+  }
+  save();
+  res.json({ booking });
+});
+
+// Reviews from past guests, newest first.
+router.get('/hotels/:id/reviews', authRequired, (req, res) => {
+  const hotel = db.hotels.find((h) => h.id === req.params.id && isLive(h));
+  if (!hotel) return res.status(404).json({ error: 'Hotel not found.' });
+  res.json({
+    reviews: reviewsFor('hotel', hotel.id),
+    rating: hotel.rating,
+    ratingCount: hotel.ratingCount || 0
+  });
 });
 
 router.post('/bookings/:id/cancel', authRequired, (req, res) => {

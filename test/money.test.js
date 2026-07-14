@@ -511,14 +511,25 @@ test('live food order: restaurant confirms, courier delivers, everyone is paid',
   const partnerAfter = (await api('/partner/me', { token: partnerToken })).data.partner.earnings;
   assert.equal(partnerAfter - partnerBefore, 0, 'partner cut for the rejected order must be reversed');
 
-  // Rating: the delivered order gives the brand-new restaurant its first stars.
-  const rated = await api(`/orders/${order.id}/rate`, { method: 'POST', token: customerToken, body: { stars: 5 } });
+  // Rating: the delivered order gives the brand-new restaurant its first
+  // stars AND a public review other customers can read.
+  const rated = await api(`/orders/${order.id}/rate`, {
+    method: 'POST', token: customerToken, body: { stars: 5, text: 'Momos arrived hot, would order again' }
+  });
   assert.equal(rated.status, 200, JSON.stringify(rated.data));
   const listing = (await api('/restaurants', { token: customerToken })).data.restaurants
     .find((r) => r.id === restaurantId);
   assert.equal(listing.rating, 5, 'first real rating must replace the NEW badge');
   const again = await api(`/orders/${order.id}/rate`, { method: 'POST', token: customerToken, body: { stars: 1 } });
   assert.equal(again.status, 409, 'an order can only be rated once');
+
+  const reviews = await api(`/restaurants/${restaurantId}/reviews`, { token: customerToken });
+  assert.equal(reviews.status, 200, JSON.stringify(reviews.data));
+  assert.equal(reviews.data.reviews.length, 1);
+  assert.equal(reviews.data.reviews[0].stars, 5);
+  assert.equal(reviews.data.reviews[0].text, 'Momos arrived hot, would order again');
+  assert.match(reviews.data.reviews[0].userName, /^foodie/, 'reviewer name is shown (masked form)');
+  assert.equal(reviews.data.ratingCount, 1);
 
   // Promoted listing: the partner spends earnings (Rs 850 accrued) to feature
   // the restaurant — it must jump to the top of the customer list.
@@ -541,6 +552,39 @@ test('live food order: restaurant confirms, courier delivers, everyone is paid',
 
   // Leave no extra bike supply behind — the surge test below counts online drivers.
   await api('/driver/online', { method: 'POST', token: courierToken, body: { online: false } });
+});
+
+test('hotel reviews: only after check-out, and readable by other customers', async () => {
+  const { token } = await registerUser('guest');
+  const hotels = await api('/hotels', { token });
+  const hotel = hotels.data.hotels[0];
+  assert.ok(hotel, 'seeded hotels must exist');
+
+  // Reviews are listed per hotel (empty until someone finishes a stay).
+  const before = await api(`/hotels/${hotel.id}/reviews`, { token });
+  assert.equal(before.status, 200, JSON.stringify(before.data));
+  assert.ok(Array.isArray(before.data.reviews));
+
+  // Book an upcoming stay — reviewing before check-out must be refused.
+  const day = (n) => new Date(Date.now() + n * 86400000).toISOString().slice(0, 10);
+  const booked = await api('/bookings', {
+    method: 'POST',
+    token,
+    body: { hotelId: hotel.id, roomId: hotel.rooms[0].id, checkIn: day(1), checkOut: day(2) }
+  });
+  assert.equal(booked.status, 200, JSON.stringify(booked.data));
+  const early = await api(`/bookings/${booked.data.booking.id}/rate`, {
+    method: 'POST', token, body: { stars: 5, text: 'Lovely' }
+  });
+  assert.equal(early.status, 400);
+  assert.match(early.data.error, /check-out/i, 'reviews must wait until the stay is over');
+
+  // A cancelled booking can never be reviewed either.
+  await api(`/bookings/${booked.data.booking.id}/cancel`, { method: 'POST', token });
+  const cancelled = await api(`/bookings/${booked.data.booking.id}/rate`, {
+    method: 'POST', token, body: { stars: 5 }
+  });
+  assert.equal(cancelled.status, 400);
 });
 
 test('task hiring: workers apply, poster hires one, payment flows on confirm', async () => {

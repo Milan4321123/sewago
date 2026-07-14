@@ -117,12 +117,49 @@ function applyRating(entity, stars) {
   entity.ratingCount = count + 1;
 }
 
+// "Milan Adhikari" -> "Milan A." — reviews show who wrote them without
+// exposing full customer names to every other guest.
+function reviewerName(name) {
+  const parts = String(name || 'Customer').trim().split(/\s+/);
+  return parts.length > 1 ? `${parts[0]} ${parts[parts.length - 1][0]}.` : parts[0];
+}
+
+// One review per delivered order / finished stay: written at rating time,
+// readable by every customer on the listing page.
+function addReview({ kind, listingId, user, stars, text, refId }) {
+  const { uid } = require('./db');
+  const review = {
+    id: uid(),
+    kind, // 'restaurant' | 'hotel'
+    listingId,
+    userId: user.id,
+    userName: reviewerName(user.name),
+    stars,
+    text: String(text || '').trim().slice(0, 300),
+    refId,
+    createdAt: Date.now()
+  };
+  db.reviews = db.reviews || [];
+  db.reviews.push(review);
+  return review;
+}
+
+function reviewsFor(kind, listingId, limit = 20) {
+  return (db.reviews || [])
+    .filter((r) => r.kind === kind && r.listingId === listingId)
+    .slice(-limit)
+    .reverse()
+    .map((r) => ({ userName: r.userName, stars: r.stars, text: r.text, createdAt: r.createdAt }));
+}
+
 module.exports = {
   withStatus,
   refundOrder,
   courierPayoutFor,
   currentDelivery,
   applyRating,
+  addReview,
+  reviewsFor,
   isLive,
   ACCEPT_TIMEOUT_MS,
   COURIER_SHARE

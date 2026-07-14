@@ -36,6 +36,11 @@ const state = {
   hotels: null,
   bookings: [],
   cities: [],
+  // reviews
+  listingReviews: null, // open restaurant: { id, list, rating, count }
+  hotelReviews: {}, // hotelId -> { open, list, rating, count }
+  orderReview: { id: '', stars: 0 }, // delivered order being reviewed
+  stayReview: { id: '', stars: 0 }, // finished stay being reviewed
   // payments
   txns: [],
   payUi: null,
@@ -144,6 +149,26 @@ function thumbStrip(urls, alt) {
   <div class="thumb-strip">
     ${urls.map((u, i) => `<img src="${esc(u)}" alt="${esc(alt)}" loading="lazy" ${lightboxAttrs(urls, i)} />`).join('')}
   </div>`;
+}
+
+/* ---------------- reviews ---------------- */
+
+function starRow(stars) {
+  return '★'.repeat(stars) + '<span style="opacity:0.25">' + '★'.repeat(5 - stars) + '</span>';
+}
+
+function reviewList(list) {
+  if (!list || !list.length) {
+    return `<div class="muted small">No reviews yet — be the first after your visit.</div>`;
+  }
+  return list.map((r) => `
+    <div class="review-row">
+      <div class="row">
+        <div><b>${esc(r.userName)}</b> <span class="review-stars">${starRow(r.stars)}</span></div>
+        <span class="muted small">${new Date(r.createdAt).toLocaleDateString([], { month: 'short', day: 'numeric' })}</span>
+      </div>
+      ${r.text ? `<div class="muted small" style="margin-top:3px">“${esc(r.text)}”</div>` : ''}
+    </div>`).join('');
 }
 
 /* Fullscreen viewer: native scroll-snap does the swiping, so it feels like
@@ -1056,19 +1081,36 @@ function ordersSlot() {
       <div class="divider"></div>
       <div style="text-align:center"><b>How was the food?</b></div>
       <div class="stars">
-        ${[1, 2, 3, 4, 5].map((n) => `<button onclick="rateOrder('${o.id}', ${n})">⭐</button>`).join('')}
+        ${[1, 2, 3, 4, 5].map((n) => `<button class="${state.orderReview.id === o.id && state.orderReview.stars >= n ? 'on' : ''}" onclick="pickOrderStars('${o.id}', ${n})">⭐</button>`).join('')}
       </div>
+      ${state.orderReview.id === o.id ? `
+      <label class="field"><span>Tell others how it was (optional)</span>
+        <input id="order-review-text" maxlength="300" placeholder="e.g. Momos arrived hot, would order again" />
+      </label>
+      <button class="btn" onclick="rateOrder('${o.id}')">Submit review</button>` : ''}
       <button class="btn ghost" style="margin-top:6px" onclick="dismissOrderRating('${o.id}')">Skip</button>` : ''}
     </div>`;
   }).join('');
 }
 
-window.rateOrder = async (id, stars) => {
+window.pickOrderStars = (id, stars) => {
+  const keepText = state.orderReview.id === id ? ($('#order-review-text') || {}).value || '' : '';
+  state.orderReview = { id, stars };
+  render();
+  const input = $('#order-review-text');
+  if (input) input.value = keepText;
+};
+
+window.rateOrder = async (id) => {
+  const { stars } = state.orderReview;
+  if (!stars) return toast('Pick a star rating first.', true);
   try {
-    await api(`/api/orders/${id}/rate`, { method: 'POST', body: { stars } });
+    const textEl = $('#order-review-text');
+    await api(`/api/orders/${id}/rate`, { method: 'POST', body: { stars, text: textEl ? textEl.value.trim() : '' } });
     const order = state.orders.find((o) => o.id === id);
     if (order) order.ratingStars = stars;
-    toast('Thanks for the rating! ' + '⭐'.repeat(stars));
+    state.orderReview = { id: '', stars: 0 };
+    toast('Thanks — your review helps other customers! ' + '⭐'.repeat(stars));
     render();
   } catch (e) {
     toast(e.message, true);
@@ -1085,7 +1127,15 @@ window.openRestaurant = (id) => {
   state.cart = {};
   state.deliverTo = '';
   state.deliverToLoc = null;
+  state.listingReviews = null;
   state._pageAnim = true;
+  // Reviews load alongside the menu; the card fills in when they arrive.
+  api(`/api/restaurants/${id}/reviews`).then((data) => {
+    if (state.restaurant && state.restaurant.id === id) {
+      state.listingReviews = { id, list: data.reviews, rating: data.rating, count: data.ratingCount };
+      render();
+    }
+  }).catch(() => {});
   render();
 };
 
@@ -1174,6 +1224,14 @@ function menuView() {
       </div>
     </div>
   </div>
+  ${state.listingReviews && state.listingReviews.id === r.id ? `
+  <div class="card">
+    <div style="font-weight:900;margin-bottom:8px">Reviews ${state.listingReviews.rating
+      ? `<span class="badge">★ ${state.listingReviews.rating}</span> <span class="muted small">${state.listingReviews.count} rating${state.listingReviews.count === 1 ? '' : 's'}</span>`
+      : '<span class="badge gray">NEW</span>'}</div>
+    ${reviewList(state.listingReviews.list)}
+    <div class="muted small" style="margin-top:8px">✍️ Only customers who received an order here can review it.</div>
+  </div>` : ''}
   ${r.menu.map((m) => {
     const qty = state.cart[m.id] || 0;
     const mPhotos = photosOf(m);
@@ -1323,6 +1381,14 @@ function hotelResults() {
         </div>
         <span class="badge">${h.rating ? '★ ' + h.rating : 'NEW'}</span>
       </div>
+      <button class="link" style="margin-top:6px" onclick="toggleHotelReviews('${h.id}')">
+        💬 ${(state.hotelReviews[h.id] || {}).open ? 'Hide reviews' : `Reviews from past guests${h.ratingCount ? ` (${h.ratingCount})` : ''}`}
+      </button>
+      ${(state.hotelReviews[h.id] || {}).open ? `
+      <div style="margin-top:8px">
+        ${state.hotelReviews[h.id].list ? reviewList(state.hotelReviews[h.id].list) : '<div class="muted small">Loading reviews…</div>'}
+        <div class="muted small" style="margin-top:8px">✍️ Only guests who completed a stay can review this hotel.</div>
+      </div>` : ''}
       <div class="divider"></div>
       ${h.rooms.map((room) => {
         const rPhotos = photosOf(room);
@@ -1346,9 +1412,14 @@ function hotelResults() {
 }
 
 function bookingsSection() {
+  const today = new Date().toISOString().slice(0, 10);
   const active = state.bookings.filter((b) => b.status === 'active');
-  if (active.length === 0) return '';
-  return `<div class="section-title">Your bookings 🧳</div>` + active.map((b) => `
+  const upcoming = active.filter((b) => b.checkOut > today);
+  // Finished stays: reviewable once, and only by the guest who stayed.
+  const finished = active.filter((b) => b.checkOut <= today);
+  let out = '';
+  if (upcoming.length) {
+    out += `<div class="section-title">Your bookings 🧳</div>` + upcoming.map((b) => `
     <div class="card">
       <div class="row">
         <div>
@@ -1357,9 +1428,76 @@ function bookingsSection() {
         </div>
         <div><b>${money(b.total)}</b></div>
       </div>
-      <button class="btn danger" style="margin-top:12px" onclick="cancelBooking('${b.id}')">Cancel (full refund)</button>
+      ${b.checkIn > today
+        ? `<button class="btn danger" style="margin-top:12px" onclick="cancelBooking('${b.id}')">Cancel (full refund)</button>`
+        : `<div class="eta-line" style="margin-top:12px">🛎️ Enjoy your stay — you can review it after check-out.</div>`}
     </div>`).join('');
+  }
+  if (finished.length) {
+    out += `<div class="section-title">Past stays 🌙</div>` + finished.map((b) => `
+    <div class="card">
+      <div class="row">
+        <div>
+          <div><b>${b.hotelIcon} ${esc(b.hotelName)}</b> <span class="muted small">· ${esc(b.city)}</span></div>
+          <div class="muted small">${esc(b.roomType)} · ${b.checkIn} → ${b.checkOut}</div>
+        </div>
+        ${b.ratingStars ? `<span class="badge">★ ${b.ratingStars} · reviewed</span>` : ''}
+      </div>
+      ${!b.ratingStars ? `
+      <div class="divider"></div>
+      <div style="text-align:center"><b>How was your stay?</b></div>
+      <div class="stars">
+        ${[1, 2, 3, 4, 5].map((n) => `<button class="${state.stayReview.id === b.id && state.stayReview.stars >= n ? 'on' : ''}" onclick="pickStayStars('${b.id}', ${n})">⭐</button>`).join('')}
+      </div>
+      ${state.stayReview.id === b.id ? `
+      <label class="field"><span>Tell future guests about it (optional)</span>
+        <input id="stay-review-text" maxlength="300" placeholder="e.g. Clean rooms, great mountain view at breakfast" />
+      </label>
+      <button class="btn" onclick="rateStay('${b.id}')">Submit review</button>` : ''}` : ''}
+    </div>`).join('');
+  }
+  return out;
 }
+
+window.pickStayStars = (id, stars) => {
+  const keepText = state.stayReview.id === id ? ($('#stay-review-text') || {}).value || '' : '';
+  state.stayReview = { id, stars };
+  render();
+  const input = $('#stay-review-text');
+  if (input) input.value = keepText;
+};
+
+window.rateStay = async (id) => {
+  const { stars } = state.stayReview;
+  if (!stars) return toast('Pick a star rating first.', true);
+  try {
+    const textEl = $('#stay-review-text');
+    const data = await api(`/api/bookings/${id}/rate`, {
+      method: 'POST',
+      body: { stars, text: textEl ? textEl.value.trim() : '' }
+    });
+    const booking = state.bookings.find((b) => b.id === id);
+    if (booking) booking.ratingStars = data.booking.ratingStars;
+    state.stayReview = { id: '', stars: 0 };
+    toast('Thanks — future guests will see your review 🌟');
+    render();
+  } catch (e) {
+    toast(e.message, true);
+  }
+};
+
+window.toggleHotelReviews = (id) => {
+  const cur = state.hotelReviews[id] || { open: false, list: null };
+  cur.open = !cur.open;
+  state.hotelReviews[id] = cur;
+  if (cur.open && !cur.list) {
+    api(`/api/hotels/${id}/reviews`).then((data) => {
+      state.hotelReviews[id] = { open: true, list: data.reviews, rating: data.rating, count: data.ratingCount };
+      render();
+    }).catch(() => {});
+  }
+  render();
+};
 
 window.searchStays = async () => {
   const city = $('#stay-city').value;
