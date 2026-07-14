@@ -1,7 +1,7 @@
 const express = require('express');
 const { db, save, uid } = require('../db');
 const { authRequired, publicUser } = require('./auth');
-const { withStatus, driverPublic, etaToPickupMin, driverIsAvailable, ROAD_FACTOR, SEARCH_TIMEOUT_SECONDS } = require('../rideLogic');
+const { withStatus, driverPublic, etaToPickupMin, driverIsAvailable, driverNearPickup, ROAD_FACTOR, SEARCH_TIMEOUT_SECONDS } = require('../rideLogic');
 const { PLACES, haversineKm } = require('../places');
 const { searchPlaces, reverseGeocode, insideServiceArea, resolveLocation, routeBetween } = require('../geo');
 const sessionTokens = require('../sessionTokens');
@@ -38,9 +38,10 @@ function estimateFor(pickup, dropoff) {
       surge,
       fare: Math.round((t.base + t.perKm * distanceKm) * surge),
       etaMin: Math.max(2, Math.round((distanceKm / t.speedKmh) * 60)),
-      // Real online drivers of this tier right now — tells the customer (and a
-      // tester) whether booking will go live or fall back to a simulated trip.
-      liveDrivers: db.drivers.filter((d) => driverIsAvailable(d, tier)).length
+      // Real online drivers of this tier NEAR THIS PICKUP — tells the customer
+      // (and a tester) whether booking goes live or falls back to a simulated
+      // trip. A driver online in another city/country doesn't count.
+      liveDrivers: db.drivers.filter((d) => driverIsAvailable(d, tier) && driverNearPickup(d, pickupPlace)).length
     };
   });
   return { distanceKm, pickupPlace, dropoffPlace, options, serviceFee: RIDE_SERVICE_FEE };
@@ -169,9 +170,11 @@ router.post('/rides', authRequired, (req, res) => {
     return res.status(402).json({ error: 'Not enough wallet balance. Top up in Profile, or pay cash.' });
   }
 
-  // If a real driver of this tier is online, wait for them to accept ("live").
-  // Otherwise fall back to the nearest simulated driver so the demo always works.
-  const anyOnline = db.drivers.some((d) => driverIsAvailable(d, tier));
+  // If a real driver of this tier is online NEAR THE PICKUP, wait for them to
+  // accept ("live"). Otherwise fall back to the nearest simulated driver so
+  // the demo always works — a real driver in another region never gets (or
+  // blocks) a trip they cannot drive to.
+  const anyOnline = db.drivers.some((d) => driverIsAvailable(d, tier) && driverNearPickup(d, pickupPlace));
   const mode = anyOnline ? 'live' : 'sim';
   let driver = null;
   let driverStart = null;

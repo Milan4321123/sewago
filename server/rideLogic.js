@@ -56,6 +56,21 @@ function driverIsAvailable(driver, tier = null) {
     driverHasFreshLocation(driver);
 }
 
+// Matching is regional: an online driver on another continent — or across the
+// country — is not "available" for this pickup. Applies to live/sim mode
+// selection, the per-tier live counts, dispatch offers and delivery jobs.
+const MATCH_RADIUS_KM = (() => {
+  const n = Number(process.env.DRIVER_MATCH_RADIUS_KM);
+  return Number.isFinite(n) && n >= 2 && n <= 200 ? n : 25;
+})();
+
+function driverNearPickup(driver, pickupLoc) {
+  if (!pickupLoc || !Number.isFinite(pickupLoc.lat)) return true;
+  const loc = driverLocation(driver);
+  if (!loc) return false;
+  return haversineKm(loc, pickupLoc) <= MATCH_RADIUS_KM;
+}
+
 function payoutFor(ride) {
   return Math.round(ride.fare * DRIVER_SHARE);
 }
@@ -185,6 +200,8 @@ module.exports = {
   driverHasFreshLocation,
   driverLocation,
   driverIsAvailable,
+  driverNearPickup,
+  MATCH_RADIUS_KM,
   SPEEDS,
   ROAD_FACTOR,
   LOCATION_FRESH_MS,

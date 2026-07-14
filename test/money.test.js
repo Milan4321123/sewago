@@ -841,6 +841,37 @@ test('fare boost: searching customer raises the fare, driver sees the boosted of
   await api('/driver/online', { method: 'POST', token: driverToken, body: { online: false } });
 });
 
+test('matching is regional: a Kathmandu driver never serves a Berlin pickup', async () => {
+  const driverToken = await onboardDriver('bike', 27.7152, 85.3123); // Thamel
+  const { token } = await registerUser('continental');
+
+  // Estimating a Berlin trip must not count the Kathmandu driver as live.
+  const berlin = {
+    pickup: { lat: 52.52, lng: 13.405, name: 'Alexanderplatz' },
+    dropoff: { lat: 52.5163, lng: 13.3777, name: 'Brandenburger Tor' }
+  };
+  const est = await api('/rides/estimate', { method: 'POST', token, body: berlin });
+  assert.equal(est.status, 200, JSON.stringify(est.data));
+  assert.equal(est.data.options.find((o) => o.tier === 'bike').liveDrivers, 0,
+    'a driver in Kathmandu is not live for a Berlin pickup');
+
+  // Booking it falls back to a simulated trip and never reaches the driver.
+  const booked = await api('/rides', { method: 'POST', token, body: { ...berlin, tier: 'bike', payment: 'wallet' } });
+  assert.equal(booked.status, 200, JSON.stringify(booked.data));
+  assert.equal(booked.data.ride.mode, 'sim', 'no nearby driver -> simulated fallback');
+  const requests = await api('/driver/requests', { token: driverToken });
+  assert.equal(requests.data.requests.length, 0, 'the far driver must not be offered the trip');
+
+  // The same driver IS live for a pickup in their own city.
+  const local = await api('/rides/estimate', {
+    method: 'POST', token, body: { pickup: 'Thamel', dropoff: 'Patan Durbar Square' }
+  });
+  assert.equal(local.data.options.find((o) => o.tier === 'bike').liveDrivers, 1);
+
+  await api(`/rides/${booked.data.ride.id}/cancel`, { method: 'POST', token });
+  await api('/driver/online', { method: 'POST', token: driverToken, body: { online: false } });
+});
+
 test('a lapsed offer cycles back to the lone online driver; a decline is final', async () => {
   const driverToken = await onboardDriver('bike', 27.7152, 85.3123); // Thamel
   const { token } = await registerUser('patient-rider');

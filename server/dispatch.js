@@ -11,7 +11,7 @@
 // instead of the ride silently dying after one missed 15s window.
 const { db, save } = require('./db');
 const events = require('./events');
-const { withStatus, driverIsAvailable, etaToPickupMin } = require('./rideLogic');
+const { withStatus, driverIsAvailable, driverNearPickup, etaToPickupMin } = require('./rideLogic');
 const { currentDelivery } = require('./orderLogic');
 
 const RIDE_OFFER_SECONDS = (() => {
@@ -30,7 +30,9 @@ function driverBusy(driverId) {
 function candidatesFor(ride) {
   const skip = new Set([...(ride.declinedDriverIds || []), ...(ride.passedDriverIds || [])]);
   return db.drivers
-    .filter((d) => driverIsAvailable(d, ride.tier) && !skip.has(d.id) && !driverBusy(d.id))
+    .filter((d) => driverIsAvailable(d, ride.tier) &&
+      driverNearPickup(d, ride.pickupLoc) && // regional: never offer a trip the driver can't reach
+      !skip.has(d.id) && !driverBusy(d.id))
     .map((d) => ({ d, eta: etaToPickupMin(d, ride.pickupLoc, ride.tier) }))
     .sort((a, b) => a.eta - b.eta)
     .map((x) => x.d);

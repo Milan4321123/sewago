@@ -12,7 +12,8 @@ const {
   driverIsVerified,
   driverHasFreshLocation,
   driverLocation,
-  driverIsAvailable
+  driverIsAvailable,
+  driverNearPickup
 } = require('../rideLogic');
 const { PLACES, haversineKm } = require('../places');
 const { recordTxn, recordPlatformRevenue, createWithdrawal } = require('../payments');
@@ -535,6 +536,11 @@ router.get('/driver/deliveries', authDriver, (req, res) => {
   if (currentJob(req.driver.id) || currentDelivery(req.driver.id)) return res.json({ deliveries: [] });
   const deliveries = db.orders
     .filter((o) => o.fulfillment === 'live' && !o.courierId && orderWithStatus(o).status === 'preparing')
+    // Regional: only restaurants this courier can realistically reach.
+    .filter((o) => {
+      const restaurant = db.restaurants.find((r) => r.id === o.restaurantId);
+      return !restaurant || !restaurant.loc || driverNearPickup(req.driver, restaurant.loc);
+    })
     .map((o) => deliveryView(o, req.driver))
     // Nearest restaurant first; long-waiting orders get nudged up (same rule
     // as ride requests).
