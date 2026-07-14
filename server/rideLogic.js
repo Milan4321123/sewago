@@ -5,7 +5,12 @@ const { haversineKm } = require('./places');
 const MATCH_SECONDS = 6;
 const PICKUP_SECONDS = 18;
 // Live rides: how long a request waits for a real driver before auto-refund.
-const SEARCH_TIMEOUT_SECONDS = 45;
+// 90s by default — offers now cycle back to slow-but-online drivers, so a
+// longer window means a driver who takes a moment to look still gets there.
+const SEARCH_TIMEOUT_SECONDS = (() => {
+  const n = Number(process.env.RIDE_SEARCH_TIMEOUT_SECONDS);
+  return Number.isFinite(n) && n >= 30 && n <= 300 ? Math.round(n) : 90;
+})();
 // How recent a driver's GPS ping must be to count them as available. Default is
 // generous (10 min) because a single-phone tester switches between the driver
 // and customer tabs, and a backgrounded tab stops sending GPS; the driver app

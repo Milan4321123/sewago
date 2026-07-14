@@ -397,7 +397,7 @@ router.post('/driver/rides/:id/decline', authDriver, (req, res) => {
   if (ride.status !== 'searching' || !ride.offer || ride.offer.driverId !== req.driver.id) {
     return res.status(409).json({ error: 'This offer is no longer yours to decline.' });
   }
-  dispatch.offerNext(ride);
+  dispatch.declineOffer(ride);
   res.json({ ok: true });
 });
 

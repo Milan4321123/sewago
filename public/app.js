@@ -812,7 +812,8 @@ function mountRideMap(ride) {
   const dp = [ride.dropoffLoc.lat, ride.dropoffLoc.lng];
   L.marker(pk, { icon: emojiIcon('🟢', 16) }).addTo(map).bindTooltip('Pickup: ' + esc(ride.pickup));
   L.marker(dp, { icon: emojiIcon('🏁', 20) }).addTo(map).bindTooltip('Dropoff: ' + esc(ride.dropoff));
-  L.polyline([pk, dp], { color: '#22c55e', weight: 3, opacity: 0.45, dashArray: '6 8' }).addTo(map);
+  // Straight dashed line until the road route arrives, then the real path.
+  L.polyline([pk, dp], { color: '#22c55e', weight: 3, opacity: 0.3, dashArray: '6 8' }).addTo(map);
   let driverMarker = null;
   if (ride.driverCoords) {
     driverMarker = L.marker([ride.driverCoords.lat, ride.driverCoords.lng], { icon: emojiIcon(ride.icon || '🚗', 26) }).addTo(map);
@@ -821,6 +822,28 @@ function mountRideMap(ride) {
   if (ride.driverCoords) bounds.extend([ride.driverCoords.lat, ride.driverCoords.lng]);
   map.fitBounds(bounds.pad(0.25));
   rideMapRefs = { map, driverMarker, icon: ride.icon || '🚗' };
+  drawRideRoute(ride);
+}
+
+// Fetch the road-following path for the trip and draw it over the fallback
+// line. Cached per pickup/dropoff pair; failures just keep the dashed line.
+let rideRouteCache = { key: '', points: null };
+async function drawRideRoute(ride) {
+  const pk = ride.pickupLoc;
+  const dp = ride.dropoffLoc;
+  const key = `${pk.lat},${pk.lng};${dp.lat},${dp.lng}`;
+  try {
+    if (rideRouteCache.key !== key) {
+      const data = await api(`/api/geo/route?fromLat=${pk.lat}&fromLng=${pk.lng}&toLat=${dp.lat}&toLng=${dp.lng}`);
+      rideRouteCache = { key, points: data.route.points };
+    }
+    // The map may have been remounted while we awaited — draw on the live one.
+    if (rideMapRefs && rideRouteCache.points) {
+      L.polyline(rideRouteCache.points, {
+        color: '#34d399', weight: 4, opacity: 0.8, lineCap: 'round', lineJoin: 'round'
+      }).addTo(rideMapRefs.map);
+    }
+  } catch (e) { /* dashed fallback stays */ }
 }
 
 function updateRideMap(ride) {

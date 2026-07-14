@@ -3,7 +3,8 @@ const { db, save, uid } = require('../db');
 const { authRequired, publicUser } = require('./auth');
 const { withStatus, driverPublic, etaToPickupMin, driverIsAvailable, ROAD_FACTOR, SEARCH_TIMEOUT_SECONDS } = require('../rideLogic');
 const { PLACES, haversineKm } = require('../places');
-const { searchPlaces, reverseGeocode, insideServiceArea, resolveLocation } = require('../geo');
+const { searchPlaces, reverseGeocode, insideServiceArea, resolveLocation, routeBetween } = require('../geo');
+const sessionTokens = require('../sessionTokens');
 const { recordTxn, recordPlatformRevenue } = require('../payments');
 const { RIDE_SERVICE_FEE, surgeFor, cancelFeeSplit } = require('../fees');
 const { normalizePhone, validPhone } = require('../accountSecurity');
@@ -74,6 +75,34 @@ router.get('/geo/reverse', authRequired, async (req, res) => {
   } catch (err) {
     console.error('Reverse geocode failed:', err.message);
     res.json({ place: { name: 'Pinned location', lat, lng } });
+  }
+});
+
+// The route line is drawn by the customer app AND the driver app, which live
+// in different token realms — accept a valid session from either.
+function authUserOrDriver(req, res, next) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (sessionTokens.tokenOwner(db.tokens, token) || sessionTokens.tokenOwner(db.driverTokens, token)) {
+    return next();
+  }
+  res.status(401).json({ error: 'Please log in again.' });
+}
+
+// Driving directions between two points (in-app navigation + map route lines).
+router.get('/geo/route', authUserOrDriver, async (req, res) => {
+  const from = { lat: Number(req.query.fromLat), lng: Number(req.query.fromLng) };
+  const to = { lat: Number(req.query.toLat), lng: Number(req.query.toLng) };
+  for (const p of [from, to]) {
+    if (!Number.isFinite(p.lat) || !Number.isFinite(p.lng) || Math.abs(p.lat) > 90 || Math.abs(p.lng) > 180) {
+      return res.status(400).json({ error: 'fromLat/fromLng and toLat/toLng are required.' });
+    }
+  }
+  try {
+    res.json({ route: await routeBetween(from, to) });
+  } catch (err) {
+    // Clients fall back to a straight line — never block the trip on routing.
+    res.status(502).json({ error: 'Routing is unavailable right now.' });
   }
 });
 

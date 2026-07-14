@@ -75,6 +75,8 @@ before(async () => {
       FOOD_SERVICE_FEE: '15',
       RIDE_CANCEL_FEE: '40',
       PROMOTE_WEEK_PRICE: '300',
+      RIDE_OFFER_SECONDS: '5', // shortest allowed, so lapse-recycling is testable
+      RIDE_SEARCH_TIMEOUT_SECONDS: '60',
       LOG_LEVEL: 'error'
     },
     stdio: ['ignore', 'ignore', 'inherit']
@@ -782,6 +784,40 @@ test('fare boost: searching customer raises the fare, driver sees the boosted of
   assert.equal(late.status, 400);
 
   await api(`/rides/${booked.data.ride.id}/cancel`, { method: 'POST', token });
+  await api('/driver/online', { method: 'POST', token: driverToken, body: { online: false } });
+});
+
+test('a lapsed offer cycles back to the lone online driver; a decline is final', async () => {
+  const driverToken = await onboardDriver('bike', 27.7152, 85.3123); // Thamel
+  const { token } = await registerUser('patient-rider');
+
+  const booked = await api('/rides', {
+    method: 'POST',
+    token,
+    body: { pickup: 'Thamel', dropoff: 'Patan Durbar Square', tier: 'bike', payment: 'wallet' }
+  });
+  assert.equal(booked.status, 200, JSON.stringify(booked.data));
+  assert.equal(booked.data.ride.mode, 'live');
+  const rideId = booked.data.ride.id;
+
+  const first = await api('/driver/requests', { token: driverToken });
+  assert.equal(first.data.requests.length, 1, 'driver must hold the initial offer');
+
+  // Let the 5s exclusive window lapse (the tester was on another tab). The
+  // request must come back to the only online driver instead of dying.
+  await new Promise((r) => setTimeout(r, 6500));
+  const again = await api('/driver/requests', { token: driverToken });
+  assert.equal(again.data.requests.length, 1, 'a lapsed offer must be re-offered to a lone driver');
+  assert.equal(again.data.requests[0].id, rideId);
+
+  // An explicit decline is permanent — the ride never comes back to them.
+  const declined = await api(`/driver/rides/${rideId}/decline`, { method: 'POST', token: driverToken });
+  assert.equal(declined.status, 200, JSON.stringify(declined.data));
+  await new Promise((r) => setTimeout(r, 6500));
+  const after = await api('/driver/requests', { token: driverToken });
+  assert.equal(after.data.requests.length, 0, 'declined rides must never be re-offered');
+
+  await api(`/rides/${rideId}/cancel`, { method: 'POST', token });
   await api('/driver/online', { method: 'POST', token: driverToken, body: { online: false } });
 });
 

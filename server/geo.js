@@ -9,6 +9,11 @@ const { config } = require('./config');
 const { PLACES } = require('./places');
 
 const NOMINATIM_BASE = process.env.NOMINATIM_BASE || 'https://nominatim.openstreetmap.org';
+// Road routing (driver navigation + route lines on maps): OSRM speaks a
+// simple open API. The public demo server is fine for a pilot; point
+// OSRM_BASE at a paid host (Mapbox/OpenRouteService proxy or self-hosted
+// OSRM) for production volume.
+const OSRM_BASE = process.env.OSRM_BASE || 'https://router.project-osrm.org';
 const USER_AGENT = `SewaGo/0.1 (${config.publicAppUrl || 'https://sewago.example'})`;
 
 // Kathmandu valley bounding box — search is biased hard to it so "New Road"
@@ -199,4 +204,32 @@ async function reverseGeocode(lat, lng) {
   return result;
 }
 
-module.exports = { searchPlaces, reverseGeocode, insideServiceArea, resolveLocation, VALLEY };
+// Driving route between two points: the polyline to draw plus distance/time.
+// Cached at ~11m origin granularity so a navigating driver re-requesting
+// every ~25s doesn't hammer the router, and identical trips share an entry.
+async function routeBetween(from, to) {
+  const key = `rt:${from.lat.toFixed(4)},${from.lng.toFixed(4)};${to.lat.toFixed(4)},${to.lng.toFixed(4)}`;
+  const cached = cacheGet(key);
+  if (cached) return cached;
+
+  const url = `${OSRM_BASE}/route/v1/driving/${from.lng},${from.lat};${to.lng},${to.lat}` +
+    '?overview=full&geometries=geojson&alternatives=false&steps=false';
+  const data = await politeFetch(url);
+  const route = data && data.code === 'Ok' && Array.isArray(data.routes) && data.routes[0];
+  if (!route || !route.geometry || !Array.isArray(route.geometry.coordinates)) {
+    throw new Error('No route found');
+  }
+  const result = {
+    // GeoJSON is [lng,lat]; Leaflet wants [lat,lng].
+    points: route.geometry.coordinates.map(([lng, lat]) => [
+      Math.round(lat * 1e5) / 1e5,
+      Math.round(lng * 1e5) / 1e5
+    ]),
+    distanceKm: Math.round(route.distance / 100) / 10,
+    durationMin: Math.max(1, Math.round(route.duration / 60))
+  };
+  cacheSet(key, result);
+  return result;
+}
+
+module.exports = { searchPlaces, reverseGeocode, insideServiceArea, resolveLocation, routeBetween, VALLEY };

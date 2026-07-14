@@ -1,11 +1,14 @@
 // Sequential ride dispatch: instead of broadcasting a request to every online
 // driver of the tier (first tap wins, accept-collisions at scale), the ride is
 // OFFERED to one driver at a time — nearest pickup first. A driver holds the
-// offer exclusively for RIDE_OFFER_SECONDS; declining or letting it lapse
-// cascades to the next-nearest. Drivers who passed are never re-offered the
-// same ride. If the list runs dry the ride waits un-offered and the sweep
-// retries as drivers come online or free up, until the 45s search timeout
-// refunds the customer (rideLogic).
+// offer exclusively for RIDE_OFFER_SECONDS.
+//
+// An explicit decline is permanent (declinedDriverIds — never re-offered), but
+// an offer that merely LAPSES is a soft pass (passedDriverIds): once every
+// available driver has had a turn, the round resets and the cascade starts
+// again. So a lone online driver who was slow to look keeps getting the
+// request back until the search timeout refunds the customer (rideLogic) —
+// instead of the ride silently dying after one missed 15s window.
 const { db, save } = require('./db');
 const events = require('./events');
 const { withStatus, driverIsAvailable, etaToPickupMin } = require('./rideLogic');
@@ -25,9 +28,9 @@ function driverBusy(driverId) {
 }
 
 function candidatesFor(ride) {
-  const declined = new Set(ride.declinedDriverIds || []);
+  const skip = new Set([...(ride.declinedDriverIds || []), ...(ride.passedDriverIds || [])]);
   return db.drivers
-    .filter((d) => driverIsAvailable(d, ride.tier) && !declined.has(d.id) && !driverBusy(d.id))
+    .filter((d) => driverIsAvailable(d, ride.tier) && !skip.has(d.id) && !driverBusy(d.id))
     .map((d) => ({ d, eta: etaToPickupMin(d, ride.pickupLoc, ride.tier) }))
     .sort((a, b) => a.eta - b.eta)
     .map((x) => x.d);
@@ -44,23 +47,39 @@ function offerTo(ride, driver) {
 
 function startDispatch(ride) {
   ride.declinedDriverIds = [];
+  ride.passedDriverIds = [];
   ride.offer = null;
   const [next] = candidatesFor(ride);
   if (next) offerTo(ride, next);
   save();
 }
 
-// The current holder passed (explicit decline or lapsed offer) — burn their
-// turn and move to the next-nearest.
+// The current holder's offer lapsed — soft pass: burn their turn for this
+// round and move to the next-nearest. When the round runs dry, reset it so
+// slow-but-willing drivers get another look.
 function offerNext(ride) {
+  if (ride.offer) {
+    ride.passedDriverIds = [...(ride.passedDriverIds || []), ride.offer.driverId];
+    ride.offer = null;
+  }
+  let [next] = candidatesFor(ride);
+  if (!next && (ride.passedDriverIds || []).length) {
+    ride.passedDriverIds = [];
+    [next] = candidatesFor(ride);
+  }
+  if (next) offerTo(ride, next);
+  save();
+  events.publish('admin', { topic: 'rides' });
+}
+
+// The current holder explicitly declined — they are never offered this ride
+// again, then the cascade continues as usual.
+function declineOffer(ride) {
   if (ride.offer) {
     ride.declinedDriverIds = [...(ride.declinedDriverIds || []), ride.offer.driverId];
     ride.offer = null;
   }
-  const [next] = candidatesFor(ride);
-  if (next) offerTo(ride, next);
-  save();
-  events.publish('admin', { topic: 'rides' });
+  offerNext(ride);
 }
 
 // Keep a searching ride's offer honest: advance a lapsed one, and give an
@@ -97,4 +116,4 @@ function clearOffer(ride) {
   ride.offer = null;
 }
 
-module.exports = { startDispatch, offerNext, refresh, sweep, clearOffer, RIDE_OFFER_SECONDS };
+module.exports = { startDispatch, offerNext, declineOffer, refresh, sweep, clearOffer, RIDE_OFFER_SECONDS };

@@ -29,7 +29,9 @@ driver side first.
 2. Laptop → customer app → pick pickup/dropoff (📍 GPS button or address
    search) → the tier should show **🟢 1 live driver online** → book.
 3. Phone chimes with the exclusive offer (pickup, distance, your payout,
-   15s countdown) → **Accept**.
+   15s countdown) → **Accept**. Missed the countdown? No problem — lapsed
+   offers cycle back to online drivers for the whole search window (90s by
+   default, `RIDE_SEARCH_TIMEOUT_SECONDS`); only tapping **Pass** is final.
 4. Laptop → the customer card shows the driver's name/vehicle/plate with a
    **🟢 LIVE** badge, and the map marker is the driver's *real* GPS position,
    updated every few seconds. Walk/cycle with the phone and watch the marker
@@ -45,9 +47,9 @@ switch to the customer tab and book within a few minutes.
 
 While a live ride is still searching, the customer can raise the fare
 (+Rs 20/50/100, up to +Rs 500). Each boost charges the wallet immediately
-(cash rides just raise what the driver collects), restarts the 45-second
-search window, and re-offers the ride — including to drivers who declined
-the old price. The driver's offer card shows an **⚡ BOOSTED** badge.
+(cash rides just raise what the driver collects), restarts the search
+window, and re-offers the ride — including to drivers who declined the old
+price. The driver's offer card shows an **⚡ BOOSTED** badge.
 
 ## Quick diagnosis
 

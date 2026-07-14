@@ -455,6 +455,82 @@ window.driverDeleteAccount = async () => {
 
 let jobMapRefs = null;
 
+/* In-app navigation: road-following route to the current leg's target
+   (pickup while en route, dropoff during the trip), refreshed from the
+   driver's live position so it re-routes as they move — with a follow
+   camera like a nav app. */
+const nav = { key: '', route: null, fetchedAt: 0, fetching: false, follow: true };
+
+function navTargetFor(job) {
+  return job.status === 'driver_en_route'
+    ? { loc: job.pickupLoc, label: 'pickup' }
+    : { loc: job.dropoffLoc, label: 'dropoff' };
+}
+
+function navOrigin(job) {
+  const d = state.driver;
+  if (d && Number.isFinite(d.currentLat) && Number.isFinite(d.currentLng)) {
+    return { lat: d.currentLat, lng: d.currentLng };
+  }
+  return job.driverCoords || job.pickupLoc;
+}
+
+function drawNavRoute() {
+  if (!jobMapRefs || !nav.route) return;
+  if (jobMapRefs.routeLine) jobMapRefs.routeLine.remove();
+  jobMapRefs.routeLine = L.polyline(nav.route.points, {
+    color: '#34d399', weight: 5, opacity: 0.85, lineCap: 'round', lineJoin: 'round'
+  }).addTo(jobMapRefs.map);
+}
+
+function updateNavBanner(label) {
+  const el = $('#nav-banner');
+  if (el && nav.route) {
+    el.textContent = `🧭 ${nav.route.distanceKm} km · ~${nav.route.durationMin} min to ${label}`;
+  }
+}
+
+// Re-request the route when the leg changes or every ~25s from the latest
+// position (which is also what re-routes a driver who took a different street).
+async function refreshNavRoute(job, force = false) {
+  if (!job || !job.pickupLoc || !job.dropoffLoc) return;
+  const { loc: target, label } = navTargetFor(job);
+  const legKey = `${job.id}:${job.status}`;
+  const stale = Date.now() - nav.fetchedAt > 25000;
+  if (nav.fetching || (!force && nav.key === legKey && !stale)) {
+    updateNavBanner(label);
+    return;
+  }
+  const from = navOrigin(job);
+  nav.fetching = true;
+  try {
+    const data = await api(`/api/geo/route?fromLat=${from.lat}&fromLng=${from.lng}&toLat=${target.lat}&toLng=${target.lng}`);
+    const firstRouteForLeg = nav.key !== legKey;
+    nav.key = legKey;
+    nav.route = data.route;
+    nav.fetchedAt = Date.now();
+    drawNavRoute();
+    updateNavBanner(label);
+    if (firstRouteForLeg && jobMapRefs) {
+      // New leg: show the whole road once, then the follow camera takes over.
+      jobMapRefs.map.fitBounds(L.latLngBounds(nav.route.points).pad(0.2));
+    }
+  } catch (e) {
+    // Routing down — the dashed straight line stays as the fallback.
+  } finally {
+    nav.fetching = false;
+  }
+}
+
+window.navRecenter = () => {
+  nav.follow = true;
+  const fab = $('#nav-recenter');
+  if (fab) fab.classList.add('hidden');
+  if (jobMapRefs && jobMapRefs.driverMarker) {
+    jobMapRefs.map.setView(jobMapRefs.driverMarker.getLatLng(), Math.max(jobMapRefs.map.getZoom(), 15), { animate: true });
+  }
+};
+
 function emojiIcon(emoji, size) {
   return L.divIcon({
     html: `<div class="map-emoji" style="font-size:${size}px">${emoji}</div>`,
@@ -513,7 +589,8 @@ function mountJobMap(job) {
   const dp = [job.dropoffLoc.lat, job.dropoffLoc.lng];
   L.marker(pk, { icon: emojiIcon('🟢', 16) }).addTo(map).bindTooltip('Pickup: ' + esc(job.pickup));
   L.marker(dp, { icon: emojiIcon('🏁', 20) }).addTo(map).bindTooltip('Dropoff: ' + esc(job.dropoff));
-  L.polyline([pk, dp], { color: '#22c55e', weight: 3, opacity: 0.45, dashArray: '6 8' }).addTo(map);
+  // Straight dashed fallback — replaced by the road route once it arrives.
+  L.polyline([pk, dp], { color: '#22c55e', weight: 3, opacity: 0.3, dashArray: '6 8' }).addTo(map);
   let driverMarker = null;
   if (job.driverCoords) {
     driverMarker = L.marker([job.driverCoords.lat, job.driverCoords.lng], { icon: emojiIcon(job.icon || '🚗', 26) }).addTo(map);
@@ -521,7 +598,16 @@ function mountJobMap(job) {
   const bounds = L.latLngBounds([pk, dp]);
   if (job.driverCoords) bounds.extend([job.driverCoords.lat, job.driverCoords.lng]);
   map.fitBounds(bounds.pad(0.25));
-  jobMapRefs = { map, driverMarker, icon: job.icon || '🚗' };
+  // Dragging the map pauses the follow camera (like every nav app); the
+  // re-centre button brings it back.
+  map.on('dragstart', () => {
+    nav.follow = false;
+    const fab = $('#nav-recenter');
+    if (fab) fab.classList.remove('hidden');
+  });
+  jobMapRefs = { map, driverMarker, routeLine: null, icon: job.icon || '🚗' };
+  drawNavRoute(); // redraw a cached route instantly on re-render
+  refreshNavRoute(job);
 }
 
 function mountRequestMaps() {
@@ -548,6 +634,10 @@ function updateJobMap(job) {
   const pos = [job.driverCoords.lat, job.driverCoords.lng];
   if (jobMapRefs.driverMarker) jobMapRefs.driverMarker.setLatLng(pos);
   else jobMapRefs.driverMarker = L.marker(pos, { icon: emojiIcon(jobMapRefs.icon, 26) }).addTo(jobMapRefs.map);
+  // Nav behavior: camera tracks the vehicle, and the route re-fetches from
+  // the latest position every ~25s (which also handles going off-route).
+  if (nav.follow) jobMapRefs.map.panTo(pos, { animate: true, duration: 0.6 });
+  refreshNavRoute(job);
 }
 
 // Re-render only when something structural changes; dynamic bits (driver
@@ -838,14 +928,19 @@ function jobCard(job) {
       </div>
     </div>
     ${job.payment === 'cash' ? `<div class="muted small" style="margin-top:8px">💵 Cash trip — collect the fare from the customer; SewaGo's ${money(job.fare - job.payout)} commission is deducted from your balance on completion.</div>` : ''}
-    ${job.pickupLoc ? `<div id="job-map" class="ride-map">${mapPreview(job)}</div>` : ''}
+    ${job.pickupLoc ? `
+    <div class="eta-line" id="nav-banner" style="margin-top:12px">🧭 Getting the road route…</div>
+    <div class="map-wrap">
+      <div id="job-map" class="ride-map nav-map">${mapPreview(job)}</div>
+      <button id="nav-recenter" class="map-fab ${nav.follow ? 'hidden' : ''}" onclick="navRecenter()">📍</button>
+    </div>` : ''}
     ${enRoute
       ? `<div class="eta-line" id="job-eta">🕐 ${esc(job.customerName.split(' ')[0])} expects you at ${esc(job.pickup)} in ~${job.driverEtaMin || 1} min</div>
-         ${navButton(job.pickupLoc, 'Navigate to pickup')}
+         ${navButton(job.pickupLoc, 'Open in Google Maps instead')}
          <button class="btn" style="margin-top:8px" onclick="startTrip('${job.id}')">Picked up — start trip</button>`
       : `<div class="progress" style="margin-top:14px"><div id="job-bar" style="width:${Math.round(job.progress * 100)}%"></div></div>
          <div class="muted small" style="margin-top:8px">Trip in progress…</div>
-         ${navButton(job.dropoffLoc, 'Navigate to dropoff')}
+         ${navButton(job.dropoffLoc, 'Open in Google Maps instead')}
          <button class="btn" style="margin-top:8px" onclick="completeTrip('${job.id}')">Complete trip</button>`}
   </div>`;
 }
