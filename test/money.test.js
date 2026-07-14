@@ -541,6 +541,125 @@ test('live food order: restaurant confirms, courier delivers, everyone is paid',
   await api('/driver/online', { method: 'POST', token: courierToken, body: { online: false } });
 });
 
+test('task hiring: workers apply, poster hires one, payment flows on confirm', async () => {
+  const poster = await registerUser('contractor');
+  const worker1 = await registerUser('worker-one');
+  const worker2 = await registerUser('worker-two');
+
+  const posted = await api('/tasks', {
+    method: 'POST',
+    token: poster.token,
+    body: { title: 'Fix a leaking tap', category: 'repair', budget: 1000, place: 'Patan', when: 'Today before 6pm' }
+  });
+  assert.equal(posted.status, 200, JSON.stringify(posted.data));
+  const taskId = posted.data.task.id;
+  assert.equal(posted.data.task.when, 'Today before 6pm');
+  assert.equal(posted.data.user.wallet, 4000, 'budget held in escrow');
+
+  // Two workers apply; the board shows each their own applied state.
+  const apply1 = await api(`/tasks/${taskId}/apply`, {
+    method: 'POST', token: worker1.token, body: { note: 'Plumber, live nearby' }
+  });
+  assert.equal(apply1.status, 200, JSON.stringify(apply1.data));
+  assert.equal(apply1.data.task.applied, true);
+  const apply2 = await api(`/tasks/${taskId}/apply`, { method: 'POST', token: worker2.token, body: {} });
+  assert.equal(apply2.status, 200);
+  const again = await api(`/tasks/${taskId}/apply`, { method: 'POST', token: worker1.token, body: {} });
+  assert.equal(again.status, 409, 'no double applications');
+
+  // Applicant pitches are only visible to the poster.
+  const board = await api('/tasks/board', { token: worker2.token });
+  const boardTask = board.data.tasks.find((t) => t.id === taskId);
+  assert.equal(boardTask.applicantCount, 2);
+  assert.equal(boardTask.applicants, undefined, 'applicant details must not leak to other workers');
+  const mine = await api('/tasks/mine', { token: poster.token });
+  const posterView = mine.data.posted.find((t) => t.id === taskId);
+  assert.equal(posterView.applicants.length, 2);
+  assert.equal(posterView.applicants[0].note, 'Plumber, live nearby');
+
+  // Hiring requires picking an actual applicant.
+  const badHire = await api(`/tasks/${taskId}/hire`, { method: 'POST', token: poster.token, body: { userId: 'nobody' } });
+  assert.equal(badHire.status, 400);
+  const hired = await api(`/tasks/${taskId}/hire`, { method: 'POST', token: poster.token, body: { userId: worker1.user.id } });
+  assert.equal(hired.status, 200, JSON.stringify(hired.data));
+  assert.equal(hired.data.task.status, 'assigned');
+  assert.equal(hired.data.task.workerName, 'worker-one');
+
+  // Late applications bounce; the hired worker completes and is paid 90%.
+  const lateApply = await api(`/tasks/${taskId}/apply`, { method: 'POST', token: worker2.token, body: {} });
+  assert.equal(lateApply.status, 409);
+  const done = await api(`/tasks/${taskId}/done`, { method: 'POST', token: worker1.token });
+  assert.equal(done.status, 200, JSON.stringify(done.data));
+  const confirmed = await api(`/tasks/${taskId}/confirm`, { method: 'POST', token: poster.token });
+  assert.equal(confirmed.status, 200, JSON.stringify(confirmed.data));
+  assert.equal(await wallet(worker1.token), 5000 + 900, 'worker receives budget minus the 10% fee');
+});
+
+test('partner photo upload: validated, served, and attached to listings', async () => {
+  const stamp = `${Date.now()}${Math.floor(Math.random() * 1000)}`;
+  const reg = await api('/partner/register', {
+    method: 'POST',
+    body: {
+      name: 'Photo Kitchen', email: `photo-${stamp}@test.local`, password: 'partner-secret',
+      phone: `+9777${stamp.slice(-9)}`, regNo: `PAN-${stamp.slice(-6)}`
+    }
+  });
+  assert.equal(reg.status, 200, JSON.stringify(reg.data));
+  const token = reg.data.token;
+  const pOtp = await api('/partner/phone/request-otp', { method: 'POST', token, body: {} });
+  await api('/partner/phone/verify', { method: 'POST', token, body: { code: pOtp.data.devCode } });
+  const admin = await api('/admin/login', { method: 'POST', body: { email: ADMIN_EMAIL, password: ADMIN_PASSWORD } });
+  await api(`/admin/partners/${reg.data.partner.id}/kyc/approve`, { method: 'POST', token: admin.data.token });
+
+  const upload = async (body, type = 'image/png') => {
+    const res = await fetch(`${BASE}/partner/photos`, {
+      method: 'POST',
+      headers: { 'Content-Type': type, Authorization: `Bearer ${token}` },
+      body
+    });
+    return { status: res.status, data: await res.json().catch(() => ({})) };
+  };
+
+  // Junk that merely claims to be an image is rejected by magic-byte sniffing.
+  const junk = await upload(Buffer.from('<script>alert(1)</script>'));
+  assert.equal(junk.status, 400);
+
+  const png = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+    'base64'
+  );
+  const ok = await upload(png);
+  assert.equal(ok.status, 200, JSON.stringify(ok.data));
+  assert.match(ok.data.url, /^\/uploads\/[\w.-]+\.png$/);
+
+  // The stored file is publicly served with the right type.
+  const served = await fetch(`http://localhost:${PORT}${ok.data.url}`);
+  assert.equal(served.status, 200);
+  assert.match(served.headers.get('content-type') || '', /image\/png/);
+
+  // Attach to a new restaurant + menu item; a foreign path is silently dropped.
+  const rest = await api('/partner/restaurants', {
+    method: 'POST', token,
+    body: { name: 'Photo Diner', cuisine: 'Test', area: 'Thamel', photo: ok.data.url }
+  });
+  assert.equal(rest.status, 200, JSON.stringify(rest.data));
+  assert.equal(rest.data.restaurant.photo, ok.data.url);
+  const item = await api(`/partner/restaurants/${rest.data.restaurant.id}/menu`, {
+    method: 'POST', token,
+    body: { name: 'Momo', price: 200, photo: '/uploads/not-mine.png' }
+  });
+  assert.equal(item.status, 200);
+  assert.equal(item.data.restaurant.menu[0].photo, '', 'unowned photo refs must be dropped');
+
+  // Customers see the photo once the listing is approved.
+  await api(`/admin/restaurants/${rest.data.restaurant.id}/approve`, { method: 'POST', token: admin.data.token });
+  const { token: customerToken } = await registerUser('photo-viewer');
+  const list = await api('/restaurants', { token: customerToken });
+  const seen = list.data.restaurants.find((r) => r.id === rest.data.restaurant.id);
+  assert.ok(seen, 'approved restaurant must be listed');
+  assert.equal(seen.photo, ok.data.url);
+});
+
 test('surge applies when riders outnumber online drivers', async () => {
   // One bike driver is online (from the previous test); one searching live ride
   // makes demand/supply >= 1, which prices bikes at 1.2x.

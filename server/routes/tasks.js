@@ -8,8 +8,22 @@ const router = express.Router();
 const CATEGORIES = { shopping: '🛒', cleaning: '🧹', delivery: '📦', repair: '🔧', other: '💼' };
 const PLATFORM_FEE = 0.1; // SewaGo keeps 10% of every completed task
 
-function taskPublic(t) {
-  return { ...t, icon: CATEGORIES[t.category] || '💼' };
+// Applicant details (names, pitches) are only shown to the poster; everyone
+// else just sees how many people applied and whether they applied themselves.
+function taskPublic(t, viewerId = null) {
+  const applicants = t.applicants || [];
+  const out = {
+    ...t,
+    icon: CATEGORIES[t.category] || '💼',
+    applicantCount: applicants.length,
+    applied: viewerId ? applicants.some((a) => a.userId === viewerId) : false
+  };
+  if (viewerId !== t.posterId) delete out.applicants;
+  return out;
+}
+
+function completedJobs(userId) {
+  return db.tasks.filter((t) => t.workerId === userId && t.status === 'completed').length;
 }
 
 router.get('/tasks/board', authRequired, (req, res) => {
@@ -17,18 +31,18 @@ router.get('/tasks/board', authRequired, (req, res) => {
     .filter((t) => t.status === 'open' && t.posterId !== req.user.id)
     .slice()
     .reverse()
-    .map(taskPublic);
+    .map((t) => taskPublic(t, req.user.id));
   res.json({ tasks });
 });
 
 router.get('/tasks/mine', authRequired, (req, res) => {
-  const posted = db.tasks.filter((t) => t.posterId === req.user.id).slice().reverse().map(taskPublic);
-  const working = db.tasks.filter((t) => t.workerId === req.user.id).slice().reverse().map(taskPublic);
+  const posted = db.tasks.filter((t) => t.posterId === req.user.id).slice().reverse().map((t) => taskPublic(t, req.user.id));
+  const working = db.tasks.filter((t) => t.workerId === req.user.id).slice().reverse().map((t) => taskPublic(t, req.user.id));
   res.json({ posted, working });
 });
 
 router.post('/tasks', authRequired, (req, res) => {
-  const { title, category, desc, place, budget } = req.body || {};
+  const { title, category, desc, place, budget, when } = req.body || {};
   const amount = Math.round(Number(budget));
   if (!title || String(title).trim().length < 4 || String(title).trim().length > 80) {
     return res.status(400).json({ error: 'Title must be 4-80 characters.' });
@@ -52,10 +66,12 @@ router.post('/tasks', authRequired, (req, res) => {
     category,
     desc: String(desc || '').trim().slice(0, 400),
     place: String(place || '').trim().slice(0, 60),
+    when: String(when || '').trim().slice(0, 40),
     budget: amount,
     fee,
     workerPayout: amount - fee,
     status: 'open',
+    applicants: [],
     workerId: null,
     workerName: null,
     createdAt: Date.now()
@@ -70,20 +86,44 @@ router.post('/tasks', authRequired, (req, res) => {
   });
   db.tasks.push(task);
   save();
-  res.json({ task: taskPublic(task), user: publicUser(req.user) });
+  res.json({ task: taskPublic(task, req.user.id), user: publicUser(req.user) });
 });
 
-router.post('/tasks/:id/accept', authRequired, (req, res) => {
+// A real hiring flow instead of first-tap-wins: workers apply with a short
+// pitch, the poster reviews them and hires one.
+router.post('/tasks/:id/apply', authRequired, (req, res) => {
   const task = db.tasks.find((t) => t.id === req.params.id);
   if (!task) return res.status(404).json({ error: 'Task not found.' });
-  if (task.posterId === req.user.id) return res.status(400).json({ error: 'You cannot accept your own task.' });
-  if (task.status !== 'open') return res.status(409).json({ error: 'This task was already taken.' });
+  if (task.posterId === req.user.id) return res.status(400).json({ error: 'You cannot apply to your own task.' });
+  if (task.status !== 'open') return res.status(409).json({ error: 'This task is no longer open.' });
+  task.applicants = task.applicants || [];
+  if (task.applicants.some((a) => a.userId === req.user.id)) {
+    return res.status(409).json({ error: 'You already applied — the poster will pick soon.' });
+  }
+  if (task.applicants.length >= 20) return res.status(409).json({ error: 'This task already has 20 applicants.' });
+  task.applicants.push({
+    userId: req.user.id,
+    name: req.user.name,
+    note: String((req.body || {}).note || '').trim().slice(0, 200),
+    completedJobs: completedJobs(req.user.id),
+    appliedAt: Date.now()
+  });
+  save();
+  res.json({ task: taskPublic(task, req.user.id) });
+});
+
+router.post('/tasks/:id/hire', authRequired, (req, res) => {
+  const task = db.tasks.find((t) => t.id === req.params.id && t.posterId === req.user.id);
+  if (!task) return res.status(404).json({ error: 'Task not found.' });
+  if (task.status !== 'open') return res.status(400).json({ error: 'This task already has a worker.' });
+  const applicant = (task.applicants || []).find((a) => a.userId === (req.body || {}).userId);
+  if (!applicant) return res.status(400).json({ error: 'Pick one of the applicants.' });
   task.status = 'assigned';
-  task.workerId = req.user.id;
-  task.workerName = req.user.name;
+  task.workerId = applicant.userId;
+  task.workerName = applicant.name;
   task.assignedAt = Date.now();
   save();
-  res.json({ task: taskPublic(task) });
+  res.json({ task: taskPublic(task, req.user.id) });
 });
 
 router.post('/tasks/:id/done', authRequired, (req, res) => {
@@ -93,7 +133,7 @@ router.post('/tasks/:id/done', authRequired, (req, res) => {
   task.status = 'done'; // waiting for the poster to confirm and release payment
   task.doneAt = Date.now();
   save();
-  res.json({ task: taskPublic(task) });
+  res.json({ task: taskPublic(task, req.user.id) });
 });
 
 router.post('/tasks/:id/confirm', authRequired, (req, res) => {
@@ -120,7 +160,7 @@ router.post('/tasks/:id/confirm', authRequired, (req, res) => {
     refId: task.id
   });
   save();
-  res.json({ task: taskPublic(task), user: publicUser(req.user) });
+  res.json({ task: taskPublic(task, req.user.id), user: publicUser(req.user) });
 });
 
 router.post('/tasks/:id/cancel', authRequired, (req, res) => {
@@ -140,7 +180,7 @@ router.post('/tasks/:id/cancel', authRequired, (req, res) => {
     refId: task.id
   });
   save();
-  res.json({ task: taskPublic(task), user: publicUser(req.user) });
+  res.json({ task: taskPublic(task, req.user.id), user: publicUser(req.user) });
 });
 
 module.exports = router;

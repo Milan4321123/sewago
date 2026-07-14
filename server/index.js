@@ -122,7 +122,7 @@ app.use(
 // Money movement and phone-verification endpoints get their own strict budget:
 // legitimate users touch these a handful of times a day, so a tight cap costs
 // them nothing while blunting brute-force OTP guessing and drain-the-wallet loops.
-const moneyLimiter = makeLimiter(10 * 60 * 1000, 40);
+const moneyLimiter = makeLimiter(10 * 60 * 1000, 60);
 app.use(
   ['/api/payments/withdraw', '/api/payments/topup/initiate', '/api/payments/topup/confirm',
     '/api/partner/withdraw', '/api/driver/withdraw',
@@ -221,6 +221,12 @@ app.get('/admin', (req, res) => res.sendFile(path.join(PUBLIC_DIR, 'admin.html')
 app.get('/download', (req, res) => res.sendFile(path.join(PUBLIC_DIR, 'download.html')));
 app.get('/privacy', (req, res) => res.sendFile(path.join(PUBLIC_DIR, 'privacy.html')));
 app.get('/terms', (req, res) => res.sendFile(path.join(PUBLIC_DIR, 'terms.html')));
+// Partner-uploaded listing photos. Filenames are random and never rewritten,
+// so they can be cached hard.
+app.use('/uploads', express.static(require('./photos').UPLOADS_DIR, {
+  immutable: true,
+  maxAge: '30d'
+}));
 // Icons/images are immutable-ish (long cache); HTML/JS/CSS revalidate via ETag
 // so every deploy reaches browsers and the network-first service worker.
 app.use(express.static(PUBLIC_DIR, {
@@ -233,7 +239,7 @@ app.use(express.static(PUBLIC_DIR, {
   }
 }));
 app.use((req, res) => {
-  if (req.method === 'GET' && !req.path.startsWith('/api')) {
+  if (req.method === 'GET' && !req.path.startsWith('/api') && !req.path.startsWith('/uploads')) {
     return res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
   }
   res.status(404).json({ error: 'Not found' });

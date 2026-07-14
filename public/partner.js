@@ -15,7 +15,9 @@ const state = {
   showRestForm: false,
   showHotelForm: false,
   showWithdraw: false,
-  showPhoneEdit: false // re-open the OTP form to change a verified phone
+  showPhoneEdit: false, // re-open the OTP form to change a verified phone
+  photos: {}, // slot -> uploaded /uploads/ URL pending form submission
+  photoBusy: '' // slot currently uploading (disables its button)
 };
 
 // Remembers which KYC decision the partner has already dismissed, so the
@@ -63,6 +65,116 @@ function toast(msg, isError = false) {
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => el.classList.add('hidden'), 3200);
 }
+
+/* ---------------- listing photos ---------------- */
+
+// Downscale on the phone before uploading: a 12 MP camera shot becomes a
+// ~200 KB 1280px JPEG, which uploads fast and renders fast in the app.
+function downscaleImage(file, maxSide = 1280, quality = 0.82) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.round(img.width * scale);
+      canvas.height = Math.round(img.height * scale);
+      canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+      canvas.toBlob((blob) => (blob ? resolve(blob) : reject(new Error('Could not read that image.'))), 'image/jpeg', quality);
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error('That file is not an image.'));
+    };
+    img.src = url;
+  });
+}
+
+async function uploadPhotoBlob(blob) {
+  const res = await fetch('/api/partner/photos', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'image/jpeg',
+      ...(state.token ? { Authorization: 'Bearer ' + state.token } : {})
+    },
+    body: blob
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || 'Photo upload failed.');
+  return data.url;
+}
+
+// Reusable "add photo" field: preview thumbnail + hidden file input. The
+// uploaded URL parks in state.photos[slot] until the form that owns the slot
+// is submitted.
+function photoField(slot, label = '📷 Add photo') {
+  const url = state.photos[slot];
+  const busy = state.photoBusy === slot;
+  return `
+  <div class="photo-field">
+    ${url ? `<img class="photo-preview" src="${esc(url)}" alt="photo" />` : ''}
+    <label class="btn ghost compact" style="margin:0">
+      ${busy ? 'Uploading…' : url ? '🔁 Change photo' : label}
+      <input type="file" accept="image/*" style="display:none" ${busy ? 'disabled' : ''}
+        onchange="pickPhoto(event, '${slot}')" />
+    </label>
+    ${url && !busy ? `<button class="link" onclick="clearPhoto('${slot}')">remove</button>` : ''}
+  </div>`;
+}
+
+// Re-render without losing what the partner already typed into form fields
+// (render() rebuilds the whole DOM, which would wipe a half-filled form).
+function renderKeepingForms() {
+  const values = {};
+  document.querySelectorAll('input[id], select[id]').forEach((el) => {
+    if (el.type !== 'file' && el.type !== 'password') values[el.id] = el.value;
+  });
+  render();
+  for (const [id, value] of Object.entries(values)) {
+    const el = document.getElementById(id);
+    if (el) el.value = value;
+  }
+}
+
+window.pickPhoto = async (event, slot) => {
+  const file = event.target.files && event.target.files[0];
+  if (!file) return;
+  state.photoBusy = slot;
+  renderKeepingForms();
+  try {
+    const blob = await downscaleImage(file);
+    state.photos[slot] = await uploadPhotoBlob(blob);
+    toast('Photo uploaded 📷');
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    state.photoBusy = '';
+    renderKeepingForms();
+  }
+};
+
+window.clearPhoto = (slot) => {
+  delete state.photos[slot];
+  render();
+};
+
+// Change the cover photo of an already-created listing in one step.
+window.changeCover = async (event, type, id) => {
+  const file = event.target.files && event.target.files[0];
+  if (!file) return;
+  try {
+    toast('Uploading photo…');
+    const blob = await downscaleImage(file);
+    const url = await uploadPhotoBlob(blob);
+    await api(`/api/partner/${type}/${id}/photo`, { method: 'POST', body: { photo: url } });
+    await reload();
+    toast('Cover photo updated 📷');
+    render();
+  } catch (e) {
+    toast(e.message, true);
+  }
+};
 
 async function reload() {
   const me = await api('/api/partner/me');
@@ -730,6 +842,8 @@ function restaurantForm() {
     <label class="field"><span>Icon</span>
       <select id="r-icon">${REST_ICONS.map((i) => `<option>${i}</option>`).join('')}</select>
     </label>
+    <div class="muted small" style="margin-bottom:6px">Cover photo — customers pick with their eyes 👀</div>
+    ${photoField('new-rest')}
     <button class="btn" onclick="addRestaurant()">Create restaurant</button>
     <button class="btn ghost" style="margin-top:8px" onclick="toggleRestForm()">Cancel</button>
   </div>`;
@@ -745,9 +859,11 @@ window.addRestaurant = async () => {
         area: $('#r-area').value.trim(),
         etaMinutes: $('#r-eta').value,
         deliveryFee: $('#r-fee').value,
-        icon: $('#r-icon').value
+        icon: $('#r-icon').value,
+        photo: state.photos['new-rest'] || ''
       }
     });
+    delete state.photos['new-rest'];
     state.showRestForm = false;
     await reload();
     toast('Restaurant created — now add menu items so customers can order! 🎉');
@@ -804,6 +920,7 @@ window.promoteListing = async (type, id) => {
 function restaurantCard(r) {
   return `
   <div class="card">
+    ${r.photo ? `<img class="cover-img" src="${esc(r.photo)}" alt="${esc(r.name)}" />` : ''}
     <div class="row">
       <div>
         <div style="font-weight:900">${r.icon} ${esc(r.name)} ${reviewStatusBadge(r)}</div>
@@ -811,13 +928,17 @@ function restaurantCard(r) {
       </div>
       <button class="btn danger compact" onclick="deleteRestaurant('${r.id}')">Remove</button>
     </div>
+    <label class="link" style="cursor:pointer">${r.photo ? '🔁 Change cover photo' : '📷 Add a cover photo'}
+      <input type="file" accept="image/*" style="display:none" onchange="changeCover(event, 'restaurants', '${r.id}')" />
+    </label>
     ${reviewStatusLine(r, 'restaurants')}
     ${promoBlock('restaurants', r)}
     <div class="divider"></div>
     ${r.menu.length === 0 ? `<div class="muted small" style="margin-bottom:10px">⚠️ No menu items yet — customers can't order until you add some.</div>` : ''}
     ${r.menu.map((m) => `
       <div class="row" style="margin-bottom:8px">
-        <div>
+        ${m.photo ? `<img class="thumb" src="${esc(m.photo)}" alt="${esc(m.name)}" />` : ''}
+        <div class="grow">
           <div><b>${esc(m.name)}</b> · ${money(m.price)}</div>
           ${m.desc ? `<div class="muted small">${esc(m.desc)}</div>` : ''}
         </div>
@@ -830,6 +951,7 @@ function restaurantCard(r) {
       <label class="field"><span>Price (Rs)</span><input id="mi-price-${r.id}" type="number" placeholder="250" /></label>
     </div>
     <label class="field"><span>Description (optional)</span><input id="mi-desc-${r.id}" placeholder="e.g. Newari rice crepe with toppings" /></label>
+    ${photoField(`menu-${r.id}`, '📷 Add a dish photo')}
     <button class="btn" onclick="addMenuItem('${r.id}')">Add item</button>
   </div>`;
 }
@@ -841,9 +963,11 @@ window.addMenuItem = async (rid) => {
       body: {
         name: $(`#mi-name-${rid}`).value.trim(),
         price: $(`#mi-price-${rid}`).value,
-        desc: $(`#mi-desc-${rid}`).value.trim()
+        desc: $(`#mi-desc-${rid}`).value.trim(),
+        photo: state.photos[`menu-${rid}`] || ''
       }
     });
+    delete state.photos[`menu-${rid}`];
     await reload();
     toast('Menu item added ✅');
     render();
@@ -888,6 +1012,8 @@ function hotelForm() {
     <label class="field"><span>Icon</span>
       <select id="h-icon">${HOTEL_ICONS.map((i) => `<option>${i}</option>`).join('')}</select>
     </label>
+    <div class="muted small" style="margin-bottom:6px">Cover photo — listings with photos get booked first 👀</div>
+    ${photoField('new-hotel')}
     <button class="btn" onclick="addHotel()">Create hotel</button>
     <button class="btn ghost" style="margin-top:8px" onclick="toggleHotelForm()">Cancel</button>
   </div>`;
@@ -902,9 +1028,11 @@ window.addHotel = async () => {
         city: $('#h-city').value.trim(),
         area: $('#h-area').value.trim(),
         desc: $('#h-desc').value.trim(),
-        icon: $('#h-icon').value
+        icon: $('#h-icon').value,
+        photo: state.photos['new-hotel'] || ''
       }
     });
+    delete state.photos['new-hotel'];
     state.showHotelForm = false;
     await reload();
     toast('Hotel created — now add room types so customers can book! 🎉');
@@ -917,6 +1045,7 @@ window.addHotel = async () => {
 function hotelCard(h) {
   return `
   <div class="card">
+    ${h.photo ? `<img class="cover-img" src="${esc(h.photo)}" alt="${esc(h.name)}" />` : ''}
     <div class="row">
       <div>
         <div style="font-weight:900">${h.icon} ${esc(h.name)} ${reviewStatusBadge(h)}</div>
@@ -924,13 +1053,17 @@ function hotelCard(h) {
       </div>
       <button class="btn danger compact" onclick="deleteHotel('${h.id}')">Remove</button>
     </div>
+    <label class="link" style="cursor:pointer">${h.photo ? '🔁 Change cover photo' : '📷 Add a cover photo'}
+      <input type="file" accept="image/*" style="display:none" onchange="changeCover(event, 'hotels', '${h.id}')" />
+    </label>
     ${reviewStatusLine(h, 'hotels')}
     ${promoBlock('hotels', h)}
     <div class="divider"></div>
     ${h.rooms.length === 0 ? `<div class="muted small" style="margin-bottom:10px">⚠️ No room types yet — customers can't book until you add some.</div>` : ''}
     ${h.rooms.map((room) => `
       <div class="row" style="margin-bottom:8px">
-        <div>
+        ${room.photo ? `<img class="thumb" src="${esc(room.photo)}" alt="${esc(room.type)}" />` : ''}
+        <div class="grow">
           <div><b>${esc(room.type)}</b> · ${money(room.pricePerNight)}/night · ${room.count} room${room.count > 1 ? 's' : ''} · sleeps ${room.sleeps}</div>
           ${room.amenities.length ? `<div style="margin-top:3px">${room.amenities.map((a) => `<span class="amenity">${esc(a)}</span>`).join('')}</div>` : ''}
         </div>
@@ -947,6 +1080,7 @@ function hotelCard(h) {
       <label class="field"><span>Sleeps</span><input id="ro-sleeps-${h.id}" type="number" value="2" min="1" max="10" /></label>
     </div>
     <label class="field"><span>Amenities (comma separated)</span><input id="ro-amen-${h.id}" placeholder="WiFi, Breakfast, AC" /></label>
+    ${photoField(`room-${h.id}`, '📷 Add a room photo')}
     <button class="btn" onclick="addRoom('${h.id}')">Add room type</button>
   </div>`;
 }
@@ -960,9 +1094,11 @@ window.addRoom = async (hid) => {
         pricePerNight: $(`#ro-price-${hid}`).value,
         count: $(`#ro-count-${hid}`).value,
         sleeps: $(`#ro-sleeps-${hid}`).value,
-        amenities: $(`#ro-amen-${hid}`).value
+        amenities: $(`#ro-amen-${hid}`).value,
+        photo: state.photos[`room-${hid}`] || ''
       }
     });
+    delete state.photos[`room-${hid}`];
     await reload();
     toast('Room type added ✅');
     render();

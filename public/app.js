@@ -45,6 +45,7 @@ const state = {
   tasksBoard: [],
   myTasks: { posted: [], working: [] },
   showTaskForm: false,
+  applyingTask: '', // board task whose application note is open
   _tasksKey: null,
   // activity
   rides: []
@@ -890,7 +891,7 @@ function foodView() {
     <div class="section-title">Hungry? Order in 🍜</div>
     ${state.restaurants.map((r) => `
       <div class="tile" onclick="openRestaurant('${r.id}')">
-        <span class="emoji">${r.icon}</span>
+        ${r.photo ? `<img class="tile-photo" src="${esc(r.photo)}" alt="${esc(r.name)}" loading="lazy" />` : `<span class="emoji">${r.icon}</span>`}
         <div>
           <h3>${esc(r.name)}${r.promotedUntil > Date.now() ? ' <span class="badge" style="background:#713f12;color:#fde68a">⭐ Featured</span>' : ''}</h3>
           <div class="sub">${esc(r.cuisine)} · ${r.etaMinutes} min · ${money(r.deliveryFee)} delivery</div>
@@ -1036,6 +1037,7 @@ function menuView() {
     <span class="badge">${r.rating ? '★ ' + r.rating : 'NEW'} · ${r.etaMinutes} min</span>
   </div>
   <div class="card">
+    ${r.photo ? `<img class="cover-img" src="${esc(r.photo)}" alt="${esc(r.name)}" />` : ''}
     <div class="row">
       <div>
         <div style="font-size:19px;font-weight:900">${r.icon} ${esc(r.name)}</div>
@@ -1048,6 +1050,7 @@ function menuView() {
     return `
     <div class="card">
       <div class="row">
+        ${m.photo ? `<img class="thumb" src="${esc(m.photo)}" alt="${esc(m.name)}" loading="lazy" />` : ''}
         <div class="grow">
           <div><b>${esc(m.name)}</b></div>
           <div class="muted small">${esc(m.desc)}</div>
@@ -1181,6 +1184,7 @@ function hotelResults() {
   return `<div class="section-title">${state.hotels.length} hotels · ${nights} night${nights > 1 ? 's' : ''}</div>` +
     state.hotels.map((h) => `
     <div class="card">
+      ${h.photo ? `<img class="cover-img" src="${esc(h.photo)}" alt="${esc(h.name)}" loading="lazy" />` : ''}
       <div class="row">
         <div>
           <div style="font-weight:900">${h.icon} ${esc(h.name)}${h.promotedUntil > Date.now() ? ' <span class="badge" style="background:#713f12;color:#fde68a">⭐ Featured</span>' : ''}</div>
@@ -1191,6 +1195,7 @@ function hotelResults() {
       <div class="divider"></div>
       ${h.rooms.map((room) => `
         <div class="row" style="margin-bottom:12px">
+          ${room.photo ? `<img class="thumb" src="${esc(room.photo)}" alt="${esc(room.type)}" loading="lazy" />` : ''}
           <div class="grow">
             <div><b>${esc(room.type)}</b> <span class="muted small">· sleeps ${room.sleeps}</span></div>
             <div style="margin:4px 0 2px">${room.amenities.map((a) => `<span class="amenity">${esc(a)}</span>`).join('')}</div>
@@ -1311,6 +1316,9 @@ function taskForm() {
         <input id="t-budget" type="number" placeholder="500" min="100" max="50000" />
       </label>
     </div>
+    <label class="field"><span>When do you need it? (optional)</span>
+      <input id="t-when" placeholder="e.g. Today before 6pm, this weekend…" />
+    </label>
     <datalist id="sg-places">
       ${state.places.map((p) => `<option value="${esc(p.name)}"></option>`).join('')}
     </datalist>
@@ -1350,10 +1358,22 @@ function tasksView() {
       <div class="row">
         <div>
           <div><b>${t.icon} ${esc(t.title)}</b></div>
-          <div class="muted small">${t.place ? '📍 ' + esc(t.place) + ' · ' : ''}budget ${money(t.budget)}${t.workerName ? ' · 🙋 ' + esc(t.workerName) : ''}</div>
+          <div class="muted small">${t.place ? '📍 ' + esc(t.place) + ' · ' : ''}${t.when ? '⏰ ' + esc(t.when) + ' · ' : ''}budget ${money(t.budget)}${t.workerName ? ' · 🙋 ' + esc(t.workerName) : ''}</div>
         </div>
         ${taskBadge(t.status)}
       </div>
+      ${t.status === 'open' && (t.applicants || []).length ? `
+        <div class="divider"></div>
+        <div class="muted small" style="font-weight:700;margin-bottom:8px">🙋 ${t.applicants.length} applicant${t.applicants.length > 1 ? 's' : ''} — pick who does the job</div>
+        ${t.applicants.map((a) => `
+        <div class="row" style="margin-bottom:10px">
+          <div class="grow">
+            <div><b>${esc(a.name)}</b> <span class="muted small">· ${a.completedJobs} job${a.completedJobs === 1 ? '' : 's'} done</span></div>
+            ${a.note ? `<div class="muted small">“${esc(a.note)}”</div>` : ''}
+          </div>
+          <button class="btn compact" style="width:auto" onclick="hireWorker('${t.id}','${a.userId}')">Hire</button>
+        </div>`).join('')}` : ''}
+      ${t.status === 'open' && !(t.applicants || []).length ? `<div class="muted small" style="margin-top:8px">⏳ Waiting for people to apply…</div>` : ''}
       ${t.status === 'done' ? `<button class="btn" style="margin-top:12px" onclick="confirmTask('${t.id}')">✓ Confirm done — pay ${money(t.workerPayout)}</button>` : ''}
       ${t.status === 'open' ? `<button class="btn danger" style="margin-top:12px" onclick="cancelTask('${t.id}')">Cancel (refund ${money(t.budget)})</button>` : ''}
     </div>`).join('') : ''}
@@ -1366,7 +1386,7 @@ function tasksView() {
       <div class="row">
         <div>
           <div><b>${t.icon} ${esc(t.title)}</b></div>
-          <div class="muted small">by ${esc(t.posterName)}${t.place ? ' · 📍 ' + esc(t.place) : ''}</div>
+          <div class="muted small">by ${esc(t.posterName)}${t.place ? ' · 📍 ' + esc(t.place) : ''}${t.when ? ' · ⏰ ' + esc(t.when) : ''}</div>
           ${t.desc ? `<div class="muted small">${esc(t.desc)}</div>` : ''}
         </div>
         <div style="text-align:right">
@@ -1374,9 +1394,51 @@ function tasksView() {
           <div class="muted small">budget ${money(t.budget)}</div>
         </div>
       </div>
-      <button class="btn" style="margin-top:12px" onclick="acceptTask('${t.id}')">Accept this job</button>
+      ${t.applicantCount ? `<div class="muted small" style="margin-top:6px">🙋 ${t.applicantCount} applicant${t.applicantCount > 1 ? 's' : ''} so far</div>` : ''}
+      ${t.applied
+        ? `<div class="eta-line" style="margin-top:12px">✓ You applied — waiting for ${esc(t.posterName.split(' ')[0])} to pick</div>`
+        : state.applyingTask === t.id ? `
+        <label class="field" style="margin-top:12px"><span>Why you? (optional, shown to the poster)</span>
+          <input id="apply-note-${t.id}" maxlength="200" placeholder="e.g. I live nearby and can start right away" />
+        </label>
+        <div class="grid2">
+          <button class="btn" onclick="applyTask('${t.id}')">Send application</button>
+          <button class="btn ghost" onclick="toggleApply('')">Cancel</button>
+        </div>`
+        : `<button class="btn" style="margin-top:12px" onclick="toggleApply('${t.id}')">🙋 Apply for this job</button>`}
     </div>`).join('')}`;
 }
+
+window.toggleApply = (id) => {
+  state.applyingTask = id;
+  render();
+};
+
+window.applyTask = async (id) => {
+  try {
+    const noteEl = $(`#apply-note-${id}`);
+    await api(`/api/tasks/${id}/apply`, { method: 'POST', body: { note: noteEl ? noteEl.value.trim() : '' } });
+    state.applyingTask = '';
+    await refreshTasks();
+    toast('Application sent — you\'ll see it here if you\'re hired 🙋');
+    render();
+  } catch (e) {
+    toast(e.message, true);
+    refreshTasks().then(render).catch(() => {});
+  }
+};
+
+window.hireWorker = async (taskId, userId) => {
+  try {
+    await api(`/api/tasks/${taskId}/hire`, { method: 'POST', body: { userId } });
+    await refreshTasks();
+    toast('Hired! They\'ve been notified to start 💪');
+    render();
+  } catch (e) {
+    toast(e.message, true);
+    refreshTasks().then(render).catch(() => {});
+  }
+};
 
 window.toggleTaskForm = () => {
   state.showTaskForm = !state.showTaskForm;
@@ -1392,7 +1454,8 @@ window.postTask = async () => {
         category: $('#t-category').value,
         desc: $('#t-desc').value.trim(),
         place: $('#t-place').value.trim(),
-        budget: $('#t-budget').value
+        budget: $('#t-budget').value,
+        when: $('#t-when').value.trim()
       }
     });
     setUser(data.user);
@@ -1402,18 +1465,6 @@ window.postTask = async () => {
     render();
   } catch (e) {
     toast(e.message, true);
-  }
-};
-
-window.acceptTask = async (id) => {
-  try {
-    await api(`/api/tasks/${id}/accept`, { method: 'POST' });
-    await refreshTasks();
-    toast('Job accepted — it\'s yours! 💪');
-    render();
-  } catch (e) {
-    toast(e.message, true);
-    refreshTasks().then(render).catch(() => {});
   }
 };
 
@@ -1943,8 +1994,9 @@ setInterval(async () => {
       const slot = $('#orders-slot');
       if (slot) slot.innerHTML = ordersSlot();
     }
-    // Tasks are two-sided: refresh while watching the board (but never wipe the post form).
-    if (state.tab === 'tasks' && !state.showTaskForm) {
+    // Tasks are two-sided: refresh while watching the board (but never wipe
+    // the post form or an application note being typed).
+    if (state.tab === 'tasks' && !state.showTaskForm && !state.applyingTask) {
       const prevKey = state._tasksKey;
       await refreshTasks();
       if (state._tasksKey !== prevKey) renderTab();
