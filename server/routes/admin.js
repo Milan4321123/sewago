@@ -96,6 +96,12 @@ router.get('/admin/overview', authAdmin, (req, res) => {
     db.orders
       .filter((o) => o.partnerCut && o.status === 'delivered')
       .reduce((sum, o) => sum + (o.total - o.partnerCut - (o.serviceFee || 0) - (o.courierPayout || 0)), 0) +
+    // Courier-abandoned food orders: commission + service fee stay booked
+    // (prepaid) or are booked at settlement (cash) with no courier payout —
+    // funded by the courier's debt — so the ledger holds total - partnerCut.
+    db.orders
+      .filter((o) => o.partnerCut && o.cancelReason === 'courier_abandoned')
+      .reduce((sum, o) => sum + (o.total - o.partnerCut), 0) +
     db.bookings
       .filter((b) => b.partnerCut && b.status !== 'cancelled')
       .reduce((sum, b) => sum + (b.total - b.partnerCut), 0) +
@@ -373,6 +379,64 @@ router.get('/admin/queue', authAdmin, (req, res) => {
       partner: partnerInfo(s.ownerId)
     }));
   res.json({ restaurants, hotels, stores });
+});
+
+// Food orders a courier collected and then vanished with. The money already
+// auto-resolved when the delivery was recovered (customer refunded, restaurant
+// income honoured, courier billed the order total) — this queue is where staff
+// review the incident, chase the courier and the food, and dismiss the flag
+// once the case is truly dealt with.
+router.get('/admin/attention', authAdmin, (req, res) => {
+  const orders = db.orders
+    .filter((o) => o.needsAttention)
+    .map((o) => {
+      const courier = db.drivers.find((d) => d.id === (o.abandonedBy || o.courierId));
+      const customer = db.users.find((u) => u.id === o.userId);
+      return {
+        id: o.id,
+        kind: 'food',
+        reason: o.needsAttention,
+        restaurantName: o.restaurantName,
+        items: o.items.map((l) => `${l.qty}× ${l.name}`).join(', '),
+        total: o.total,
+        payment: o.payment,
+        refunded: o.payment !== 'cash',
+        abandonedAt: o.abandonedAt || o.cancelledAt || null,
+        customer: customer ? { name: customer.name, phone: customer.phone || '—' } : null,
+        courier: courier
+          ? {
+            id: courier.id,
+            name: courier.name,
+            phone: courier.phone || '—',
+            owes: Math.max(0, -(courier.earnings || 0)),
+            suspended: !!courier.suspended
+          }
+          : null
+      };
+    })
+    .sort((a, b) => (b.abandonedAt || 0) - (a.abandonedAt || 0));
+  res.json({ orders });
+});
+
+// Staff dealt with the incident. Clearing the flag only empties the queue —
+// the order stays cancelled and every ledger line stays put; any further
+// compensation goes through the existing wallet-adjust / settle-cash tools.
+router.post('/admin/orders/:id/attention/resolve', authAdmin, (req, res) => {
+  const order = db.orders.find((o) => o.id === req.params.id);
+  if (!order) return res.status(404).json({ error: 'Order not found.' });
+  if (!order.needsAttention) return res.status(400).json({ error: 'This order is not flagged for attention.' });
+  order.needsAttention = null;
+  order.attentionResolvedAt = Date.now();
+  save();
+  logAudit({
+    actor: adminActor(),
+    action: 'order_attention_resolved',
+    targetType: 'order',
+    targetId: order.id,
+    meta: { note: String((req.body || {}).note || '').trim().slice(0, 300) },
+    ip: req.ip
+  });
+  res.json({ order: { id: order.id, needsAttention: null } });
 });
 
 router.get('/admin/partners', authAdmin, (req, res) => {

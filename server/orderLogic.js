@@ -6,6 +6,7 @@
 //   'sim'  — seeded demo restaurant with no partner behind it. Status advances
 //            on the original timers so the demo stays alive with zero staff.
 const { db, save } = require('./db');
+const events = require('./events');
 
 // Demo timings (seconds) for simulated orders.
 const PLACED_UNTIL = 8;
@@ -113,8 +114,97 @@ function withStatus(order) {
 // forever: the order never reached a terminal state, the partner's income stayed
 // frozen in pendingEarnings, a prepaid customer got no refund, and the courier
 // stayed pinned to a job they abandoned. Recover both cases on a timer.
-const PICKUP_DEADLINE_MS = 25 * 60 * 1000;   // accepted but never collected
-const DROPOFF_DEADLINE_MS = 90 * 60 * 1000;  // collected but never delivered
+// Env knobs mirror the delivery-run deadlines in deliveryRuns.js; the low
+// minimums exist so the recovery paths are testable in seconds.
+function envNum(name, fallback, min, max) {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) && n >= min && n <= max ? n : fallback;
+}
+
+const PICKUP_DEADLINE_MS = envNum('FOOD_PICKUP_DEADLINE_MIN', 25, 0.01, 600) * 60000;    // accepted but never collected
+const DROPOFF_DEADLINE_MS = envNum('FOOD_DROPOFF_DEADLINE_MIN', 90, 0.01, 1440) * 60000; // collected but never delivered
+
+// Money for a collected food order whose courier vanished with the bag —
+// the food twin of settleAbandonedOrder in deliveryRuns.js. This must NOT be
+// refundOrder: that unwinds the restaurant's income and the platform's bookings
+// as if nothing was ever cooked, but this meal physically left the kitchen.
+// Instead each party lands where the handshake says it should — the customer is
+// made whole (they got nothing), the restaurant keeps the sale (it genuinely
+// handed the food to our courier), and the courier absorbs the loss as a debt
+// on their earnings ledger, the same ledger COD debts live on, so staff collect
+// it through the existing cash-settlement flow. For a prepaid order the
+// platform's commission and service fee stay booked from placement: the
+// courier's debit is what funds the refund.
+function settleAbandonedDelivery(order, courier) {
+  // Lazy requires to avoid circular imports at module load time.
+  const { recordTxn, recordPlatformRevenue } = require('./payments');
+  const { driverOwesTooMuch } = require('./rideLogic');
+  if (order.payment !== 'cash') {
+    const user = db.users.find((u) => u.id === order.userId);
+    if (user) {
+      user.wallet += order.total;
+      recordTxn('user', user, {
+        type: 'food_refund',
+        label: `Courier failed to deliver — refund: ${order.restaurantName}`,
+        amount: order.total,
+        sign: 1,
+        refId: order.id
+      });
+    }
+  } else {
+    // Cash: the customer never paid, so there is nothing to refund and none of
+    // the platform's cut is booked yet. Billing the courier the order total
+    // below funds the commission and service fee exactly as if they had
+    // collected at the customer's door.
+    if (order.partnerCut) {
+      recordPlatformRevenue({
+        source: 'food_commission',
+        label: `Food commission + delivery (courier abandoned): ${order.restaurantName}`,
+        amount: order.total - order.partnerCut - (order.serviceFee || 0),
+        refId: order.id
+      });
+    }
+    if (order.serviceFee > 0) {
+      recordPlatformRevenue({
+        source: 'service_fee',
+        label: `Order service fee (courier abandoned): ${order.restaurantName}`,
+        amount: order.serviceFee,
+        refId: order.id
+      });
+    }
+  }
+  // The restaurant cooked and handed over a real meal — honour its income the
+  // same way a completed delivery would (pending -> withdrawable).
+  if (order.partnerCut && order.partnerId && !order.partnerSettled) {
+    const owner = db.partners.find((p) => p.id === order.partnerId);
+    if (owner) {
+      owner.pendingEarnings = (owner.pendingEarnings || 0) - order.partnerCut;
+      owner.earnings = (owner.earnings || 0) + order.partnerCut;
+      recordTxn('partner', owner, {
+        type: 'order_income',
+        label: `Courier lost the delivery — income honoured: ${order.restaurantName}`,
+        amount: order.partnerCut,
+        sign: 1,
+        refId: order.id
+      });
+    }
+    order.partnerSettled = true;
+  }
+  if (courier) {
+    courier.earnings = (courier.earnings || 0) - order.total;
+    recordTxn('driver', courier, {
+      type: 'abandoned_goods',
+      label: `Undelivered food on abandoned delivery: ${order.restaurantName}`,
+      amount: order.total,
+      sign: -1,
+      refId: order.id
+    });
+    // Same rule as collecting cash at a door: too deep in debt means no more
+    // jobs of any kind until they settle up with staff.
+    if (driverOwesTooMuch(courier)) courier.online = false;
+  }
+  order.moneySettledAt = Date.now();
+}
 
 function recoverAbandonedDeliveries() {
   const now = Date.now();
@@ -130,15 +220,30 @@ function recoverAbandonedDeliveries() {
       order.courier = null;
       order.courierAcceptedAt = null;
       order.reofferedAt = now;
+      // Nudge online couriers the same way the restaurant's accept does.
+      events.publish('drivers:bike', { topic: 'delivery_request' });
       changed += 1;
       continue;
     }
-    // Food collected but never delivered: this needs a human. Flag it for the
-    // admin queue and unpin the courier so they aren't blocked from other work,
-    // but keep the assignment recorded for the investigation.
+    // Food collected but never delivered: the meal is gone and only a human can
+    // chase where it went — but the money must not wait for one. Every driver
+    // endpoint is status-gated away from this order once it cancels, so resolve
+    // the money NOW (customer refunded, restaurant income honoured, courier
+    // billed) and flag the incident for staff to review after the fact in the
+    // admin attention queue. The courier assignment stays recorded for the
+    // investigation; currentDelivery already skips cancelled orders, so the
+    // courier is not blocked from other work.
     if (order.status === 'out_for_delivery' && now - (order.pickedUpAt || 0) > DROPOFF_DEADLINE_MS && !order.abandonedAt) {
       order.abandonedAt = now;
       order.abandonedBy = order.courierId;
+      settleAbandonedDelivery(order, db.drivers.find((d) => d.id === order.courierId));
+      order.status = 'cancelled';
+      order.cancelledAt = now;
+      order.cancelReason = 'courier_abandoned';
+      order.needsAttention = 'courier_abandoned';
+      events.publish(`user:${order.userId}`, { topic: 'order' });
+      if (order.partnerId) events.publish(`partner:${order.partnerId}`, { topic: 'orders' });
+      events.publish('admin', { topic: 'orders' });
       changed += 1;
     }
   }

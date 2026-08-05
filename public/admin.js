@@ -28,6 +28,7 @@ const state = {
   queue: { restaurants: [], hotels: [], stores: [] },
   partners: [],
   pendingDrivers: [],
+  attention: [], // abandoned-delivery incidents awaiting a staff sign-off
   payments: { pendingWithdrawals: [], stats: {}, revenue: {}, ledger: [] },
   approvalOpen: null, // 'kind:id' of the expanded approvals-inbox row
   inlineOpen: null,   // key of the one open .inline-form on the People tab
@@ -89,12 +90,13 @@ function toast(msg, isError = false) {
 
 // Core data behind badges + the Overview/Approvals/Money tabs.
 async function loadCore() {
-  const [o, q, p, pay, ppl] = await Promise.all([
+  const [o, q, p, pay, ppl, att] = await Promise.all([
     api('/api/admin/overview'),
     api('/api/admin/queue'),
     api('/api/admin/partners'),
     api('/api/admin/payments'),
-    api('/api/admin/people?q=') // newest signups → pending driver licenses for the inbox
+    api('/api/admin/people?q='), // newest signups → pending driver licenses for the inbox
+    api('/api/admin/attention')  // couriers who vanished with collected orders
   ]);
   state.stats = o.stats;
   state.revenueTrend = o.revenueTrend || [];
@@ -106,6 +108,7 @@ async function loadCore() {
   };
   state.partners = p.partners;
   state.payments = pay;
+  state.attention = att.orders || [];
   // Licenses awaiting a manual decision (drivers self-verify at signup, so
   // these are the rare flagged/rejected-and-resubmitted cases).
   state.pendingDrivers = (ppl.drivers || []).filter((d) => d.verificationStatus === 'pending');
@@ -483,6 +486,11 @@ function approvalItems() {
     sub: `Payout · ${money(w.amount)} + ${money(w.fee)} fee → ${esc(w.channelLabel)}`,
     at: w.createdAt || 0, data: w
   }));
+  (state.attention || []).forEach((o) => items.push({
+    kind: 'attention', id: o.id, emoji: '🚨', title: esc(o.restaurantName),
+    sub: `Abandoned delivery · ${money(o.total)} · 🛵 ${esc(o.courier ? o.courier.name : 'unknown courier')}`,
+    at: o.abandonedAt || 0, data: o
+  }));
   return items.sort((a, b) => (a.at || Infinity) - (b.at || Infinity));
 }
 
@@ -559,6 +567,24 @@ function payoutDetail(w) {
   </div>`;
 }
 
+// Abandoned-delivery incident. Money is already resolved by the time one lands
+// here (customer refunded, restaurant paid, courier billed) — this row exists
+// so a human closes the loop on the physical goods and the courier who took them.
+function attentionDetail(o) {
+  return `
+  <div class="muted small">${esc(o.items)}</div>
+  <div class="muted small">${money(o.total)} · ${o.payment === 'cash' ? 'CASH — customer had not paid' : 'PAID IN APP — customer auto-refunded'} · courier billed ${money(o.total)}</div>
+  <div style="background:var(--card2);border-radius:10px;padding:10px 12px;margin-top:10px">
+    <div class="small">🛵 <b>${esc(o.courier ? o.courier.name : 'Unknown courier')}</b>${o.courier ? ` · 📞 ${esc(o.courier.phone)} · owes <b style="color:var(--danger)">${money(o.courier.owes)}</b>${o.courier.suspended ? ' · <span style="color:var(--danger)">SUSPENDED</span>' : ''}` : ''}</div>
+    ${o.customer ? `<div class="muted small">👤 ${esc(o.customer.name)} · 📞 ${esc(o.customer.phone)}</div>` : ''}
+    <div class="muted small" style="margin-top:3px">Call the courier about the food; suspend them or settle their debt from the 👥 People tab.</div>
+  </div>
+  <label class="field" style="margin-top:12px"><span>Resolution note (kept on the audit trail)</span>
+    <input id="anote-${o.id}" placeholder="e.g. goods written off, courier suspended" />
+  </label>
+  <button class="btn" style="margin-top:4px" onclick="resolveAttention('${o.id}')">✓ Dealt with — clear</button>`;
+}
+
 function approvalDetail(item) {
   const d = item.data;
   if (item.kind === 'restaurants') {
@@ -587,8 +613,21 @@ function approvalDetail(item) {
   }
   if (item.kind === 'kyc') return kycDetail(d);
   if (item.kind === 'license') return licenseDetail(d);
+  if (item.kind === 'attention') return attentionDetail(d);
   return payoutDetail(d);
 }
+
+window.resolveAttention = async (id) => {
+  try {
+    const note = ($(`#anote-${id}`) || { value: '' }).value.trim();
+    await api(`/api/admin/orders/${id}/attention/resolve`, { method: 'POST', body: { note } });
+    state.approvalOpen = null;
+    toast('Incident cleared ✓');
+    await reloadAfterAction();
+  } catch (e) {
+    toast(e.message, true);
+  }
+};
 
 function queueRowHtml(item) {
   const key = item.kind + ':' + item.id;
