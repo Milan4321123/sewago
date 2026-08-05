@@ -5,7 +5,8 @@ const $ = (sel) => document.querySelector(sel);
 const state = {
   token: localStorage.getItem('sewago_token'),
   user: null,
-  tab: 'rides',
+  tab: 'home', // hub-and-spoke: the launcher is the default page
+  _popNav: false, // current setTab was triggered by the browser back button
   authMode: 'login',
   demo: false, // set from /api/app-info; only then do we show seed-account hints
   resetToken: '',
@@ -387,7 +388,7 @@ async function completeCustomerAuth(data) {
   state.user = data.user;
   localStorage.setItem('sewago_token', data.token);
   toast(`Namaste, ${data.user.name.split(' ')[0]}! 🙏`);
-  state.tab = 'rides';
+  state.tab = 'home'; // fresh login lands on the launcher
   state.otpLogin = { phone: '', devCode: '' };
   await loadPlaces();
   connectEvents();
@@ -487,14 +488,16 @@ window.doLogout = async () => {
 
 /* ---------------- shell ---------------- */
 
+// Hub-and-spoke: these are the service pages launched from the Home grid
+// (the ids double as `state.tab` values; `hint` is the tile's subtitle).
 const TABS = [
-  { id: 'rides', label: 'Rides', ico: '🚗' },
-  { id: 'shops', label: 'Shops', ico: '🏪' },
-  { id: 'food', label: 'Food', ico: '🍜' },
-  { id: 'stays', label: 'Stays', ico: '🏨' },
-  { id: 'tasks', label: 'Tasks', ico: '🧰' },
-  { id: 'activity', label: 'Activity', ico: '🧾' },
-  { id: 'profile', label: 'Profile', ico: '👤' }
+  { id: 'rides', label: 'Rides', ico: '🚗', hint: 'Bike · car · parcel' },
+  { id: 'shops', label: 'Shops', ico: '🏪', hint: 'Kirana near you' },
+  { id: 'food', label: 'Food', ico: '🍜', hint: 'Restaurants' },
+  { id: 'stays', label: 'Stays', ico: '🏨', hint: 'Hotels' },
+  { id: 'tasks', label: 'Tasks', ico: '🧰', hint: 'Hire help' },
+  { id: 'activity', label: 'Activity', ico: '🧾', hint: 'Trips & orders' },
+  { id: 'profile', label: 'Profile', ico: '👤', hint: '' } // hint = live wallet balance
 ];
 
 function render() {
@@ -505,16 +508,11 @@ function render() {
   }
   app.innerHTML = `
     <header class="topbar">
+      ${state.tab !== 'home' ? `<button class="back-chip" onclick="setTab('home')" aria-label="Back to Home">←</button>` : ''}
       <div class="brand"><img class="brand-mark" src="/icon.svg" alt="" />Sewa<em>Go</em></div>
       <div class="wallet-chip" id="wallet-chip">👛 ${money(state.user.wallet)}</div>
     </header>
-    <main id="view"></main>
-    <nav class="tabbar">
-      ${TABS.map((t) => `
-        <button class="${state.tab === t.id ? 'active' : ''}" onclick="setTab('${t.id}')">
-          <span class="ico">${t.ico}</span>${t.label}
-        </button>`).join('')}
-    </nav>`;
+    <main id="view"></main>`;
   renderTab();
 }
 
@@ -525,6 +523,10 @@ function renderTab() {
   if (state._pageAnim) {
     view.classList.add('page-enter');
     state._pageAnim = false;
+  }
+  if (state.tab === 'home') {
+    view.innerHTML = homeView();
+    return;
   }
   if (state.tab === 'rides') {
     view.innerHTML = ridesView();
@@ -540,11 +542,81 @@ function renderTab() {
   else view.innerHTML = profileView();
 }
 
+/* ---------------- home launcher ---------------- */
+
+// Counts hydrate lazily from whatever state is already loaded (boot, SSE,
+// a previous visit to the tab) — Home itself never fetches anything.
+function homeActiveCounts() {
+  const food = (state.orders || []).filter((o) => o.status !== 'delivered' && o.status !== 'cancelled').length;
+  const shop = (state.shopOrders || []).filter((o) => o.status !== 'delivered' && o.status !== 'cancelled').length;
+  return { food, shop };
+}
+
+// One glass row per live thing (ride under way, food on the bike, shop order
+// being packed) — a tap jumps straight into the service that owns it.
+function homeCtxRow(tab, text) {
+  return `
+  <div class="card" style="cursor:pointer" onclick="setTab('${tab}')">
+    <div class="row">
+      <div class="grow" style="font-weight:700">${text}</div>
+      <span style="color:var(--accent);font-weight:900">→</span>
+    </div>
+  </div>`;
+}
+
+function homeView() {
+  const first = (state.user.name || '').split(' ')[0];
+  const h = new Date().getHours();
+  const daypart = h < 12 ? 'morning' : h < 17 ? 'afternoon' : 'evening';
+  const { food, shop } = homeActiveCounts();
+  const ride = state.activeRide;
+  const rideLive = ride && RIDE_STEP_IDX[ride.status] !== undefined && ride.status !== 'completed';
+  const badges = { food, shops: shop };
+  return `
+  <div style="margin:2px 2px 16px">
+    <div style="font-size:23px;font-weight:900;letter-spacing:-0.5px">Namaste, ${esc(first)} 🙏</div>
+    <div class="muted small" style="margin-top:3px">Good ${daypart} — what do you need today?</div>
+  </div>
+  ${rideLive ? homeCtxRow('rides', `🚗 ${RIDE_STEPS[RIDE_STEP_IDX[ride.status]]} — your ride is live`) : ''}
+  ${food ? homeCtxRow('food', `🍜 ${food} food order${food === 1 ? '' : 's'} on the way`) : ''}
+  ${shop ? homeCtxRow('shops', `🏪 ${shop} shop order${shop === 1 ? '' : 's'} in progress`) : ''}
+  <div class="home-grid" style="margin-top:${rideLive || food || shop ? 16 : 0}px">
+    ${TABS.map((t) => `
+    <button class="home-tile" onclick="setTab('${t.id}')">
+      ${badges[t.id] ? `<span class="badge-dot">${badges[t.id]}</span>` : ''}
+      <span class="ico">${t.ico}</span>
+      <span class="lbl">${t.label}</span>
+      <span class="hint">${t.id === 'profile' ? `Wallet · ${money(state.user.wallet)}` : t.hint}</span>
+    </button>`).join('')}
+  </div>`;
+}
+
 window.setTab = async (tab) => {
+  const fromPop = state._popNav;
+  state._popNav = false;
+  // Hardware/browser back mirrors the ← chip, one level deep (Home ↔ service):
+  // leaving Home pushes an entry; the chip consumes it via history.back(), and
+  // the popstate handler below finishes the trip back to Home.
+  if (tab === 'home' && !fromPop && history.state && history.state.tab) {
+    history.back();
+    return;
+  }
+  if (tab !== 'home') {
+    if (history.state && history.state.tab) history.replaceState({ tab }, '');
+    else history.pushState({ tab }, '');
+  }
   state._pageAnim = state.tab !== tab;
   state.tab = tab;
   localStorage.setItem('sewago_tab', tab); // reload lands back on the same tab
   state.restaurant = null;
+  if (tab === 'home') {
+    // Back on the launcher: close service sub-screens. The basket survives —
+    // it follows you until it's ordered or cleared.
+    state.shop = null;
+    state.basketSwitch = null;
+    state.showTaskForm = false;
+    state.applyingTask = '';
+  }
   try {
     if (tab === 'shops') {
       state.shop = null;
@@ -2267,8 +2339,11 @@ function connectEvents() {
   sseSource.onmessage = (e) => {
     let msg;
     try { msg = JSON.parse(e.data); } catch (_) { return; }
-    if (msg.topic === 'ride') syncActiveRideUI().catch(() => {});
-    if (msg.topic === 'order' && state.tab === 'food') {
+    if (msg.topic === 'ride') {
+      // On Home the ride lives in a context row, not #ride-slot — repaint it.
+      syncActiveRideUI().then(() => { if (state.tab === 'home') render(); }).catch(() => {});
+    }
+    if (msg.topic === 'order' && (state.tab === 'food' || state.tab === 'home')) {
       api('/api/orders').then((o) => { state.orders = o.orders; render(); }).catch(() => {});
     }
     if (msg.topic === 'store_order') {
@@ -2282,7 +2357,7 @@ function connectEvents() {
             toast(`📦 ${ord.storeName} packed your order — pickup code ${ord.pickupCode}`);
           }
         }
-        if (state.tab === 'shops') render();
+        if (state.tab === 'shops' || state.tab === 'home') render();
       }).catch(() => {});
     }
     if (msg.topic === 'subscription') {
@@ -2324,6 +2399,12 @@ setInterval(async () => {
     // time-based (sim) transitions; push covers the discrete live-ride changes.
     if (rideActive) {
       await syncActiveRideUI();
+      // Home shows the ride as a context row; repaint only when the status
+      // key moves so ticks don't rebuild the launcher every 2.5s.
+      if (state.tab === 'home' && rideKey() !== state._rideKey) {
+        state._rideKey = rideKey();
+        renderTab();
+      }
     }
     if (state.tab === 'food' && !state.restaurant &&
         state.orders.some((o) => o.status !== 'delivered' && o.status !== 'cancelled')) {
@@ -2353,6 +2434,14 @@ document.addEventListener('click', (e) => {
   });
 });
 
+// Hardware/browser back from a service page returns to Home instead of
+// leaving the app (the entry was pushed by setTab when leaving Home).
+window.addEventListener('popstate', () => {
+  if (!state.user || state.tab === 'home') return;
+  state._popNav = true;
+  setTab('home');
+});
+
 (async function boot() {
   // Learn whether this is a demo/dev deployment before the first render, so
   // seed-account credentials never surface on a real production login screen.
@@ -2371,9 +2460,9 @@ document.addEventListener('click', (e) => {
       localStorage.removeItem('sewago_token');
     }
   }
-  // Reopen the tab they were on last time (a fresh login still lands on rides).
+  // Reopen the page they were on last time (a fresh login lands on Home).
   const savedTab = localStorage.getItem('sewago_tab');
-  if (state.user && savedTab && TABS.some((t) => t.id === savedTab)) state.tab = savedTab;
+  if (state.user && savedTab && (savedTab === 'home' || TABS.some((t) => t.id === savedTab))) state.tab = savedTab;
   // Back from a payment gateway redirect (eSewa / Khalti).
   const params = new URLSearchParams(window.location.search);
   // Password-reset link from the email: open the reset form with the token in.
@@ -2390,9 +2479,12 @@ document.addEventListener('click', (e) => {
     if (state.user) state.tab = 'profile';
     if (state.user && state.tab === 'profile') await loadTxns().catch(() => {});
   }
+  // The base history entry is Home: hardware back from a service page pops to
+  // it (setTab pushes exactly one entry on top when leaving Home).
+  history.replaceState({ home: true }, '');
   render();
-  // The restored tab paints instantly from empty state; hydrate it right after.
-  if (state.user && state.tab !== 'rides') setTab(state.tab).catch(() => {});
+  // The restored page paints instantly from empty state; hydrate it right after.
+  if (state.user && state.tab !== 'rides' && state.tab !== 'home') setTab(state.tab).catch(() => {});
   if (payResult === 'success') {
     const amount = Number(params.get('amount'));
     toast(`Payment successful — Rs ${amount || ''} added to your wallet 💸`);
@@ -2468,9 +2560,9 @@ function qtyControl(qty, fn, ids) {
   </div>`;
 }
 
-// Floating pill above the tabbar on every shops surface except the basket's own
-// shop front (the full cartbar checkout takes over there). Tapping it opens
-// that shop — the basket IS the shop.
+// Floating pill hugging the bottom edge on every shops surface except the
+// basket's own shop front (the full cartbar checkout takes over there).
+// Tapping it opens that shop — the basket IS the shop.
 function basketBar() {
   const b = state.basket;
   if (!b) return '';

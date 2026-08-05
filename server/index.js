@@ -142,7 +142,9 @@ app.get('/api/app-info', (req, res) => {
     androidApkUrl: config.androidApkUrl,
     iosAppStoreUrl: config.iosAppStoreUrl,
     // Clients hide demo credentials / seed-account hints outside development.
-    demo: !config.isProduction
+    demo: !config.isProduction,
+    // The partner app hides the AI stock assistant when no key is configured.
+    ai: require('./ai').aiEnabled()
   });
 });
 

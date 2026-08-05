@@ -1267,6 +1267,85 @@ a.link { text-decoration: none; }
 
 /* ===== app-specific: customer ===== */
 
+/* --- hub-and-spoke shell --- */
+/* Generic on purpose: the partner app reuses these three class names (both
+   pages load this stylesheet); the definitions live here only. */
+
+/* Round glass ← button at the left of the topbar on every non-Home page. */
+.back-chip {
+  flex-shrink: 0;
+  width: 36px;
+  height: 36px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--card2);
+  color: var(--text);
+  font-size: 19px;
+  font-family: inherit;
+  line-height: 1;
+  cursor: pointer;
+  box-shadow: var(--glass-hi);
+  transition: transform 0.15s var(--spring), background 0.15s ease;
+}
+.back-chip:active { transform: scale(0.9); background: var(--accent-soft); }
+
+/* Home launcher: two columns of big service tiles. */
+.home-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+.home-tile {
+  position: relative;
+  min-height: 104px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: flex-end;
+  gap: 2px;
+  padding: 14px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--text);
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  box-shadow: var(--glass-hi), var(--shadow);
+  transition: transform 0.15s var(--spring), border-color 0.15s ease, box-shadow 0.15s ease;
+}
+.home-tile:active {
+  transform: scale(0.965);
+  border-color: var(--accent);
+  box-shadow: var(--glass-hi), var(--accent-glow);
+}
+.home-tile .ico { font-size: 34px; line-height: 1.15; }
+.home-tile .lbl { margin-top: 6px; font-size: 15px; font-weight: 800; letter-spacing: -0.2px; }
+.home-tile .hint { font-size: 12px; color: var(--muted); }
+.home-tile .badge-dot {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  min-width: 20px;
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #04130a;
+  font-size: 11px;
+  font-weight: 800;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  box-shadow: 0 0 12px rgba(52, 211, 153, 0.45);
+}
+
+/* --- customer-only --- */
+/* No tabbar to clear anymore: the floating basket pill and the cartbar
+   checkout drop to the bottom edge (these classes exist only in app.js). */
+.basket-bar,
+.cartbar {
+  bottom: calc(10px + env(safe-area-inset-bottom, 0px));
+}
+
 /* ===== app-specific: driver ===== */
 
 /* Quiet, centered "Pass" / dismiss link under a full-width Accept bar on
@@ -1280,6 +1359,54 @@ a.link { text-decoration: none; }
 }
 
 /* ===== app-specific: partner ===== */
+
+/* Hub-and-spoke shell (.back-chip / .home-grid / .home-tile) is shared with
+   the customer app — defined once at the top of the customer section. */
+
+/* AI stock assistant — the only textarea in the partner app, so it gets the
+   shared input look here (the global reset only styles input/select). */
+.ai-card textarea {
+  width: 100%;
+  padding: 12px 14px;
+  border-radius: 13px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text);
+  font-size: 16px; /* 16px minimum — smaller makes iOS zoom on focus */
+  font-family: inherit;
+  outline: none;
+  resize: vertical;
+  box-shadow: var(--glass-hi);
+  transition: border-color 0.18s ease, box-shadow 0.18s ease;
+}
+.ai-card textarea:focus {
+  border-color: var(--accent);
+  box-shadow: var(--glass-hi), 0 0 0 3px rgba(52, 211, 153, 0.16);
+}
+
+/* Editable draft review rows — voice and AI drafts share this table.
+   Fields the voice parser was unsure about carry .warn (amber border). */
+.draft-row { padding: 10px 0; border-bottom: 1px solid var(--border); }
+.draft-row:last-of-type { border-bottom: none; }
+.draft-row .dr-top { display: flex; align-items: center; gap: 6px; }
+.draft-row .dr-top input { flex: 1; min-width: 0; }
+.draft-row .dr-x { flex-shrink: 0; margin: 0; }
+.draft-row .dr-grid { display: grid; grid-template-columns: 62px 1fr 72px 1fr; gap: 6px; margin-top: 6px; }
+.draft-row input, .draft-row select { padding: 9px 10px; }
+.draft-row .warn { border-color: var(--amber); }
+@media (max-width: 380px) {
+  .draft-row .dr-grid { grid-template-columns: 56px 1fr 64px 1fr; gap: 4px; }
+}
+
+/* Mic button: hold-to-speak look — pulses while it listens. */
+.mic-btn.listening { animation: mic-pulse 1.4s ease-in-out infinite; }
+@keyframes mic-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(248, 113, 113, 0.35); }
+  50% { box-shadow: 0 0 0 12px rgba(248, 113, 113, 0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .mic-btn.listening { animation: none; }
+}
 
 /* ===== app-specific: admin ===== */
 
