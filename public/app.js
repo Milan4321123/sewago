@@ -2555,6 +2555,11 @@ function shopDetailView() {
       <button class="btn ${fulfil === 'pickup' ? '' : 'ghost'} compact" onclick="setShopFulfil('pickup')">🏃 I'll collect — free</button>
       <button class="btn ${fulfil === 'delivery' ? '' : 'ghost'} compact" onclick="setShopFulfil('delivery')">🛵 Deliver · ${money(s.store.deliveryFee)}</button>
     </div>` : ''}
+    ${fulfil === 'delivery' ? `
+    <label class="field" style="margin:0 0 8px"><span>Deliver to</span>
+      <input id="shop-deliver-to" placeholder="Landmark or address, e.g. Thamel" value="${esc(state.shopDeliverTo || '')}"
+        oninput="shopDeliverTyped(this.value)" />
+    </label>` : ''}
     <div class="grid2" style="margin-bottom:8px">
       <button class="btn ${state.shopPay !== 'cash' ? '' : 'ghost'} compact" onclick="setShopPay('wallet')">👛 Wallet</button>
       <button class="btn ${state.shopPay === 'cash' ? '' : 'ghost'} compact" onclick="setShopPay('cash')">💵 Cash</button>
@@ -2619,6 +2624,9 @@ window.setShopPay = (how) => { state.shopPay = how; render(); };
 
 window.setShopFulfil = (how) => { state.shopFulfil = how; render(); };
 
+// No render — a re-render per keystroke would steal focus from the input.
+window.shopDeliverTyped = (value) => { state.shopDeliverTo = value; };
+
 window.subscribeItem = async (itemId) => {
   try {
     await api(`/api/stores/${state.shop.store.id}/items/${itemId}/subscribe`, { method: 'POST', body: { everyDays: 7 } });
@@ -2650,11 +2658,14 @@ window.placeShopOrder = async () => {
   if (!items.length) return;
   const canDeliver = (state.shop.store.deliveryFee || 0) > 0;
   const fulfilment = canDeliver && state.shopFulfil === 'delivery' ? 'delivery' : 'pickup';
+  const body = { storeId: state.shop.store.id, items, payment: state.shopPay === 'cash' ? 'cash' : 'wallet', fulfilment };
+  if (fulfilment === 'delivery') {
+    const where = (state.shopDeliverTo || '').trim();
+    if (!where) return toast('Where should we deliver? Add a landmark or address.', true);
+    body.deliverTo = where;
+  }
   try {
-    const data = await api('/api/store-orders', {
-      method: 'POST',
-      body: { storeId: state.shop.store.id, items, payment: state.shopPay === 'cash' ? 'cash' : 'wallet', fulfilment }
-    });
+    const data = await api('/api/store-orders', { method: 'POST', body });
     if (data.user) setUser(data.user);
     state.shop = null;
     state.shopCart = {};

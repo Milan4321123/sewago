@@ -363,18 +363,102 @@ test('a delivery order still charges the fee and hands over without a code', asy
     method: 'POST', token: shop.token, body: { name: 'Salt', unit: 'packet', price: 50, stock: 5 }
   });
   const { token: cust } = await registerUser('homebody');
-  const placed = await api('/store-orders', {
+
+  // Paying for delivery without saying where would charge for a courier the
+  // run sweep can never dispatch — refuse it up front.
+  const nowhere = await api('/store-orders', {
     method: 'POST', token: cust,
     body: { storeId: shop.storeId, items: [{ itemId: created.data.item.id, qty: 1 }], payment: 'wallet', fulfilment: 'delivery' }
   });
+  assert.equal(nowhere.status, 400, 'choosing delivery demands an address');
+
+  const placed = await api('/store-orders', {
+    method: 'POST', token: cust,
+    body: {
+      storeId: shop.storeId, items: [{ itemId: created.data.item.id, qty: 1 }],
+      payment: 'wallet', fulfilment: 'delivery', deliverTo: 'Thamel'
+    }
+  });
   const o = placed.data.order;
   assert.equal(o.deliveryFee, 30, 'delivery keeps paying the shop\'s fee');
+  assert.ok(o.deliveryLoc, 'the courier has somewhere to go');
   assert.equal(o.pickupCode, null);
 
   await api(`/partner/store-orders/${o.id}/accept`, { method: 'POST', token: shop.token });
   await api(`/partner/store-orders/${o.id}/ready`, { method: 'POST', token: shop.token });
   const done = await api(`/partner/store-orders/${o.id}/handover`, { method: 'POST', token: shop.token });
   assert.equal(done.status, 200, 'no code demanded when there is no pickup');
+});
+
+test('an uncollected pickup order can be refunded by the shop, never stranded', async () => {
+  const shop = await openShop();
+  const created = await api(`/partner/stores/${shop.storeId}/items`, {
+    method: 'POST', token: shop.token, body: { name: 'Momo masala', unit: 'packet', price: 100, stock: 5 }
+  });
+  const itemId = created.data.item.id;
+  const { token: cust } = await registerUser('noshow');
+  const walletBefore = (await api('/auth/me', { token: cust })).data.user.wallet;
+
+  const placed = await api('/store-orders', {
+    method: 'POST', token: cust,
+    body: { storeId: shop.storeId, items: [{ itemId, qty: 2 }], payment: 'wallet', fulfilment: 'pickup' }
+  });
+  const o = placed.data.order;
+  await api(`/partner/store-orders/${o.id}/accept`, { method: 'POST', token: shop.token });
+  await api(`/partner/store-orders/${o.id}/ready`, { method: 'POST', token: shop.token });
+
+  // The customer cannot cancel a packed order — but the shop must be able to
+  // give up on a no-show, or the money and the shelf stock are stuck forever.
+  const custCancel = await api(`/store-orders/${o.id}/cancel`, { method: 'POST', token: cust });
+  assert.equal(custCancel.status, 400);
+  const refund = await api(`/partner/store-orders/${o.id}/reject`, { method: 'POST', token: shop.token });
+  assert.equal(refund.status, 200, JSON.stringify(refund.data));
+  assert.equal(refund.data.order.status, 'cancelled');
+
+  const walletAfter = (await api('/auth/me', { token: cust })).data.user.wallet;
+  assert.equal(walletAfter, walletBefore, 'every rupee comes back');
+  const inv = await api(`/partner/stores/${shop.storeId}/inventory`, { token: shop.token });
+  assert.equal(inv.data.items.find((i) => i.id === itemId).stock, 5, 'the goods go back on the shelf');
+  const me = await api('/partner/me', { token: shop.token });
+  assert.equal(me.data.partner.pendingEarnings, 0, 'nothing left dangling in pending income');
+  assert.equal(me.data.partner.earnings, 0);
+});
+
+test('five wrong pickup codes lock the order — guessing is not a settlement path', async () => {
+  const shop = await openShop();
+  const created = await api(`/partner/stores/${shop.storeId}/items`, {
+    method: 'POST', token: shop.token, body: { name: 'Chiura', unit: 'kg', price: 80, stock: 6 }
+  });
+  const { token: cust } = await registerUser('guessed');
+  const placed = await api('/store-orders', {
+    method: 'POST', token: cust,
+    body: { storeId: shop.storeId, items: [{ itemId: created.data.item.id, qty: 1 }], payment: 'wallet', fulfilment: 'pickup' }
+  });
+  const o = placed.data.order;
+  await api(`/partner/store-orders/${o.id}/accept`, { method: 'POST', token: shop.token });
+  await api(`/partner/store-orders/${o.id}/ready`, { method: 'POST', token: shop.token });
+
+  // '0000' is always wrong: the codes run 1000-9999.
+  for (let i = 1; i <= 4; i += 1) {
+    const wrong = await api(`/partner/store-orders/${o.id}/handover`, {
+      method: 'POST', token: shop.token, body: { code: '0000' }
+    });
+    assert.equal(wrong.status, 400, `attempt ${i} is refused but not yet locked`);
+  }
+  const fifth = await api(`/partner/store-orders/${o.id}/handover`, {
+    method: 'POST', token: shop.token, body: { code: '0000' }
+  });
+  assert.equal(fifth.status, 409, 'the fifth failure locks the order');
+
+  // Even the right code is dead now — the lock is the point.
+  const late = await api(`/partner/store-orders/${o.id}/handover`, {
+    method: 'POST', token: shop.token, body: { code: o.pickupCode }
+  });
+  assert.equal(late.status, 409, 'a locked order cannot be settled, only refunded');
+
+  // The exit still works: refund the customer.
+  const refund = await api(`/partner/store-orders/${o.id}/reject`, { method: 'POST', token: shop.token });
+  assert.equal(refund.status, 200, JSON.stringify(refund.data));
 });
 
 test('a hired helper can count stock, and their work is attributed to them', async () => {
@@ -413,6 +497,44 @@ test('a hired helper can count stock, and their work is attributed to them', asy
     method: 'PATCH', token: helper.token, body: { price: 1 }
   });
   assert.equal(priceAttempt.status, 401, 'a customer token cannot reach shopkeeper-only routes');
+
+  // ...including the back way in. Re-adding a line that already exists merges
+  // into it, and that merge used to carry the helper's price with it — a hired
+  // counter could reprice the whole shop by "adding" Soap at Rs 1.
+  const reAdd = await api(`/stores/${shop.storeId}/helper/items`, {
+    method: 'POST', token: helper.token, body: { name: 'Soap', unit: 'each', price: 1, stock: 5 }
+  });
+  assert.equal(reAdd.status, 200, JSON.stringify(reAdd.data));
+  const shelf = await api(`/partner/stores/${shop.storeId}/inventory`, { token: shop.token });
+  const soap = shelf.data.items.find((i) => i.id === added.data.item.id);
+  assert.equal(soap.price, 45, 'the shopkeeper’s price stands');
+  assert.equal(soap.stock, 23, 'but the count the helper made still lands');
+});
+
+test('a shopkeeper cannot delete their account on top of live orders', async () => {
+  // Account deletion only knew about restaurants and hotels. A kirana owner
+  // could delete while customers had already paid — the shop vanished from the
+  // marketplace with their money still sitting in pendingEarnings.
+  const shop = await openShop('Vanishing Kirana');
+  const created = await api(`/partner/stores/${shop.storeId}/items`, {
+    method: 'POST', token: shop.token, body: { name: 'Ghee', unit: 'l', price: 900, stock: 4 }
+  });
+  const { token: cust } = await registerUser('ghee-buyer');
+  const order = await api('/store-orders', {
+    method: 'POST', token: cust,
+    body: { storeId: shop.storeId, items: [{ itemId: created.data.item.id, qty: 1 }], payment: 'wallet' }
+  });
+  assert.equal(order.status, 200, JSON.stringify(order.data));
+
+  const blocked = await api('/partner/account/delete', {
+    method: 'POST', token: shop.token, body: { password: 'partner-secret' }
+  });
+  assert.equal(blocked.status, 400, JSON.stringify(blocked.data));
+  assert.match(blocked.data.error, /orders that are not finished|shop income is still settling/i);
+
+  // The shop is still open for business, not half-removed.
+  const stillThere = await api(`/stores/${shop.storeId}`, { token: cust });
+  assert.equal(stillThere.status, 200);
 });
 
 test('reorder suggestions surface what is running out', async () => {

@@ -195,6 +195,7 @@ function eligibleCouriers(runCash, near) {
   return (db.drivers || [])
     .filter((d) => d.tier === 'bike' && driverIsAvailable(d) && !busy.has(d.id))
     .filter((d) => !courierOtherwiseBusy(d.id))
+    .filter((d) => !(d.runNoShowUntil > Date.now()))
     // The courier will be holding every rupee of this run's cash at once.
     .filter((d) => cashJobFitsFloat(d, runCash))
     .map((d) => ({
@@ -281,7 +282,11 @@ function sweepDeliveryRuns() {
     run.offer = {
       driverId: candidates[0].driver.id,
       expiresAt: now + OFFER_SECONDS * 1000,
-      declined: [...declined]
+      declined: [...declined],
+      // Carry the lapse memory forward. Rebuilding the offer without it wiped
+      // every cooldown the moment the run was re-offered, so the same distracted
+      // rider could be handed the same run on the very next sweep, forever.
+      passed
     };
     changed += 1;
   }
@@ -294,8 +299,23 @@ function sweepDeliveryRuns() {
 // its orders stayed claimed, the shop's money stayed pending, the customer's
 // stock stayed reserved and the rider stayed marked busy. These deadlines give
 // every run a way out, mirroring the food-delivery recovery.
-const RUN_PICKUP_DEADLINE_MS = envNum('RUN_PICKUP_DEADLINE_MIN', 25, 1, 600) * 60000;
-const RUN_DROPOFF_DEADLINE_MS = envNum('RUN_DROPOFF_DEADLINE_MIN', 90, 1, 1440) * 60000;
+// DELIVERY_ prefix to match the rest of this file's config; the low minimums are
+// there so the recovery paths are testable in seconds rather than half an hour.
+const RUN_PICKUP_DEADLINE_MS = envNum('DELIVERY_RUN_PICKUP_DEADLINE_MIN', 25, 0.01, 600) * 60000;
+const RUN_DROPOFF_DEADLINE_MS = envNum('DELIVERY_RUN_DROPOFF_DEADLINE_MIN', 90, 0.01, 1440) * 60000;
+
+// Releasing an abandoned run is only half the job: the rider who let it go dark
+// is still online and still nearest the shop, so the very next sweep hands them
+// the same orders back and the run dies again. Bench them for a while — the
+// orders go to someone who will actually ride, and staff can see who did it.
+const NO_SHOW_COOLDOWN_MS = envNum('DELIVERY_NO_SHOW_COOLDOWN_MIN', 15, 0.01, 720) * 60000;
+
+function benchNoShow(driverId) {
+  const driver = (db.drivers || []).find((d) => d.id === driverId);
+  if (!driver) return;
+  driver.runNoShowUntil = Date.now() + NO_SHOW_COOLDOWN_MS;
+  driver.runNoShows = (driver.runNoShows || 0) + 1;
+}
 
 function lastActivityAt(run) {
   const done = run.stops.filter((s) => s.done && s.doneAt);
@@ -313,11 +333,11 @@ function recoverAbandonedRuns() {
     if (nothingCollected && idleFor > RUN_PICKUP_DEADLINE_MS) {
       // Nothing has physically moved and no money settled — hand the whole run
       // back to the pool so another rider picks the orders up.
-      const abandonedBy = run.courierId;
       run.status = 'cancelled';
       run.cancelledAt = now;
       run.cancelReason = 'courier_no_show';
-      run.abandonedBy = abandonedBy;
+      run.abandonedBy = run.courierId;
+      benchNoShow(run.courierId);
       for (const orderId of run.orderIds) {
         const order = (db.storeOrders || []).find((o) => o.id === orderId);
         if (order && order.status === 'ready') {
@@ -338,6 +358,7 @@ function recoverAbandonedRuns() {
       run.status = 'cancelled';
       run.cancelledAt = now;
       run.cancelReason = 'courier_abandoned';
+      benchNoShow(run.courierId);
       for (const orderId of run.orderIds) {
         const order = (db.storeOrders || []).find((o) => o.id === orderId);
         if (order && order.status !== 'delivered' && order.status !== 'cancelled') {
@@ -402,6 +423,7 @@ module.exports = {
   recoverAbandonedRuns,
   runForCourier,
   committedRunCash,
+  courierOtherwiseBusy,
   offeredRunFor,
   runContainingOrder,
   runView,

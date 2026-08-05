@@ -433,6 +433,12 @@ router.post('/driver/rides/:id/accept', authDriver, (req, res) => {
   if (ride.tier !== req.driver.tier) return res.status(400).json({ error: 'This request is for a different vehicle type.' });
   if (currentJob(req.driver.id)) return res.status(409).json({ error: 'Finish your current trip first.' });
   if (currentDelivery(req.driver.id)) return res.status(409).json({ error: 'Finish your current delivery first.' });
+  // Dispatch already skips riders working a run, but an offer made a moment
+  // before they accepted one is still sitting on their phone. Taking it would
+  // strand a bootful of shop orders halfway across town.
+  if (runs.runForCourier(req.driver.id)) {
+    return res.status(409).json({ error: 'Finish your delivery run first.' });
+  }
   if (withStatus(ride).status !== 'searching') {
     return res.status(409).json({ error: 'This request was already taken or expired.' });
   }
@@ -750,6 +756,11 @@ router.post('/driver/runs/:id/accept', authDriver, (req, res) => {
   if (runs.runForCourier(req.driver.id)) {
     return res.status(409).json({ error: 'Finish your current run first.' });
   }
+  // Eligibility was checked when the offer went out; a rider can pick up a trip
+  // or a food delivery in the seconds before they tap accept.
+  if (runs.courierOtherwiseBusy(req.driver.id)) {
+    return res.status(409).json({ error: 'Finish your current job first.' });
+  }
   if (run.status !== 'offered' || !run.offer || run.offer.driverId !== req.driver.id) {
     return res.status(409).json({ error: 'That run went to another rider.' });
   }
@@ -786,14 +797,19 @@ router.post('/driver/runs/:id/accept', authDriver, (req, res) => {
 
 router.post('/driver/runs/:id/decline', authDriver, (req, res) => {
   const run = db.deliveryRuns.find((r) => r.id === req.params.id);
-  if (!run || !run.offer || run.offer.driverId !== req.driver.id) {
-    return res.status(404).json({ error: 'Run not found.' });
-  }
   // Decline is for an OFFER only. Handing back a run already in progress needs a
   // real abandon path — declining it would push a half-worked run, stops still
   // ticked, back into the pool for someone else to finish and be paid in full for.
-  if (run.status !== 'offered' || run.courierId) {
+  // Check ownership before the offer, or accepting (which releases the offer)
+  // makes a rider's own live run look like someone else's and answer 404.
+  if (run && run.courierId === req.driver.id) {
     return res.status(409).json({ error: 'You have already accepted this run.' });
+  }
+  if (!run || !run.offer || run.offer.driverId !== req.driver.id) {
+    return res.status(404).json({ error: 'Run not found.' });
+  }
+  if (run.status !== 'offered') {
+    return res.status(409).json({ error: 'That offer is no longer open.' });
   }
   run.offer.declined = [...new Set([...(run.offer.declined || []), req.driver.id])];
   run.offer.driverId = null;

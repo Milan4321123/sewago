@@ -399,7 +399,7 @@ function authView() {
     <div class="card">
       <div class="muted small" style="line-height:1.8">
         <b style="color:var(--text)">Demo partner</b> (password: <b style="color:var(--text)">partner123</b>)<br/>
-        partner.demo@sewago.app
+        partner.demo@sewago.app · 🏪 shopkeeper.demo@sewago.app
       </div>
     </div>` : ''}
     <div style="text-align:center;margin-top:14px">
@@ -1666,7 +1666,11 @@ function storeOrdersView() {
   }
   const nextAction = { placed: ['accept', 'Accept'], accepted: ['ready', 'Mark ready'], ready: ['handover', 'Handed over'] };
   return state.storeOrders.map((o) => {
-    const next = nextAction[o.status];
+    // Once a courier is carrying it, the order settles at the customer's door —
+    // offering "Handed over" here would be the wrong tap at exactly the moment
+    // the shopkeeper hands the bag over.
+    const withCourier = !!o.courierId;
+    const next = withCourier ? null : nextAction[o.status];
     return `
     <div class="card">
       <div class="row">
@@ -1684,6 +1688,10 @@ function storeOrdersView() {
         ${next ? `<button class="btn compact" onclick="decideStoreOrder('${o.id}','${next[0]}')">${next[1]}</button>` : ''}
         ${o.status === 'placed' || o.status === 'accepted'
           ? `<button class="btn ghost compact danger" onclick="decideStoreOrder('${o.id}','reject')">Can't fulfil</button>` : ''}
+        ${o.status === 'ready' && o.fulfilment === 'pickup'
+          ? `<button class="btn ghost compact danger" onclick="decideStoreOrder('${o.id}','reject')">Never collected — refund</button>` : ''}
+        ${withCourier && o.status !== 'delivered' && o.status !== 'cancelled'
+          ? `<span class="badge">🛵 with ${esc((o.courier && o.courier.name) || 'courier')}</span>` : ''}
         ${o.status === 'delivered' ? `<span class="badge">✓ DONE</span>` : ''}
         ${o.status === 'cancelled' ? `<span class="badge gray">CANCELLED</span>` : ''}
       </div>

@@ -23,6 +23,7 @@ const { authPartner, requirePartnerKyc, galleryFrom } = partnerRoutes;
 const router = express.Router();
 
 const MAX_ORDER_LINES = 40; // a grocery basket is longer than a food order
+const PICKUP_CODE_MAX_TRIES = 5; // same cap the OTP flow uses — enough for fat fingers, useless for brute force
 
 /* ---------------- shared helpers ---------------- */
 
@@ -664,6 +665,13 @@ router.post('/store-orders', authRequired, (req, res) => {
     if (resolved.error === 'outside') return res.status(400).json({ error: 'That delivery point is outside the service area.' });
     if (!resolved.error) deliveryLoc = { name: resolved.name, lat: resolved.lat, lng: resolved.lng };
   }
+  // Choosing delivery means paying for a courier, and a courier needs a door.
+  // Without this, the fee is charged but the run sweep (which needs deliveryLoc)
+  // never dispatches anyone — a paid-for service that silently never happens.
+  // Only explicit fulfilment opts into the check so older clients keep working.
+  if (fulfilment === 'delivery' && !deliveryLoc) {
+    return res.status(400).json({ error: 'Tell us where to deliver — add a landmark or address.' });
+  }
 
   const commission = Math.round(subtotal * (STORE_COMMISSION_PCT / 100));
   const order = {
@@ -825,13 +833,21 @@ router.post('/partner/store-orders/:orderId/:action(accept|reject|ready|handover
   const action = req.params.action;
 
   if (action === 'reject') {
-    if (order.status !== 'placed' && order.status !== 'accepted') {
+    // A packed pickup order's only other exit is a handover code the absent
+    // customer holds — without reject-at-ready, a no-show would strand the
+    // customer's money and the shop's pending income forever.
+    const noShow = order.status === 'ready' && order.fulfilment === 'pickup';
+    if (order.status !== 'placed' && order.status !== 'accepted' && !noShow) {
       return res.status(400).json({ error: 'This order can no longer be rejected.' });
     }
     order.status = 'cancelled';
     order.cancelledAt = Date.now();
-    order.cancelReason = 'shop_rejected';
-    unwindStoreOrder(order, { label: `Shop could not fulfil the order — refund: ${order.storeName}` });
+    order.cancelReason = noShow ? 'not_collected' : 'shop_rejected';
+    unwindStoreOrder(order, {
+      label: noShow
+        ? `Pickup order not collected — refund: ${order.storeName}`
+        : `Shop could not fulfil the order — refund: ${order.storeName}`
+    });
   } else if (action === 'accept') {
     if (order.status !== 'placed') return res.status(400).json({ error: 'This order was already handled.' });
     order.status = 'accepted';
@@ -849,16 +865,40 @@ router.post('/partner/store-orders/:orderId/:action(accept|reject|ready|handover
     // exactly the tap a shopkeeper makes when handing the bag to the rider —
     // and settling here would mark it delivered, causing the run's dropoff to
     // skip the courier's cash debit entirely. The cash would simply vanish.
+    // Only 'collecting'/'delivering' count: a run still forming or merely
+    // offered has no rider holding anything, and with no couriers around such
+    // a run never cancels — blocking on it would trap the order at the counter
+    // while the customer stands right there.
     const activeRun = require('../deliveryRuns').runContainingOrder(order.id);
-    if (order.courierId || (activeRun && activeRun.status !== 'completed')) {
+    if (activeRun && (activeRun.status === 'collecting' || activeRun.status === 'delivering')) {
       return res.status(409).json({
         error: 'A courier is delivering this order — it settles at the customer’s door.'
       });
     }
     if (order.fulfilment === 'pickup') {
+      // The code has 9000 possible values, so unlimited guesses would let a
+      // shopkeeper script their way to settling a prepaid order nobody
+      // collected. Five failures lock the order; reject-and-refund is the exit.
+      if ((order.codeTries || 0) >= PICKUP_CODE_MAX_TRIES) {
+        return res.status(409).json({ error: 'Too many wrong codes — this order is locked. Reject it to refund the customer.' });
+      }
       const code = String((req.body || {}).code || '').trim();
       if (!code || code !== order.pickupCode) {
-        return res.status(400).json({ error: 'Wrong pickup code — ask the customer for the 4-digit code in their app.' });
+        order.codeTries = (order.codeTries || 0) + 1;
+        logAudit({
+          actor: { role: 'partner', id: req.partner.id, email: req.partner.email },
+          action: 'store.order.pickup_code_failed',
+          targetType: 'store_order',
+          targetId: order.id,
+          meta: { storeId: store.id, tries: order.codeTries }
+        });
+        save();
+        const left = PICKUP_CODE_MAX_TRIES - order.codeTries;
+        return res.status(left > 0 ? 400 : 409).json({
+          error: left > 0
+            ? `Wrong pickup code — ask the customer for the 4-digit code in their app (${left} ${left === 1 ? 'try' : 'tries'} left).`
+            : 'Too many wrong codes — this order is locked. Reject it to refund the customer.'
+        });
       }
     }
     order.status = 'delivered';

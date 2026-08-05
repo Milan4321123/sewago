@@ -3,6 +3,7 @@ const { hashPassword } = require('./passwords');
 const { recordTxn } = require('./payments');
 const { coordsFor, haversineKm } = require('./places');
 const { ROAD_FACTOR, payoutFor, driverPublic } = require('./rideLogic');
+const storeSearch = require('./storeSearch');
 
 const DEMO_PASSWORDS = {
   customer: 'customer123',
@@ -32,6 +33,21 @@ function removeDemoData() {
   const removeDemo = (x) => !String(x.id || '').startsWith('demo-');
   for (const key of ['users', 'drivers', 'partners', 'restaurants', 'hotels', 'rides', 'orders', 'bookings', 'tasks', 'payments', 'withdrawals', 'otpCodes', 'passwordResetTokens']) {
     if (Array.isArray(db[key])) db[key] = db[key].filter(removeDemo);
+  }
+  // Shops also live in the search index, so drop them there before the array.
+  for (const store of db.stores || []) {
+    if (String(store.id || '').startsWith('demo-')) storeSearch.unindexStore(store.id);
+  }
+  if (Array.isArray(db.stores)) db.stores = db.stores.filter(removeDemo);
+  const demoStoreRef = (x) => String(x.storeId || '').startsWith('demo-');
+  if (Array.isArray(db.stockMoves)) db.stockMoves = db.stockMoves.filter((m) => !demoStoreRef(m));
+  if (Array.isArray(db.itemSubscriptions)) {
+    db.itemSubscriptions = db.itemSubscriptions.filter(
+      (s) => !String(s.id || '').startsWith('demo-') && !demoStoreRef(s) && !String(s.userId || '').startsWith('demo-')
+    );
+  }
+  if (Array.isArray(db.deliveryRuns)) {
+    db.deliveryRuns = db.deliveryRuns.filter((r) => !String(r.id || '').startsWith('demo-') && !demoStoreRef(r));
   }
   if (Array.isArray(db.transactions)) {
     db.transactions = db.transactions.filter((txn) =>
@@ -393,6 +409,296 @@ function addDemoPartnerInventory() {
   return { partner, restaurant, hotel };
 }
 
+/* ---------------- kirana shops ---------------- */
+
+// Deterministic 0..1 from a string, so repeated seeds produce the same market.
+function seededRand(seedStr) {
+  let h = 2166136261;
+  for (let i = 0; i < seedStr.length; i += 1) {
+    h ^= seedStr.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return ((h >>> 0) % 10000) / 10000;
+}
+
+// What a Kathmandu kirana actually stocks, at street prices (NPR).
+// perDay is a typical daily sales velocity used to build believable history.
+const KIRANA_CATALOG = [
+  { name: 'Chamal (Sona Mansuli)', unit: 'kg', price: 92, category: 'Rice & Grains', perDay: 6 },
+  { name: 'Jira Masino Chamal 20kg', unit: 'sack', price: 2450, category: 'Rice & Grains', perDay: 0.4 },
+  { name: 'Chiura', unit: 'kg', price: 95, category: 'Rice & Grains', perDay: 1.5 },
+  { name: 'Musuro Dal', unit: 'kg', price: 185, category: 'Rice & Grains', perDay: 2 },
+  { name: 'Chini', unit: 'kg', price: 110, category: 'Rice & Grains', perDay: 4 },
+  { name: 'Aayo Nun', unit: 'packet', price: 25, category: 'Spices & Oil', perDay: 3 },
+  { name: 'Dhara Sunflower Oil 1L', unit: 'bottle', price: 265, category: 'Spices & Oil', perDay: 1.5 },
+  { name: 'Besar 100g', unit: 'packet', price: 60, category: 'Spices & Oil', perDay: 0.6 },
+  { name: 'Jeera 100g', unit: 'packet', price: 85, category: 'Spices & Oil', perDay: 0.5 },
+  { name: 'Tokla Chiya 500g', unit: 'packet', price: 240, category: 'Spices & Oil', perDay: 0.7 },
+  { name: 'Wai Wai Chicken', unit: 'packet', price: 25, category: 'Snacks', perDay: 14 },
+  { name: 'Rara Masala Noodles', unit: 'packet', price: 32, category: 'Snacks', perDay: 5 },
+  { name: 'Parle-G', unit: 'packet', price: 20, category: 'Snacks', perDay: 8 },
+  { name: 'Hulas Digestive Biscuit', unit: 'packet', price: 55, category: 'Snacks', perDay: 3 },
+  { name: 'Lays Classic Salted', unit: 'packet', price: 65, category: 'Snacks', perDay: 4 },
+  { name: 'Kurkure Masala Munch', unit: 'packet', price: 35, category: 'Snacks', perDay: 5 },
+  { name: 'Dairy Milk Chocolate', unit: 'each', price: 120, category: 'Snacks', perDay: 2 },
+  { name: 'Coca-Cola 1L', unit: 'bottle', price: 135, category: 'Drinks', perDay: 3 },
+  { name: 'Frooti 200ml', unit: 'each', price: 35, category: 'Drinks', perDay: 5 },
+  { name: 'Himalayan Spring Water 1L', unit: 'bottle', price: 30, category: 'Drinks', perDay: 6 },
+  { name: 'Real Mixed Fruit Juice 1L', unit: 'packet', price: 250, category: 'Drinks', perDay: 1 },
+  { name: 'DDC Dudh 500ml', unit: 'packet', price: 62, category: 'Dairy & Eggs', perDay: 10, subscribable: true },
+  { name: 'Local Anda', unit: 'dozen', price: 250, category: 'Dairy & Eggs', perDay: 3, subscribable: true },
+  { name: 'DDC Paneer 200g', unit: 'packet', price: 180, category: 'Dairy & Eggs', perDay: 0.8 },
+  { name: 'Juju Dhau 200ml', unit: 'each', price: 90, category: 'Dairy & Eggs', perDay: 1.2 },
+  { name: 'Aalu', unit: 'kg', price: 55, category: 'Vegetables', perDay: 8 },
+  { name: 'Pyaj', unit: 'kg', price: 95, category: 'Vegetables', perDay: 7 },
+  { name: 'Golbheda', unit: 'kg', price: 85, category: 'Vegetables', perDay: 5 },
+  { name: 'Hariyo Khursani 250g', unit: 'packet', price: 30, category: 'Vegetables', perDay: 2 },
+  { name: 'Kauli', unit: 'kg', price: 70, category: 'Vegetables', perDay: 3 },
+  { name: 'Surf Excel 500g', unit: 'packet', price: 155, category: 'Household', perDay: 1 },
+  { name: 'Vim Bar', unit: 'each', price: 30, category: 'Household', perDay: 2 },
+  { name: 'Harpic 500ml', unit: 'bottle', price: 210, category: 'Household', perDay: 0.5 },
+  { name: 'Mainbatti Packet', unit: 'packet', price: 50, category: 'Household', perDay: 0.5 },
+  { name: 'Colgate 100g', unit: 'each', price: 185, category: 'Personal Care', perDay: 1 },
+  { name: 'Lifebuoy Sabun', unit: 'each', price: 65, category: 'Personal Care', perDay: 2.5 },
+  { name: 'Sunsilk Shampoo 180ml', unit: 'bottle', price: 340, category: 'Personal Care', perDay: 0.5 },
+  { name: 'Clinic Plus Sachet', unit: 'each', price: 10, category: 'Personal Care', perDay: 6 },
+  { name: 'Horlicks 500g', unit: 'bottle', price: 780, category: 'Baby & Health', perDay: 0.4 },
+  { name: 'Cerelac Wheat 300g', unit: 'packet', price: 550, category: 'Baby & Health', perDay: 0.3 }
+];
+
+// Real neighbourhoods, real coordinates — these pins land where the areas are.
+const DEMO_SHOPS = [
+  { key: 'ram-kirana', name: 'Ram Kirana Pasal', icon: '🏪', area: 'Thamel', lat: 27.7148, lng: 85.3121, deliveryFee: 40, owner: 'shopkeeper', full: true },
+  { key: 'sita-general', name: 'Sita General Store', icon: '🛒', area: 'New Baneshwor', lat: 27.6899, lng: 85.343, deliveryFee: 50, owner: 'shopkeeper' },
+  { key: 'city-mart', name: 'City Mart Lazimpat', icon: '🏬', area: 'Lazimpat', lat: 27.7218, lng: 85.3216, deliveryFee: 60, owner: 'partner' },
+  { key: 'gurung-cold-store', name: 'Gurung Cold Store', icon: '🧊', area: 'Jawalakhel', lat: 27.6738, lng: 85.3142, deliveryFee: 45, owner: 'valley' },
+  { key: 'boudha-fresh', name: 'Boudha Fresh Mart', icon: '🥬', area: 'Boudha', lat: 27.7208, lng: 85.361, deliveryFee: 55, owner: 'valley' },
+  { key: 'koteshwor-suppliers', name: 'Koteshwor Kirana Suppliers', icon: '🏪', area: 'Koteshwor', lat: 27.6786, lng: 85.349, deliveryFee: 35, owner: 'valley', open: false }
+];
+
+function slug(text) {
+  return String(text).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+}
+
+// Quantities in believable shop units: whole pieces, half-kilos.
+function roundQty(unit, qty) {
+  if (unit === 'kg' || unit === 'l') return Math.max(0.5, Math.round(qty * 2) / 2);
+  return Math.max(1, Math.round(qty));
+}
+
+function dateKeyAgo(daysAgo) {
+  return new Date(now() - daysAgo * 86400000).toISOString().slice(0, 10);
+}
+
+// Hand-tuned shelf situations for the flagship shop so the dashboard has a
+// story to tell: a fast mover nearly gone, oil sold out, eggs running low.
+const FLAGSHIP_STOCK = {
+  'Wai Wai Chicken': 4,
+  'Dhara Sunflower Oil 1L': 0,
+  'Local Anda': 2,
+  'Chini': 3
+};
+
+function buildShopItem(shop, product) {
+  const r = (purpose) => seededRand(`${shop.key}:${product.name}:${purpose}`);
+  // Every shop prices a little differently — that is what makes comparing fun.
+  let price = Math.round(product.price * (0.96 + 0.08 * r('price')));
+  if (price > 500) price = Math.round(price / 5) * 5;
+  const createdAt = now() - Math.round((40 + 10 * r('age')) * 86400000);
+
+  // Three weeks of daily sales at the item's natural pace, with day-to-day wobble.
+  const salesDaily = {};
+  let recentSold = 0;
+  for (let d = 0; d <= 20; d += 1) {
+    let qty = product.perDay * (0.55 + 0.9 * r(`day${d}`));
+    if (d === 0) qty *= 0.5; // today is still in progress
+    if (qty < (product.perDay >= 1 ? 0.5 : 0.2)) continue;
+    qty = roundQty(product.unit, qty);
+    salesDaily[dateKeyAgo(d)] = qty;
+    recentSold += qty;
+  }
+
+  const targetStock = Object.prototype.hasOwnProperty.call(FLAGSHIP_STOCK, product.name) && shop.full
+    ? FLAGSHIP_STOCK[product.name]
+    : roundQty(product.unit, Math.max(0.5, product.perDay * (3 + 18 * r('cover'))));
+
+  return {
+    id: demoId('item', `${shop.key}-${slug(product.name)}`),
+    name: product.name,
+    unit: product.unit,
+    price,
+    subscribePrice: product.subscribable && shop.owner === 'shopkeeper' ? Math.round(price * 0.93) : null,
+    stock: targetStock,
+    lowStockAt: null,
+    category: product.category,
+    photo: '',
+    photos: [],
+    salesDaily,
+    soldTotal: Math.round((recentSold * 2.2) * 10) / 10,
+    createdAt,
+    updatedAt: now()
+  };
+}
+
+/**
+ * A consistent audit trail for one item: an opening shelf count, then the last
+ * three days of counter sales (and a restock for the fast mover), each move's
+ * stockAfter agreeing with the one before it and ending at today's shelf count.
+ */
+function ledgerMovesFor(store, item, shopkeeperName) {
+  const events = [];
+  if (item.name === 'Wai Wai Chicken') {
+    events.push({ qty: 36, reason: 'restock', at: now() - 3 * 86400000 - 8 * 3600000 });
+  }
+  for (let d = 2; d >= 0; d -= 1) {
+    const sold = item.salesDaily[dateKeyAgo(d)] || 0;
+    if (sold <= 0) continue;
+    const morning = roundQty(item.unit, sold * 0.6);
+    const evening = Math.round((sold - morning) * 10) / 10;
+    events.push({ qty: -Math.min(morning, sold), reason: 'sale_counter', at: now() - d * 86400000 - 7 * 3600000 });
+    if (evening > 0) events.push({ qty: -evening, reason: 'sale_counter', at: now() - d * 86400000 - 2 * 3600000 });
+  }
+
+  // Walk forward from an opening count chosen so the chain lands exactly on
+  // today's stock; if sales outrun it, clamp and correct the final stock.
+  const delta = events.reduce((sum, e) => sum + e.qty, 0);
+  let running = Math.max(0, Math.round((item.stock - delta) * 10) / 10);
+  const moves = [{
+    storeId: store.id, itemId: item.id, itemName: item.name,
+    qty: running, reason: 'initial_count', stockAfter: running,
+    actorKind: 'partner', actorId: store.ownerId, actorName: shopkeeperName,
+    refId: null, at: item.createdAt
+  }];
+  for (const e of events) {
+    running = Math.max(0, Math.round((running + e.qty) * 10) / 10);
+    moves.push({
+      storeId: store.id, itemId: item.id, itemName: item.name,
+      qty: e.qty, reason: e.reason, stockAfter: running,
+      actorKind: 'partner', actorId: store.ownerId, actorName: shopkeeperName,
+      refId: null, at: e.at
+    });
+  }
+  item.stock = running;
+  return moves;
+}
+
+function addShopPartner(id, name, legalName, email, phone) {
+  const partner = {
+    id: demoId('partner', id),
+    name,
+    email,
+    phone,
+    phoneVerified: true,
+    phoneVerifiedAt: now() - 25 * 24 * 60 * 60 * 1000,
+    regNo: `PAN-DEMO-${phone.slice(-6)}`,
+    businessKycStatus: 'approved',
+    businessKyc: {
+      legalName,
+      regNo: `PAN-DEMO-${phone.slice(-6)}`,
+      documentRef: `demo-certificate-${id}.pdf`,
+      submittedAt: now() - 25 * 24 * 60 * 60 * 1000,
+      reviewedAt: now() - 24 * 24 * 60 * 60 * 1000,
+      note: ''
+    },
+    password: hashPassword(DEMO_PASSWORDS.partner),
+    earnings: 0
+  };
+  db.partners.push(partner);
+  return partner;
+}
+
+function addDemoStores(users, hospitalityPartner) {
+  const shopkeeper = addShopPartner('ram-shrestha', 'Ram Bahadur Shrestha', 'Ram Kirana Pasal Pvt Ltd', 'shopkeeper.demo@sewago.app', '9841000920');
+  const valley = addShopPartner('valley-retail', 'Valley Retail Suppliers', 'Valley Retail Suppliers Pvt Ltd', 'valley.demo@sewago.app', '9841000930');
+  const owners = { shopkeeper, partner: hospitalityPartner, valley };
+
+  const stores = [];
+  const allMoves = [];
+  let itemCount = 0;
+
+  for (const spec of DEMO_SHOPS) {
+    const owner = owners[spec.owner];
+    const store = {
+      id: demoId('store', spec.key),
+      ownerId: owner.id,
+      name: spec.name,
+      area: spec.area,
+      loc: { name: spec.area, lat: spec.lat, lng: spec.lng },
+      locPinned: true,
+      icon: spec.icon,
+      photo: '',
+      photos: [],
+      deliveryFee: spec.deliveryFee,
+      open: spec.open !== false,
+      items: [],
+      helpers: [],
+      status: 'approved',
+      reviewNote: '',
+      submittedAt: now() - 20 * 24 * 60 * 60 * 1000,
+      reviewedAt: now() - 19 * 24 * 60 * 60 * 1000
+    };
+
+    for (const product of KIRANA_CATALOG) {
+      // The flagship carries the full range; smaller shops a personal subset.
+      // The cold store always stocks its namesake chilled lines.
+      const chilled = product.category === 'Dairy & Eggs' || product.category === 'Drinks';
+      const keep = spec.full ||
+        (spec.key === 'gurung-cold-store' && chilled) ||
+        seededRand(`${spec.key}:${product.name}:carries`) < 0.6;
+      if (!keep) continue;
+      const item = buildShopItem(spec, product);
+      store.items.push(item);
+      itemCount += 1;
+    }
+
+    // The audit trail is the feature — every shop's ledger should reconcile.
+    for (const item of store.items) {
+      allMoves.push(...ledgerMovesFor(store, item, owner.name));
+    }
+
+    db.stores.push(store);
+    stores.push(store);
+  }
+
+  // The ledger is append-only and read newest-first, so keep global time order.
+  allMoves.sort((a, b) => a.at - b.at);
+  allMoves.forEach((move, i) => {
+    db.stockMoves.push({ id: demoId('move', String(i + 1)), ...move });
+  });
+
+  // A live helper on the flagship shop, plus one invite still waiting.
+  const flagship = stores[0];
+  flagship.helpers.push(
+    { code: '734519', status: 'active', userId: users.puja.id, name: users.puja.name, createdAt: now() - 10 * 86400000, joinedAt: now() - 10 * 86400000 },
+    { code: '281673', status: 'invited', userId: null, name: 'Suresh', createdAt: now() - 86400000 }
+  );
+
+  // Standing daily-needs subscriptions, at the subscriber price.
+  const milk = flagship.items.find((i) => i.name === 'DDC Dudh 500ml');
+  const eggs = flagship.items.find((i) => i.name === 'Local Anda');
+  if (milk && milk.subscribePrice) {
+    db.itemSubscriptions.push({
+      id: demoId('sub', 'aarav-milk'), userId: users.aarav.id,
+      storeId: flagship.id, storeName: flagship.name,
+      itemId: milk.id, itemName: milk.name,
+      everyDays: 2, price: milk.subscribePrice, listPrice: milk.price,
+      status: 'active', createdAt: now() - 12 * 86400000, nextDueAt: now() + 86400000
+    });
+  }
+  if (eggs && eggs.subscribePrice) {
+    db.itemSubscriptions.push({
+      id: demoId('sub', 'maya-anda'), userId: users.maya.id,
+      storeId: flagship.id, storeName: flagship.name,
+      itemId: eggs.id, itemName: eggs.name,
+      everyDays: 7, price: eggs.subscribePrice, listPrice: eggs.price,
+      status: 'active', createdAt: now() - 6 * 86400000, nextDueAt: now() + 86400000
+    });
+  }
+
+  for (const store of stores) storeSearch.indexStore(store);
+  return { shopkeeper, stores, itemCount };
+}
+
 function seedDemoData({ persist = true } = {}) {
   removeDemoData();
   const t = now();
@@ -418,6 +724,7 @@ function seedDemoData({ persist = true } = {}) {
   };
 
   const { partner, restaurant, hotel } = addDemoPartnerInventory();
+  const shops = addDemoStores(users, partner);
   const momo = db.restaurants.find((r) => r.id === 'res-momo-ghar');
   const thakali = db.restaurants.find((r) => r.id === 'res-thakali');
   const lakeside = db.hotels.find((h) => h.id === 'htl-lakeside');
@@ -479,6 +786,8 @@ function seedDemoData({ persist = true } = {}) {
     partner: partner.email,
     restaurants: db.restaurants.filter((r) => String(r.id).startsWith('demo-')).length,
     hotels: db.hotels.filter((h) => String(h.id).startsWith('demo-')).length,
+    stores: shops.stores.length,
+    storeItems: shops.itemCount,
     rides: db.rides.filter((r) => String(r.id).startsWith('demo-')).length,
     orders: db.orders.filter((o) => String(o.id).startsWith('demo-')).length,
     bookings: db.bookings.filter((b) => String(b.id).startsWith('demo-')).length,
@@ -493,6 +802,7 @@ function seedDemoData({ persist = true } = {}) {
       ],
       customerPassword: DEMO_PASSWORDS.customer,
       partner: partner.email,
+      shopkeeper: shops.shopkeeper.email,
       partnerPassword: DEMO_PASSWORDS.partner,
       drivers: ['ramesh@sewago.app', 'sunita@sewago.app', 'sita@sewago.app', 'dipesh@sewago.app', 'bijay.demo@sewago.app', 'tara.demo@sewago.app', 'om.demo@sewago.app'],
       driverPassword: DEMO_PASSWORDS.driver

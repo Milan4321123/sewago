@@ -13,7 +13,7 @@
     "demo:seed": "node scripts/seed-demo.js",
     "supabase:push": "node scripts/supabase-push.js",
     "supabase:pull": "node scripts/supabase-pull.js",
-    "verify": "node --check server/index.js && node --check server/db.js && node --check server/logger.js && node --check server/payments.js && node --check server/settlement.js && node --check server/fees.js && node --check server/orderLogic.js && node --check server/email.js && node --check server/accountDeletion.js && node --check server/accountSecurity.js && node --check server/sessionTokens.js && node --check server/routes/payments.js && node --check server/gateways/khalti.js && node --check server/gateways/esewa.js && node --check server/storage/supabaseStateStore.js && node --check server/storage/rowSync.js && node --check server/storage/supabaseRowStore.js && node --check public/app.js && node --check public/driver.js && node --check public/partner.js && node --check public/admin.js && node --check public/pwa.js && node --check public/sw.js"
+    "verify": "find server public -name '*.js' -print0 | xargs -0 -n1 node --check"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.109.0",

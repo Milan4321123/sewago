@@ -99,6 +99,26 @@ async function orderAndPack(shop, custToken, deliverTo, payment = 'wallet') {
 // clear it. 8s was enough alone but flaked when the whole suite ran in parallel
 // and CPU contention pushed the sweep late — this returns the moment a run
 // appears, so a longer ceiling costs nothing on a healthy run.
+// Same wait, but pinned to the shop this test opened. A test that leaves a run
+// unclaimed leaves it in the pool, and the sweep will happily offer it to the
+// next courier who comes online — which is the courier the *next* test just
+// created. Hand back anything that is not ours so the assertions below are
+// about this test's money and not a neighbour's.
+async function waitForRunFrom(courierToken, shopName, tries = 45) {
+  const seen = [];
+  for (let i = 0; i < tries; i += 1) {
+    const r = await api('/driver/run', { token: courierToken });
+    const run = r.data.run;
+    if (run && run.stops.some((s) => s.type === 'pickup' && s.name === shopName)) return r.data;
+    if (run) {
+      seen.push(`${run.stops.map((s) => s.name).join('+')} [${run.status}${r.data.offered ? ' offered' : ''}]`);
+      if (r.data.offered) await api(`/driver/runs/${run.id}/decline`, { method: 'POST', token: courierToken });
+    }
+    await new Promise((res) => setTimeout(res, 400));
+  }
+  return { run: null, seen: [...new Set(seen)] };
+}
+
 async function waitForRun(courierToken, tries = 45) {
   for (let i = 0; i < tries; i += 1) {
     const r = await api('/driver/run', { token: courierToken });
@@ -261,6 +281,71 @@ test('letting an offer lapse does not strand the order forever', async () => {
   assert.ok(second.run, 'the same rider is asked again rather than the order dying');
   const accepted = await api(`/driver/runs/${second.run.id}/accept`, { method: 'POST', token: courier.token });
   assert.equal(accepted.status, 200, JSON.stringify(accepted.data));
+});
+
+test('the shopkeeper cannot settle an order a courier is already carrying', async () => {
+  // Regression: an order stays 'ready' until the rider ticks the pickup stop,
+  // so "Handed over" was exactly the tap a shopkeeper made when handing over the
+  // bag. It marked the order delivered+settled, which made the run's dropoff
+  // skip the courier's cash debit — the customer's cash simply vanished.
+  const shop = await openShop('Handover Kirana', 27.6789, 85.3494);
+  const courier = await onboardCourier(27.6785, 85.3490);
+  const c = await registerUser('handover-c');
+  const order = await api('/store-orders', {
+    method: 'POST', token: c.token,
+    body: {
+      storeId: shop.storeId, items: [{ itemId: shop.itemId, qty: 1 }],
+      payment: 'cash', deliverTo: { lat: 27.6770, lng: 85.3470, name: 'Koteshwor' }
+    }
+  });
+  const orderId = order.data.order.id;
+  const total = order.data.order.total;
+  await api(`/partner/store-orders/${orderId}/accept`, { method: 'POST', token: shop.token });
+  await api(`/partner/store-orders/${orderId}/ready`, { method: 'POST', token: shop.token });
+
+  const { run, seen } = await waitForRunFrom(courier.token, 'Handover Kirana');
+  assert.ok(run, `the cash order becomes a run (saw instead: ${JSON.stringify(seen)})`);
+  const accepted = await api(`/driver/runs/${run.id}/accept`, { method: 'POST', token: courier.token });
+  assert.equal(accepted.status, 200, JSON.stringify(accepted.data));
+
+  // The shopkeeper taps "Handed over" as the rider takes the bag.
+  const premature = await api(`/partner/store-orders/${orderId}/handover`, { method: 'POST', token: shop.token });
+  assert.equal(premature.status, 409, 'settling an order a courier holds must be refused');
+  assert.match(premature.data.error, /courier is delivering/i);
+
+  // The run completes normally and the courier is debited the cash they took.
+  for (const stop of run.stops) {
+    const done = await api(`/driver/runs/${run.id}/stops/${stop.seq}/done`, { method: 'POST', token: courier.token });
+    assert.equal(done.status, 200, JSON.stringify(done.data));
+  }
+  const driver = await api('/driver/me', { token: courier.token });
+  assert.ok(
+    driver.data.driver.commissionOwed >= total - run.payout,
+    `courier must owe the cash they collected (owes ${driver.data.driver.commissionOwed}, collected ${total})`
+  );
+});
+
+test('a courier cannot decline a run they have already accepted', async () => {
+  // Regression: decline had no status guard and accept never released the offer,
+  // so a rider could collect every bag, decline, and let a second rider tick the
+  // last stop and be paid the entire run.
+  const shop = await openShop('Decline Kirana', 27.7016, 85.3117);
+  const courier = await onboardCourier(27.7010, 85.3110);
+  const c = await registerUser('decline-c');
+  await orderAndPack(shop, c.token, { lat: 27.7000, lng: 85.3090, name: 'New Road' });
+
+  const { run } = await waitForRunFrom(courier.token, 'Decline Kirana');
+  assert.ok(run);
+  assert.equal((await api(`/driver/runs/${run.id}/accept`, { method: 'POST', token: courier.token })).status, 200);
+
+  const declined = await api(`/driver/runs/${run.id}/decline`, { method: 'POST', token: courier.token });
+  assert.equal(declined.status, 409, 'an accepted run cannot be declined back into the pool');
+  assert.match(declined.data.error, /already accepted/i);
+
+  // It is still theirs to finish.
+  const mine = await api('/driver/run', { token: courier.token });
+  assert.equal(mine.data.run.id, run.id);
+  assert.equal(mine.data.offered, false);
 });
 
 test('a run is never offered to a rider whose cash float it would blow', async () => {

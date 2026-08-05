@@ -502,6 +502,11 @@ function adminDriver(d) {
     earnings: d.earnings || 0,
     commissionOwed: Math.max(0, -(d.earnings || 0)),
     tripsCompleted: d.tripsCompleted || 0,
+    // Riders who accepted a delivery run and then went dark. Staff need to see
+    // the repeat offenders — the system only benches them for a cooling-off
+    // period, it does not judge them.
+    runNoShows: d.runNoShows || 0,
+    benchedUntil: d.runNoShowUntil && d.runNoShowUntil > Date.now() ? d.runNoShowUntil : null,
     suspended: !!d.suspended
   };
 }
