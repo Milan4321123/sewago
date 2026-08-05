@@ -6,7 +6,7 @@ const { withStatus, driverPublic, etaToPickupMin, driverIsAvailable, driverNearP
 const { PLACES, haversineKm } = require('../places');
 const { searchPlaces, reverseGeocode, insideServiceArea, resolveLocation, routeBetween } = require('../geo');
 const sessionTokens = require('../sessionTokens');
-const { recordTxn, recordPlatformRevenue, debitWallet } = require('../payments');
+const { recordTxn, recordPlatformRevenue, debitWallet, creditWallet } = require('../payments');
 const { RIDE_SERVICE_FEE, surgeFor, cancelFeeSplit } = require('../fees');
 const { normalizePhone, validPhone } = require('../accountSecurity');
 const { applyRating } = require('../orderLogic');
@@ -324,7 +324,7 @@ router.post('/rides/:id/cancel', authRequired, (req, res) => {
         refId: ride.id
       });
     }
-    req.user.wallet += refund;
+    creditWallet(req.user, refund);
     recordTxn('user', req.user, {
       type: 'ride_refund',
       label: chargeCancelFee

@@ -2,7 +2,7 @@ const express = require('express');
 const { db, save, uid } = require('../db');
 const { config } = require('../config');
 const { authRequired, publicUser } = require('./auth');
-const { recordTxn, recordPlatformRevenue, debitWallet } = require('../payments');
+const { recordTxn, recordPlatformRevenue, debitWallet, creditWallet } = require('../payments');
 const { applyRating, addReview, reviewsFor } = require('../orderLogic');
 const events = require('../events');
 
@@ -199,7 +199,7 @@ router.post('/bookings/:id/cancel', authRequired, (req, res) => {
   }
   booking.status = 'cancelled';
   booking.cancelledAt = Date.now();
-  req.user.wallet += booking.total; // full refund before check-in
+  creditWallet(req.user, booking.total); // full refund before check-in
   recordTxn('user', req.user, {
     type: 'stay_refund',
     label: `Booking cancelled — refund: ${booking.hotelName}`,

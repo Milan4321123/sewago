@@ -4,7 +4,7 @@ const { db, save, uid } = require('../db');
 const { config } = require('../config');
 const { authRequired, publicUser } = require('./auth');
 const partnerRoutes = require('./partner');
-const { recordTxn, recordPlatformRevenue, debitWallet } = require('../payments');
+const { recordTxn, recordPlatformRevenue, debitWallet, creditWallet } = require('../payments');
 const { STORE_COMMISSION_PCT, STORE_SERVICE_FEE } = require('../fees');
 const { coordsFor } = require('../places');
 const { resolveLocation } = require('../geo');
@@ -966,7 +966,7 @@ function unwindStoreOrder(order, { label }) {
   if (order.payment !== 'cash') {
     const user = db.users.find((u) => u.id === order.userId);
     if (user) {
-      user.wallet += order.total;
+      creditWallet(user, order.total);
       recordTxn('user', user, { type: 'store_refund', label, amount: order.total, sign: 1, refId: order.id });
     }
     const owner = db.partners.find((p) => p.id === order.partnerId);

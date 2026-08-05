@@ -33,7 +33,7 @@ function isLive(listing) {
 // cancel, restaurant reject, and the accept timeout.
 function refundOrder(order, { label, txnType = 'food_refund' }) {
   // Lazy require to avoid a circular import at module load time.
-  const { recordTxn, recordPlatformRevenue } = require('./payments');
+  const { recordTxn, recordPlatformRevenue, creditWallet } = require('./payments');
   // Cash-on-delivery orders were never charged (the courier collects at the
   // door), so there is nothing to refund and no booked revenue to reverse —
   // only the partner's pending income unwinds.
@@ -45,12 +45,12 @@ function refundOrder(order, { label, txnType = 'food_refund' }) {
     for (const share of order.group.perMember) {
       const member = db.users.find((u) => u.id === share.userId);
       if (member && share.paid) {
-        member.wallet += share.paid;
+        creditWallet(member, share.paid);
         recordTxn('user', member, { type: txnType, label, amount: share.paid, sign: 1, refId: order.id });
       }
     }
   } else if (user && wasPrepaid) {
-    user.wallet += order.total;
+    creditWallet(user, order.total);
     recordTxn('user', user, { type: txnType, label, amount: order.total, sign: 1, refId: order.id });
   }
   if (order.partnerCut && order.partnerId) {

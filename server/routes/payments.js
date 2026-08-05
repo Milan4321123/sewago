@@ -58,6 +58,9 @@ function creditTopup(payment, { gatewayRef = null } = {}) {
     const stillHeld = (user.heldUntil || 0) > now ? (user.heldBalance || 0) : 0;
     user.heldBalance = stillHeld + payment.amount;
     user.heldUntil = now + config.withdrawHoldMs;
+    // How much this window ever held, so a refund can restore the hold a spend
+    // released without freezing money that was never fresh (see creditWallet).
+    user.heldPeak = user.heldBalance;
   }
   recordTxn('user', user, {
     type: 'topup',

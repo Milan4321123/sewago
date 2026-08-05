@@ -4,7 +4,7 @@ const { db, save } = require('../db');
 const sessionTokens = require('../sessionTokens');
 const metrics = require('../metrics');
 const { payoutFor, withStatus, driverIsAvailable, driverHasFreshLocation, driverLocation } = require('../rideLogic');
-const { recordTxn, recordPlatformRevenue, platformRevenueTotals, WITHDRAW_CHANNELS } = require('../payments');
+const { recordTxn, recordPlatformRevenue, platformRevenueTotals, creditWallet, WITHDRAW_CHANNELS } = require('../payments');
 const events = require('../events');
 const { logAudit } = require('../audit');
 
@@ -323,7 +323,7 @@ router.post('/admin/withdrawals/:id/:action(approve|reject)', authAdmin, (req, r
         : db.users.find((u) => u.id === withdrawal.ownerId);
     if (owner) {
       const total = withdrawal.amount + withdrawal.fee;
-      if (withdrawal.ownerKind === 'user') owner.wallet += total;
+      if (withdrawal.ownerKind === 'user') creditWallet(owner, total);
       else owner.earnings = (owner.earnings || 0) + total;
       recordTxn(withdrawal.ownerKind, owner, {
         type: 'withdrawal_refund',

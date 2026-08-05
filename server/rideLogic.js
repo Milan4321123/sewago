@@ -102,9 +102,9 @@ function payoutFor(ride) {
 function refundUser(userId, amount, label = 'Ride refund', refId = null) {
   const user = db.users.find((u) => u.id === userId);
   if (!user) return;
-  user.wallet += amount;
   // Required lazily to avoid a circular import at module load time.
-  const { recordTxn } = require('./payments');
+  const { recordTxn, creditWallet } = require('./payments');
+  creditWallet(user, amount);
   recordTxn('user', user, { type: 'ride_refund', label, amount, sign: 1, refId });
 }
 

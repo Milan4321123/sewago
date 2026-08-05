@@ -1,7 +1,7 @@
 const express = require('express');
 const { db, save, uid } = require('../db');
 const { authRequired, publicUser } = require('./auth');
-const { recordTxn, recordPlatformRevenue, debitWallet } = require('../payments');
+const { recordTxn, recordPlatformRevenue, debitWallet, creditWallet } = require('../payments');
 
 const router = express.Router();
 
@@ -171,7 +171,7 @@ router.post('/tasks/:id/cancel', authRequired, (req, res) => {
   }
   task.status = 'cancelled';
   task.cancelledAt = Date.now();
-  req.user.wallet += task.budget; // full escrow refund
+  creditWallet(req.user, task.budget); // full escrow refund
   recordTxn('user', req.user, {
     type: 'task_refund',
     label: `Task cancelled — refund: ${task.title}`,

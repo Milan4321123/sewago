@@ -186,6 +186,43 @@ test('freshly topped-up funds are held before they can be withdrawn (anti cash-o
   assert.equal(ok.status, 200, `un-held funds should withdraw: ${JSON.stringify(ok.data)}`);
 });
 
+test('a hold cannot be laundered off by spending the money and cancelling', async () => {
+  // The hold exists so card money cannot be topped up and cashed straight back
+  // out before a chargeback can land. Spending used to take the hold down with
+  // it, and refunds put the money back unheld — so posting a task and
+  // cancelling it turned held funds into withdrawable ones in two calls, with
+  // no counterparty and nothing to review.
+  const { token } = await registerUser('launderer');
+  await verifyPhone(token);
+  const init = await api('/payments/topup/initiate', { method: 'POST', token, body: { amount: 5000, method: 'card' } });
+  const confirm = await api('/payments/topup/confirm', { method: 'POST', token, body: { paymentId: init.data.payment.id, pin: '1234' } });
+  assert.equal(confirm.data.user.wallet, 10000, 'welcome bonus 5000 + topped-up 5000');
+
+  // Baseline: the fresh 5000 really is held.
+  const blocked = await api('/payments/withdraw', { method: 'POST', token, body: { amount: 6000, channel: 'esewa', account: '9800000000' } });
+  assert.equal(blocked.status, 400, 'fresh funds start out held');
+
+  // Park the held money in an escrow, then take it straight back.
+  const task = await api('/tasks', {
+    method: 'POST', token,
+    body: { title: 'Wash the windows', category: 'cleaning', desc: 'Ground floor only', place: 'Thamel', budget: 5000, when: 'today' }
+  });
+  assert.equal(task.status, 200, JSON.stringify(task.data));
+  const cancelled = await api(`/tasks/${task.data.task.id}/cancel`, { method: 'POST', token });
+  assert.equal(cancelled.status, 200, JSON.stringify(cancelled.data));
+  assert.equal(cancelled.data.user.wallet, 10000, 'the escrow came back in full');
+
+  // The round trip must not have washed the hold off.
+  const after = await api('/payments/withdraw', { method: 'POST', token, body: { amount: 6000, channel: 'esewa', account: '9800000000' } });
+  assert.equal(after.status, 400, 'refunded money is still held money — this is the laundering path');
+  assert.match(after.data.error, /held/i);
+
+  // ...and the genuinely old money is still spendable, so the hold did not
+  // spread to funds that were never at risk.
+  const stillFine = await api('/payments/withdraw', { method: 'POST', token, body: { amount: 4000, channel: 'esewa', account: '9800000000' } });
+  assert.equal(stillFine.status, 200, `un-held funds must stay withdrawable: ${JSON.stringify(stillFine.data)}`);
+});
+
 // --- 0.4 the confirmed collusion drain is closed ---------------------------
 
 test('partner CANNOT withdraw food income until the order is delivered', async () => {

@@ -24,6 +24,28 @@ function debitWallet(user, amount) {
   }
 }
 
+// The mirror of debitWallet, for money coming BACK to a customer: refunds,
+// reversals, cancelled escrows.
+//
+// Spending releases the hold (above), which is right — the fresh money left the
+// wallet. But a refund undoes the spend, so it has to undo the release too.
+// Without this, the hold was two calls away from meaningless: top up by card,
+// post a task, cancel it, and the money came back withdrawable with no
+// counterparty and nothing to review — then charge the card back.
+//
+// Never re-hold past the window's high-water mark. Refunding money that was
+// never fresh (an old balance spent and returned) must not freeze it, so the
+// cap is what was actually held during this window, not the sum of everything
+// that flows back. Wallets topped up before heldPeak existed have no mark to
+// restore to; they keep the old behaviour and age out with their own window.
+function creditWallet(user, amount) {
+  user.wallet += amount;
+  if ((user.heldUntil || 0) <= Date.now()) return;
+  const peak = user.heldPeak || 0;
+  if (peak <= 0) return;
+  user.heldBalance = Math.min(user.wallet, (user.heldBalance || 0) + amount, peak);
+}
+
 // Append a ledger entry AFTER the wallet/earnings mutation so balanceAfter is correct.
 function recordTxn(kind, entity, { type, label, amount, sign, method = null, refId = null, status = 'completed' }) {
   const txn = {
@@ -144,6 +166,7 @@ module.exports = {
   recordPlatformRevenue,
   platformRevenueTotals,
   debitWallet,
+  creditWallet,
   createWithdrawal,
   SANDBOX_PIN,
   WITHDRAW_FEE,
