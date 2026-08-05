@@ -555,8 +555,8 @@ function renderTab() {
 
 /* ---------------- home launcher ---------------- */
 
-// Counts hydrate lazily from whatever state is already loaded (boot, SSE,
-// a previous visit to the tab) — Home itself never fetches anything.
+// Counts render from whatever state is already loaded — homeView() itself never
+// fetches. hydrateHome() below is what puts something there to read.
 function homeActiveCounts() {
   // ORDER_DONE covers all three food endings: delivered (courier), completed
   // (collected at the counter) and cancelled — so in-flight pickup/eat-there
@@ -576,6 +576,27 @@ function homeCtxRow(tab, text) {
       <span style="color:var(--accent);font-weight:900">→</span>
     </div>
   </div>`;
+}
+
+// Home is the screen the app opens on, and it was the one screen that never
+// loaded the orders it advertises: reopen the app with a shop order sitting
+// packed and waiting at the counter and the launcher showed a bare grid — no
+// row, no badge, nothing to tell the customer to go and collect it. Fetch the
+// two lists in the background (never blocking the paint) and repaint if they
+// turn out to say something.
+let homeHydratedAt = 0;
+async function hydrateHome({ force = false } = {}) {
+  if (!state.user) return;
+  if (!force && Date.now() - homeHydratedAt < 15000) return;
+  homeHydratedAt = Date.now();
+  try {
+    const [food, shop] = await Promise.all([api('/api/orders'), api('/api/store-orders')]);
+    state.orders = food.orders || state.orders;
+    state.shopOrders = shop.orders || state.shopOrders;
+    if (state.tab === 'home') render();
+  } catch (e) {
+    homeHydratedAt = 0; // a failed hydrate should not silence the next attempt
+  }
 }
 
 function homeView() {
@@ -634,6 +655,7 @@ window.setTab = async (tab) => {
     state.showGroupJoin = false;
     state.showTaskForm = false;
     state.applyingTask = '';
+    hydrateHome(); // in-flight rows are only as honest as the last fetch
   }
   try {
     if (tab === 'shops') {
@@ -3018,6 +3040,7 @@ window.addEventListener('popstate', () => {
   render();
   // The restored page paints instantly from empty state; hydrate it right after.
   if (state.user && state.tab !== 'rides' && state.tab !== 'home') setTab(state.tab).catch(() => {});
+  else if (state.user && state.tab === 'home') hydrateHome({ force: true });
   if (payResult === 'success') {
     const amount = Number(params.get('amount'));
     toast(`Payment successful — Rs ${amount || ''} added to your wallet 💸`);
