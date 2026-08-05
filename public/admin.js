@@ -67,11 +67,12 @@ function toast(msg, isError = false) {
 
 // Core data behind badges + the Overview/Reviews/Payments/Partners tabs.
 async function loadCore() {
-  const [o, q, p, pay] = await Promise.all([
+  const [o, q, p, pay, att] = await Promise.all([
     api('/api/admin/overview'),
     api('/api/admin/queue'),
     api('/api/admin/partners'),
-    api('/api/admin/payments')
+    api('/api/admin/payments'),
+    api('/api/admin/attention')
   ]);
   state.stats = o.stats;
   state.revenueTrend = o.revenueTrend || [];
@@ -79,6 +80,7 @@ async function loadCore() {
   state.queue = q;
   state.partners = p.partners;
   state.payments = pay;
+  state.attention = att.orders || [];
   state.loggedIn = true;
 }
 
@@ -557,14 +559,52 @@ function reviewActions(kind, id) {
   </div>`;
 }
 
+// Abandoned-delivery incidents. Money is already resolved by the time one
+// lands here (customer refunded, shop paid, rider billed) — this queue exists
+// so a human closes the loop on the physical goods and the rider who took them.
+function attentionView() {
+  const list = state.attention || [];
+  if (!list.length) return '';
+  return `
+  <div class="section-title" style="margin-top:0">Abandoned deliveries 🚨 <span class="badge amber">${list.length}</span></div>
+  ${list.map((o) => `
+    <div class="card" style="border:1px solid #b91c1c">
+      <div class="row"><div>
+        <div style="font-weight:900">${esc(o.storeName)} · ${money(o.total)} <span class="badge gray">${o.payment === 'cash' ? 'CASH' : 'PAID IN APP'}</span></div>
+        <div class="muted small">${esc(o.items)}</div>
+        <div class="muted small">${fmtTime(o.abandonedAt)} · ${o.refunded ? 'customer auto-refunded' : 'customer had not paid'} · rider billed ${money(o.total)}</div>
+      </div></div>
+      <div style="background:var(--card2);border-radius:10px;padding:10px 12px;margin-top:10px">
+        <div class="small">🛵 <b>${esc(o.courier ? o.courier.name : 'Unknown rider')}</b>${o.courier ? ` · 📞 ${esc(o.courier.phone)} · owes <b style="color:#f87171">${money(o.courier.owes)}</b>${o.courier.suspended ? ' · <span style="color:#f87171">SUSPENDED</span>' : ''}` : ''}</div>
+        ${o.customer ? `<div class="muted small">👤 ${esc(o.customer.name)} · 📞 ${esc(o.customer.phone)}</div>` : ''}
+        <div class="muted small" style="margin-top:3px">Call the rider about the goods; suspend them or settle their debt from the People tab.</div>
+      </div>
+      <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
+        <button class="btn compact" onclick="resolveAttention('${o.id}')">✓ Dealt with — clear</button>
+      </div>
+    </div>`).join('')}`;
+}
+
+window.resolveAttention = async (id) => {
+  const note = prompt('What happened? (kept on the audit trail — e.g. "goods recovered", "written off, rider suspended")') || '';
+  try {
+    await api(`/api/admin/store-orders/${id}/attention/resolve`, { method: 'POST', body: { note } });
+    toast('Incident cleared ✓');
+    const att = await api('/api/admin/attention');
+    state.attention = att.orders || [];
+    renderMain();
+  } catch (e) { toast(e.message, true); }
+};
+
 function reviewsView() {
   const { restaurants, hotels } = state.queue;
+  const incidents = attentionView();
   if (restaurants.length === 0 && hotels.length === 0) {
-    return `<div class="section-title" style="margin-top:0">Review queue 🔍</div>
+    return `${incidents}<div class="section-title"${incidents ? '' : ' style="margin-top:0"'}>Review queue 🔍</div>
       <div class="empty"><div class="big">✅</div>Review queue is empty — nothing waiting.</div>`;
   }
-  return `
-  <div class="section-title" style="margin-top:0">Review queue 🔍 <span class="badge amber">${restaurants.length + hotels.length} waiting</span></div>
+  return `${incidents}
+  <div class="section-title"${incidents ? '' : ' style="margin-top:0"'}>Review queue 🔍 <span class="badge amber">${restaurants.length + hotels.length} waiting</span></div>
   ${restaurants.map((r) => `
     <div class="card">
       <div class="row"><div>
@@ -693,7 +733,7 @@ const TABS = [
 ];
 
 function tabBadge(tab) {
-  if (tab === 'reviews') return state.queue.restaurants.length + state.queue.hotels.length;
+  if (tab === 'reviews') return state.queue.restaurants.length + state.queue.hotels.length + (state.attention || []).length;
   if (tab === 'payments') return state.payments.pendingWithdrawals.length;
   if (tab === 'live') return state.live ? state.live.kpis.activeRides : 0;
   return 0;

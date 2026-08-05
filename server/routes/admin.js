@@ -375,6 +375,64 @@ router.get('/admin/queue', authAdmin, (req, res) => {
   res.json({ restaurants, hotels, stores });
 });
 
+// Shop orders a courier collected and then vanished with. The money already
+// auto-resolved when the run was recovered (customer refunded, shop income
+// honoured, rider billed the order total) — this queue is where staff review
+// the incident, chase the rider and the goods, and dismiss the flag once the
+// case is truly dealt with.
+router.get('/admin/attention', authAdmin, (req, res) => {
+  const orders = (db.storeOrders || [])
+    .filter((o) => o.needsAttention)
+    .map((o) => {
+      const run = (db.deliveryRuns || []).find((r) => r.abandonedAt && r.orderIds.includes(o.id));
+      const rider = db.drivers.find((d) => d.id === (o.courierId || (run && run.abandonedBy)));
+      const customer = db.users.find((u) => u.id === o.userId);
+      return {
+        id: o.id,
+        reason: o.needsAttention,
+        storeName: o.storeName,
+        items: o.items.map((l) => `${l.qty}× ${l.name}`).join(', '),
+        total: o.total,
+        payment: o.payment,
+        refunded: o.payment !== 'cash',
+        abandonedAt: (run && run.abandonedAt) || o.cancelledAt || null,
+        customer: customer ? { name: customer.name, phone: customer.phone || '—' } : null,
+        courier: rider
+          ? {
+            id: rider.id,
+            name: rider.name,
+            phone: rider.phone || '—',
+            owes: Math.max(0, -(rider.earnings || 0)),
+            suspended: !!rider.suspended
+          }
+          : null
+      };
+    })
+    .sort((a, b) => (b.abandonedAt || 0) - (a.abandonedAt || 0));
+  res.json({ orders });
+});
+
+// Staff dealt with the incident. Clearing the flag only empties the queue —
+// the order stays cancelled and every ledger line stays put; any further
+// compensation goes through the existing wallet-adjust / settle-cash tools.
+router.post('/admin/store-orders/:id/attention/resolve', authAdmin, (req, res) => {
+  const order = (db.storeOrders || []).find((o) => o.id === req.params.id);
+  if (!order) return res.status(404).json({ error: 'Order not found.' });
+  if (!order.needsAttention) return res.status(400).json({ error: 'This order is not flagged for attention.' });
+  order.needsAttention = null;
+  order.attentionResolvedAt = Date.now();
+  save();
+  logAudit({
+    actor: adminActor(),
+    action: 'store_order_attention_resolved',
+    targetType: 'store_order',
+    targetId: order.id,
+    meta: { note: String((req.body || {}).note || '').trim().slice(0, 300) },
+    ip: req.ip
+  });
+  res.json({ order: { id: order.id, needsAttention: null } });
+});
+
 router.get('/admin/partners', authAdmin, (req, res) => {
   const partners = db.partners.map((p) => ({
     id: p.id,

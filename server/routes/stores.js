@@ -927,6 +927,11 @@ router.post('/partner/store-orders/:orderId/:action(accept|reject|ready|handover
         });
       }
       order.partnerSettled = true;
+      // Handover IS the settlement moment. Stamp it, or a run formed around
+      // this order before the counter handover can still be worked by a rider
+      // afterwards — and its dropoff tick, gated only on moneySettledAt, would
+      // "settle" the order again, debiting that rider for cash they never held.
+      order.moneySettledAt = Date.now();
     }
   }
   save();
