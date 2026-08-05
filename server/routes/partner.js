@@ -29,8 +29,13 @@ const {
   requestPasswordReset,
   resetPassword
 } = require('../accountSecurity');
+const { logAudit } = require('../audit');
 
 const router = express.Router();
+
+// Enough for fat fingers at a busy counter, useless for brute force. Same cap
+// the kirana handover and the OTP flow use.
+const COLLECT_CODE_MAX_TRIES = 5;
 
 function profile(p) {
   return {
@@ -438,9 +443,31 @@ router.post('/partner/orders/:id/collected', authPartner, (req, res) => {
   if (status !== 'ready' && status !== 'preparing') {
     return res.status(409).json({ error: 'This order is not waiting to be collected.' });
   }
+  // The code has 9000 possible values and this settles prepaid money, so
+  // unlimited guesses let a restaurant script its way to keeping the payment for
+  // an order nobody collected — the customer has no refund path once the order
+  // is 'completed'. Five failures lock it; reject-and-refund is the exit. Same
+  // cap and same reasoning as the kirana handover (routes/stores.js).
+  if ((order.codeTries || 0) >= COLLECT_CODE_MAX_TRIES) {
+    return res.status(409).json({ error: 'Too many wrong codes — this order is locked. Reject it to refund the customer.' });
+  }
   const code = String((req.body || {}).code || '').trim();
   if (!code || code !== order.collectCode) {
-    return res.status(400).json({ error: 'Wrong code — ask the customer for the 4-digit code in their app.' });
+    order.codeTries = (order.codeTries || 0) + 1;
+    logAudit({
+      actor: { role: 'partner', id: req.partner.id, email: req.partner.email },
+      action: 'food.order.collect_code_failed',
+      targetType: 'order',
+      targetId: order.id,
+      meta: { restaurantId: order.restaurantId, tries: order.codeTries }
+    });
+    save();
+    const left = COLLECT_CODE_MAX_TRIES - order.codeTries;
+    return res.status(left > 0 ? 400 : 409).json({
+      error: left > 0
+        ? `Wrong code — ask the customer for the 4-digit code in their app (${left} ${left === 1 ? 'try' : 'tries'} left).`
+        : 'Too many wrong codes — this order is locked. Reject it to refund the customer.'
+    });
   }
   order.status = 'completed';
   order.collectedAt = Date.now();

@@ -255,3 +255,54 @@ test('a no-show pickup can be refunded by the kitchen, never stranded', async ()
   assert.equal(me.data.partner.pendingEarnings, 0, 'nothing dangling in pending income');
   assert.equal(me.data.partner.earnings, 0);
 });
+
+test('the counter code cannot be brute-forced into settling a prepaid order', async () => {
+  // The code is the customer's only proof the food changed hands, and the party
+  // being checked is the one entering it. With 9000 values and no cap, a
+  // restaurant could script its way to 'completed' on an order nobody collected
+  // — and 'completed' is terminal, so the customer's refund path closes with it.
+  const shop = await onboardPartnerRestaurant(300);
+  const { token: cust } = await registerUser('bruteforce');
+  const walletBefore = (await api('/auth/me', { token: cust })).data.user.wallet;
+
+  const placed = await api('/orders', {
+    method: 'POST', token: cust,
+    body: { restaurantId: shop.restaurantId, items: [{ id: shop.menuItemId, qty: 1 }], mode: 'pickup' }
+  });
+  const o = placed.data.order;
+  const realCode = o.collectCode;
+  await api(`/partner/orders/${o.id}/accept`, { method: 'POST', token: shop.token });
+  await api(`/partner/orders/${o.id}/ready`, { method: 'POST', token: shop.token });
+
+  // Guess wrong codes, carefully never hitting the real one.
+  const wrong = (n) => String(1000 + ((Number(realCode) - 1000 + n) % 9000)).padStart(4, '0');
+  for (let i = 1; i <= 4; i += 1) {
+    const attempt = await api(`/partner/orders/${o.id}/collected`, {
+      method: 'POST', token: shop.token, body: { code: wrong(i) }
+    });
+    assert.equal(attempt.status, 400, `guess ${i} is refused`);
+    assert.match(attempt.data.error, /left/, 'the kitchen is told how many tries remain');
+  }
+
+  // The fifth failure locks the order for good.
+  const fifth = await api(`/partner/orders/${o.id}/collected`, {
+    method: 'POST', token: shop.token, body: { code: wrong(5) }
+  });
+  assert.equal(fifth.status, 409);
+  assert.match(fifth.data.error, /locked/i);
+
+  // Even the CORRECT code no longer settles it — the lock is not a speed bump.
+  const withReal = await api(`/partner/orders/${o.id}/collected`, {
+    method: 'POST', token: shop.token, body: { code: realCode }
+  });
+  assert.equal(withReal.status, 409, 'a locked order cannot be collected at all');
+
+  const me = await api('/partner/me', { token: shop.token });
+  assert.equal(me.data.partner.earnings, 0, 'no income moved into withdrawable earnings');
+
+  // The customer is not stranded: reject still refunds them in full.
+  const refund = await api(`/partner/orders/${o.id}/reject`, { method: 'POST', token: shop.token });
+  assert.equal(refund.status, 200, JSON.stringify(refund.data));
+  const walletAfter = (await api('/auth/me', { token: cust })).data.user.wallet;
+  assert.equal(walletAfter, walletBefore, 'every rupee comes back');
+});
