@@ -55,6 +55,7 @@ before(async () => {
       ADMIN_EMAIL,
       ADMIN_PASSWORD,
       OTP_PROVIDER: 'sandbox',
+      RATE_LIMIT_API_PER_MIN: '100000',
       EMAIL_PROVIDER: 'sandbox',
       LOG_LEVEL: 'error'
     },

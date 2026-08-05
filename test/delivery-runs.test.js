@@ -135,7 +135,8 @@ before(async () => {
   server = spawn(process.execPath, [path.join(__dirname, '..', 'server', 'index.js')], {
     env: {
       ...process.env, NODE_ENV: 'development', PORT: String(PORT), DATA_STORE: 'json', DATA_DIR: dataDir,
-      ADMIN_EMAIL, ADMIN_PASSWORD, OTP_PROVIDER: 'sandbox', EMAIL_PROVIDER: 'sandbox',
+      ADMIN_EMAIL, ADMIN_PASSWORD, OTP_PROVIDER: 'sandbox',
+      RATE_LIMIT_API_PER_MIN: '100000', EMAIL_PROVIDER: 'sandbox',
       DRIVER_LICENSE_DEMO_CODE: '123456',
       DELIVERY_BATCH_TARGET: '3',
       DELIVERY_MAX_WAIT_MIN: '0.02', // ~1s, so the "never strand an order" path is testable

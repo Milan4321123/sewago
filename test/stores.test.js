@@ -67,7 +67,8 @@ before(async () => {
   server = spawn(process.execPath, [path.join(__dirname, '..', 'server', 'index.js')], {
     env: {
       ...process.env, NODE_ENV: 'development', PORT: String(PORT), DATA_STORE: 'json', DATA_DIR: dataDir,
-      ADMIN_EMAIL, ADMIN_PASSWORD, OTP_PROVIDER: 'sandbox', EMAIL_PROVIDER: 'sandbox',
+      ADMIN_EMAIL, ADMIN_PASSWORD, OTP_PROVIDER: 'sandbox',
+      RATE_LIMIT_API_PER_MIN: '100000', EMAIL_PROVIDER: 'sandbox',
       STORE_COMMISSION_PCT: '8', STORE_SERVICE_FEE: '5', LOG_LEVEL: 'error'
     },
     stdio: ['ignore', 'ignore', 'inherit']
@@ -226,9 +227,11 @@ test('insights add up: walk-ins at current price, orders at charged price, cance
   assert.ok(events.every((e) => e.at >= since && e.qty > 0));
 
   // The 30-day trend uses the daily counters, which deliberately stay gross of
-  // cancellations — so today shows all ten units that left the shelf.
+  // cancellations — so today shows all ten units that left the shelf. The
+  // buckets are UTC-dated, so allow the sale to land in "yesterday" when the
+  // suite happens to straddle a UTC midnight.
   assert.equal(daily.length, 30);
-  assert.equal(daily[29].units, 10);
+  assert.equal(daily[28].units + daily[29].units, 10);
 
   // Per-item week/month totals, same gross convention, valued at the current
   // shelf price — the shopkeeper's "what did rice earn this month".
