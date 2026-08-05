@@ -900,14 +900,20 @@ function settleStoreOrderOnDelivery(order, courier) {
   const owner = db.partners.find((p) => p.id === order.partnerId);
   if (order.payment === 'cash') {
     // The courier now holds the customer's cash for this order and owes it in.
-    courier.earnings = (courier.earnings || 0) - order.total;
-    recordTxn('driver', courier, {
-      type: 'cod_collected',
-      label: `Cash collected: ${order.storeName}`,
-      amount: order.total,
-      sign: -1,
-      refId: order.id
-    });
+    // Gated by !partnerSettled like every other money move below: if the order
+    // was already settled another way (e.g. the shopkeeper handed it over before
+    // a run had formed), no courier ever collected this cash, so debiting them
+    // the full order total would be inventing a debt out of nothing.
+    if (!order.partnerSettled) {
+      courier.earnings = (courier.earnings || 0) - order.total;
+      recordTxn('driver', courier, {
+        type: 'cod_collected',
+        label: `Cash collected: ${order.storeName}`,
+        amount: order.total,
+        sign: -1,
+        refId: order.id
+      });
+    }
     if (owner && !order.partnerSettled) {
       owner.earnings = (owner.earnings || 0) + order.partnerCut;
       recordTxn('partner', owner, {

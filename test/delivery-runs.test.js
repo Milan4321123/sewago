@@ -252,6 +252,58 @@ test('a rider works the run stop by stop, and each order settles at its own door
   assert.ok(driver.data.driver.earnings > 0, 'the rider was paid for the run');
 });
 
+test('an order settled by shopkeeper handover never double-debits the courier who works its run', async () => {
+  // Handover (shopkeeper) and the courier dropoff settle the same order through
+  // different flags. If a run has already formed when the shopkeeper hands the
+  // order over, a courier can still accept and work it — and the dropoff used to
+  // debit them the full cash total for money they never collected. Settlement
+  // must be idempotent: a run payout, and no phantom COD debit.
+  const shop = await openShop('Double Settle Kirana', 27.7016, 85.3210);
+  const courier = await onboardCourier(27.7010, 85.3205);
+  const cust = await registerUser('double-settle');
+
+  // Cash so the courier-debit branch is the one exercised; delivery so it runs.
+  const placed = await api('/store-orders', {
+    method: 'POST', token: cust.token,
+    body: {
+      storeId: shop.storeId, items: [{ itemId: shop.itemId, qty: 1 }],
+      payment: 'cash', fulfilment: 'delivery',
+      deliverTo: { lat: 27.6990, lng: 85.3180, name: 'New Road' }
+    }
+  });
+  assert.equal(placed.status, 200, JSON.stringify(placed.data));
+  const orderId = placed.data.order.id;
+  const orderTotal = placed.data.order.total;
+  assert.ok(orderTotal > 0);
+  await api(`/partner/store-orders/${orderId}/accept`, { method: 'POST', token: shop.token });
+  await api(`/partner/store-orders/${orderId}/ready`, { method: 'POST', token: shop.token });
+
+  // Let the run form and be offered — but do NOT accept yet.
+  const { run } = await waitForRun(courier.token);
+  assert.ok(run, 'the lone order forms a run');
+  const runPayout = run.payout;
+  assert.ok(runPayout > 0);
+
+  // Shopkeeper hands the order over while the run is still only offered — this
+  // marks it delivered and settled on the shop side (the race window).
+  const handover = await api(`/partner/store-orders/${orderId}/handover`, { method: 'POST', token: shop.token });
+  assert.equal(handover.status, 200, JSON.stringify(handover.data));
+  assert.equal(handover.data.order.status, 'delivered');
+
+  // The courier can still accept and work the already-settled run.
+  const accepted = await api(`/driver/runs/${run.id}/accept`, { method: 'POST', token: courier.token });
+  assert.equal(accepted.status, 200, JSON.stringify(accepted.data));
+  await api(`/driver/runs/${run.id}/stops/0/done`, { method: 'POST', token: courier.token }); // pickup
+  const drop = await api(`/driver/runs/${run.id}/stops/1/done`, { method: 'POST', token: courier.token }); // dropoff
+  assert.equal(drop.status, 200, JSON.stringify(drop.data));
+
+  // The courier keeps their run payout and is NOT debited the order total for
+  // cash they never collected. Before the fix this was runPayout - orderTotal.
+  const me = await api('/driver/me', { token: courier.token });
+  assert.equal(me.data.driver.earnings, runPayout,
+    'courier earns the run payout only — no phantom COD debit for an already-settled order');
+});
+
 test('a lone order is not stranded waiting for a batch to fill', async () => {
   const shop = await openShop('Lonely Kirana', 27.6727, 85.3255);
   const courier = await onboardCourier(27.6730, 85.3250);
