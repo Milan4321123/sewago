@@ -204,7 +204,7 @@ test('insights add up: walk-ins at current price, orders at charged price, cance
   const since = Date.now() - 3600000; // "midnight" as far as this test day goes
   const res = await api(`/partner/stores/${shop.storeId}/insights?since=${since}`, { token: shop.token });
   assert.equal(res.status, 200, JSON.stringify(res.data));
-  const { totals, topItems, events, week } = res.data;
+  const { totals, topItems, events, daily, items } = res.data;
 
   assert.equal(totals.units, 8, 'three walk-in + five ordered; the cancelled two do not count');
   assert.equal(totals.walkinUnits, 3);
@@ -225,10 +225,20 @@ test('insights add up: walk-ins at current price, orders at charged price, cance
   assert.equal(events.length, 2);
   assert.ok(events.every((e) => e.at >= since && e.qty > 0));
 
-  // The 7-day trend uses the daily counters, which deliberately stay gross of
+  // The 30-day trend uses the daily counters, which deliberately stay gross of
   // cancellations — so today shows all ten units that left the shelf.
-  assert.equal(week.length, 7);
-  assert.equal(week[6].units, 10);
+  assert.equal(daily.length, 30);
+  assert.equal(daily[29].units, 10);
+
+  // Per-item week/month totals, same gross convention, valued at the current
+  // shelf price — the shopkeeper's "what did rice earn this month".
+  const waiwaiRow = items.find((x) => x.name === 'Wai Wai');
+  assert.equal(waiwaiRow.qty7, 7, 'five ordered + two cancelled leave the daily counters at seven');
+  assert.equal(waiwaiRow.revenue7, 7 * 20);
+  assert.equal(waiwaiRow.qty30, 7);
+  const chiuraRow = items.find((x) => x.name === 'Chiura');
+  assert.equal(chiuraRow.qty7, 3);
+  assert.equal(chiuraRow.revenue30, 3 * 90);
 
   // Another partner cannot read this shop's money.
   const rival = await openShop();

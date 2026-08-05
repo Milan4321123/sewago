@@ -228,15 +228,45 @@ function salesInsights(store, sinceMs) {
     .slice(0, 20);
   events.sort((a, b) => a.at - b.at);
 
-  // Seven-day rhythm from the daily buckets — walk-ins and orders together,
-  // gross of cancellations, exactly as the reorder analytics count them.
-  const week = [];
-  for (let i = 6; i >= 0; i -= 1) {
+  // Thirty-day rhythm from the daily buckets — walk-ins and orders together,
+  // gross of cancellations, exactly as the reorder analytics count them. The
+  // client draws "this week" from the tail of the same series.
+  const daily = [];
+  for (let i = 29; i >= 0; i -= 1) {
     const key = new Date(now - i * 86400000).toISOString().slice(0, 10);
     let units = 0;
     for (const item of store.items) units += ((item.salesDaily || {})[key] || 0);
-    week.push({ date: key, units: Math.round(units * 10) / 10 });
+    daily.push({ date: key, units: Math.round(units * 10) / 10 });
   }
+
+  // Per-item week/month totals from the same buckets. Revenue here is the
+  // item's CURRENT price × units — the daily buckets carry no prices, and a
+  // shopkeeper wants "roughly what did rice earn this month", not a ledger.
+  const items = [];
+  for (const item of store.items) {
+    if (item.archived) continue;
+    const bucket = item.salesDaily || {};
+    let qty7 = 0;
+    let qty30 = 0;
+    for (let i = 0; i < 30; i += 1) {
+      const key = new Date(now - i * 86400000).toISOString().slice(0, 10);
+      const v = bucket[key] || 0;
+      if (i < 7) qty7 += v;
+      qty30 += v;
+    }
+    if (qty30 <= 0) continue;
+    const price = Number(item.price) || 0;
+    items.push({
+      itemId: item.id,
+      name: item.name,
+      unit: (UNITS[item.unit] || UNITS.each).label,
+      qty7: Math.round(qty7 * 100) / 100,
+      qty30: Math.round(qty30 * 100) / 100,
+      revenue7: Math.round(qty7 * price),
+      revenue30: Math.round(qty30 * price)
+    });
+  }
+  items.sort((a, b) => b.revenue30 - a.revenue30 || b.qty30 - a.qty30);
 
   return {
     since,
@@ -249,7 +279,8 @@ function salesInsights(store, sinceMs) {
     },
     topItems,
     events,
-    week
+    daily,
+    items: items.slice(0, 30)
   };
 }
 

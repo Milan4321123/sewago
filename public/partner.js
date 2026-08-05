@@ -45,8 +45,10 @@ const state = {
   showPhoneEdit: false, // re-open the OTP form to change a verified phone
   photos: {}, // slot -> uploaded /uploads/ URL pending form submission
   photoBusy: '', // slot currently uploading (disables its button)
-  // Hub-and-spoke shell: Home launcher + full-screen pages (no bottom bar)
-  tab: localStorage.getItem('sewago_partner_tab') || 'home',
+  // Hub-and-spoke shell: Home launcher + full-screen pages (no bottom bar).
+  // Always boot on Home — reopening the app inside yesterday's page (Profile,
+  // Earnings…) disorients far more than one extra tap costs.
+  tab: 'home',
   _popNav: false, // current setTab was triggered by the browser back button
   pipeTab: 'new', // orders pipeline: new | progress | ready | done
   activeListing: null, // { kind:'restaurants'|'hotels', id } -> full-screen editor
@@ -62,6 +64,7 @@ const state = {
   invTab: 'stock', // stock | reorder | subs | insights
   reorder: null,
   insights: null, // today's sales, fetched when the insights tab opens
+  insightsPeriod: 'today', // today | week | month — the reports range switch
   invoiceOrder: null, // store order rendered as a printable bill (full screen)
   storeOrders: [], // customer orders across ALL approved stores
   subReqs: {}, // storeId -> { requests, pendingByItem }
@@ -75,8 +78,9 @@ const state = {
   voice: { listening: false, heard: '', error: '' }
 };
 
-// The old bottom bar persisted a combined 'listings' tab that no longer
-// exists — migrate those sessions (and any junk value) to Home.
+// The old shell persisted the last-open tab; that key is intentionally no
+// longer read (see state.tab above) and cleared so it never resurrects.
+localStorage.removeItem('sewago_partner_tab');
 const PAGES = ['home', 'orders', 'shops', 'restaurants', 'hotels', 'earnings', 'profile'];
 if (!PAGES.includes(state.tab)) state.tab = 'home';
 
@@ -729,7 +733,6 @@ window.setTab = async (tab) => {
   }
   state._pageAnim = state.tab !== tab;
   state.tab = tab;
-  localStorage.setItem('sewago_partner_tab', tab);
   try {
     if (tab === 'home') {
       await Promise.all([reloadOrders(), loadStores()]);
@@ -2519,16 +2522,97 @@ window.pinShopLocation = () => {
 
 /* ---------------- insights (how is my shop doing?) ---------------- */
 
+window.setInsightsPeriod = (p) => {
+  state.insightsPeriod = p;
+  render();
+};
+
+// A daily-units bar chart shared by the week and month views. The last bar is
+// today, in amber.
+function dailyChart(days, labelEvery) {
+  const maxU = Math.max(...days.map((w) => w.units), 1);
+  return `
+  <div class="vbar-chart" style="margin-top:10px">
+    ${days.map((w, idx) => `<div class="vbar ${w.units ? '' : 'zero'} ${idx === days.length - 1 ? 'today' : ''}" style="height:${w.units ? Math.max(8, Math.round((w.units / maxU) * 100)) : 2}%" title="${esc(w.date)} — ${w.units}"></div>`).join('')}
+  </div>
+  <div class="vbar-labels">
+    ${days.map((w, idx) => `<span>${labelEvery(w, idx)}</span>`).join('')}
+  </div>`;
+}
+
+// One ranked row per item: name, units in the period, money bar.
+function itemBars(rows) {
+  const maxRevenue = Math.max(...rows.map((x) => x.revenue), 1);
+  return rows.map((x) => `
+    <div style="margin-top:10px">
+      <div class="row">
+        <div class="grow small">${esc(x.name)} <span class="muted">· ${x.qty} ${esc(t(x.unit || ''))}</span></div>
+        <div style="font-weight:800;white-space:nowrap">${money(x.revenue)}</div>
+      </div>
+      <div class="hbar-track"><div style="width:${Math.max(4, Math.round((x.revenue / maxRevenue) * 100))}%"></div></div>
+    </div>`).join('');
+}
+
 // Pure-CSS bars: every number a shopkeeper needs, no chart library. The events
 // come with real timestamps and are bucketed by the PHONE's clock, so "10 AM"
-// means 10 AM in the shop, wherever the server lives.
+// means 10 AM in the shop, wherever the server lives. One switch flips the
+// whole report between today / this week / this month — per item every time.
 function insightsView() {
   const ins = state.insights;
   if (!ins) return `<div class="empty">${t('Loading…')}</div>`;
+  const period = state.insightsPeriod;
+  const daily = ins.daily || [];
+  const periodItems = ins.items || [];
+  const dayNames = [t('Sun'), t('Mon'), t('Tue'), t('Wed'), t('Thu'), t('Fri'), t('Sat')];
+
+  const switcher = `
+  <div class="pipe-tabs" style="margin-bottom:12px">
+    <button class="${period === 'today' ? 'active' : ''}" onclick="setInsightsPeriod('today')">${t('Today')}</button>
+    <button class="${period === 'week' ? 'active' : ''}" onclick="setInsightsPeriod('week')">${t('This week')}</button>
+    <button class="${period === 'month' ? 'active' : ''}" onclick="setInsightsPeriod('month')">${t('This month')}</button>
+  </div>`;
+
+  if (period !== 'today') {
+    const week = period === 'week';
+    const days = week ? daily.slice(-7) : daily;
+    const units = Math.round(days.reduce((s, w) => s + w.units, 0) * 10) / 10;
+    const rows = periodItems
+      .map((x) => ({ name: x.name, unit: x.unit, qty: week ? x.qty7 : x.qty30, revenue: week ? x.revenue7 : x.revenue30 }))
+      .filter((x) => x.qty > 0)
+      .sort((a, b) => b.revenue - a.revenue || b.qty - a.qty);
+    const revenue = rows.reduce((s, x) => s + x.revenue, 0);
+    return `
+    ${switcher}
+    <div class="grid2" style="margin-bottom:12px">
+      <div class="card" style="padding:12px">
+        <div class="muted small">${week ? t('Sold this week') : t('Sold this month')}</div>
+        <div style="font-size:22px;font-weight:900">${units}</div>
+        <div class="muted small">${week ? t('last 7 days') : t('last 30 days')}</div>
+      </div>
+      <div class="card" style="padding:12px">
+        <div class="muted small">${t('Sales value')}</div>
+        <div style="font-size:22px;font-weight:900;color:var(--accent)">${money(revenue)}</div>
+        <div class="muted small">${t("valued at today's prices")}</div>
+      </div>
+    </div>
+    <div class="card">
+      <div style="font-weight:900">${t('Sales per day')} 📅</div>
+      ${dailyChart(days, week
+        ? (w) => dayNames[new Date(w.date + 'T00:00:00').getDay()]
+        : (w, idx) => ((idx % 5 === 0 || idx === days.length - 1) ? String(Number(w.date.slice(8, 10))) : ''))}
+      <div class="muted small" style="margin-top:8px">${t('Units sold per day — the amber bar is today.')}</div>
+    </div>
+    <div class="card">
+      <div style="font-weight:900">${week ? t('What sold this week') : t('What sold this month')} 🏆</div>
+      ${rows.length ? itemBars(rows.slice(0, 12)) : `
+      <div class="muted small" style="margin-top:8px">${t('No sales in this period yet.')}</div>`}
+      <div class="muted small" style="margin-top:12px">${t("valued at today's prices")}</div>
+    </div>`;
+  }
+
   const tot = ins.totals || {};
   const events = ins.events || [];
   const topItems = ins.topItems || [];
-  const week = ins.week || [];
 
   // Hour histogram, trimmed to the interesting part of the day but never
   // narrower than morning-to-evening so the shape is comparable day to day.
@@ -2548,11 +2632,8 @@ function insightsView() {
     hourLabels.push(`<span>${(h - lo) % 3 === 0 ? h : ''}</span>`);
   }
 
-  const maxRevenue = Math.max(...topItems.map((x) => x.revenue), 1);
-  const maxWeek = Math.max(...week.map((w) => w.units), 1);
-  const dayNames = [t('Sun'), t('Mon'), t('Tue'), t('Wed'), t('Thu'), t('Fri'), t('Sat')];
-
   return `
+  ${switcher}
   <div class="grid2" style="margin-bottom:12px">
     <div class="card" style="padding:12px">
       <div class="muted small">${t('Sold today')}</div>
@@ -2576,28 +2657,10 @@ function insightsView() {
 
   <div class="card">
     <div style="font-weight:900">${t('What sold today')} 🏆</div>
-    ${topItems.length ? topItems.slice(0, 8).map((x) => `
-    <div style="margin-top:10px">
-      <div class="row">
-        <div class="grow small">${esc(x.name)} <span class="muted">· ${x.qty} ${esc(t(x.unit || ''))}</span></div>
-        <div style="font-weight:800;white-space:nowrap">${money(x.revenue)}</div>
-      </div>
-      <div class="hbar-track"><div style="width:${Math.max(4, Math.round((x.revenue / maxRevenue) * 100))}%"></div></div>
-    </div>`).join('') : `
+    ${topItems.length ? itemBars(topItems.slice(0, 8)) : `
     <div class="muted small" style="margin-top:8px">${t('Nothing sold yet today — sales appear here as they happen.')}</div>`}
     ${topItems.some((x) => x.walkinQty > 0) ? `
     <div class="muted small" style="margin-top:12px">${t("Counter sales are valued at today's shelf price.")}</div>` : ''}
-  </div>
-
-  <div class="card">
-    <div style="font-weight:900">${t('Last 7 days')} 📅</div>
-    <div class="vbar-chart" style="margin-top:10px">
-      ${week.map((w, idx) => `<div class="vbar ${w.units ? '' : 'zero'} ${idx === week.length - 1 ? 'today' : ''}" style="height:${w.units ? Math.max(8, Math.round((w.units / maxWeek) * 100)) : 2}%" title="${esc(w.date)} — ${w.units}"></div>`).join('')}
-    </div>
-    <div class="vbar-labels">
-      ${week.map((w) => `<span>${dayNames[new Date(w.date + 'T00:00:00').getDay()]}</span>`).join('')}
-    </div>
-    <div class="muted small" style="margin-top:8px">${t('Units sold per day — the amber bar is today.')}</div>
   </div>`;
 }
 
