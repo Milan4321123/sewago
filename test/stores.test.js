@@ -174,6 +174,68 @@ test('counter sales and restocks keep the number on screen matching the shelf', 
   assert.ok(reasons.includes('initial_count'));
 });
 
+test('insights add up: walk-ins at current price, orders at charged price, cancels excluded', async () => {
+  const shop = await openShop();
+  const chiura = await api(`/partner/stores/${shop.storeId}/items`, {
+    method: 'POST', token: shop.token, body: { name: 'Chiura', unit: 'kg', price: 90, stock: 20 }
+  });
+  const waiwai = await api(`/partner/stores/${shop.storeId}/items`, {
+    method: 'POST', token: shop.token, body: { name: 'Wai Wai', unit: 'packet', price: 20, stock: 50 }
+  });
+
+  // Three sold at the counter, five sold through an app order…
+  await api(`/partner/stores/${shop.storeId}/items/${chiura.data.item.id}/sold`, {
+    method: 'POST', token: shop.token, body: { qty: 3 }
+  });
+  const { token: cust } = await registerUser('insight-shopper');
+  const order = await api('/store-orders', {
+    method: 'POST', token: cust,
+    body: { storeId: shop.storeId, items: [{ itemId: waiwai.data.item.id, qty: 5 }], payment: 'wallet' }
+  });
+  assert.equal(order.status, 200, JSON.stringify(order.data));
+
+  // …and two more that were ordered but cancelled — refunded money is not a sale.
+  const gone = await api('/store-orders', {
+    method: 'POST', token: cust,
+    body: { storeId: shop.storeId, items: [{ itemId: waiwai.data.item.id, qty: 2 }], payment: 'wallet' }
+  });
+  await api(`/store-orders/${gone.data.order.id}/cancel`, { method: 'POST', token: cust });
+
+  const since = Date.now() - 3600000; // "midnight" as far as this test day goes
+  const res = await api(`/partner/stores/${shop.storeId}/insights?since=${since}`, { token: shop.token });
+  assert.equal(res.status, 200, JSON.stringify(res.data));
+  const { totals, topItems, events, week } = res.data;
+
+  assert.equal(totals.units, 8, 'three walk-in + five ordered; the cancelled two do not count');
+  assert.equal(totals.walkinUnits, 3);
+  assert.equal(totals.orderUnits, 5);
+  assert.equal(totals.orders, 1, 'the cancelled order is not an order');
+  // Walk-ins at the current price (3 × 90), the order at its charged line price
+  // (5 × 20) — fees are the platform's money, not the shop's sales.
+  assert.equal(totals.revenue, 3 * 90 + 5 * 20);
+
+  assert.equal(topItems.length, 2);
+  assert.equal(topItems[0].name, 'Chiura', 'ranked by revenue');
+  assert.equal(topItems[0].walkinQty, 3);
+  assert.equal(topItems[1].name, 'Wai Wai');
+  assert.equal(topItems[1].orderQty, 5);
+  assert.equal(topItems[1].revenue, 100);
+
+  // One event per sale, timestamped so the client can draw the day's rhythm.
+  assert.equal(events.length, 2);
+  assert.ok(events.every((e) => e.at >= since && e.qty > 0));
+
+  // The 7-day trend uses the daily counters, which deliberately stay gross of
+  // cancellations — so today shows all ten units that left the shelf.
+  assert.equal(week.length, 7);
+  assert.equal(week[6].units, 10);
+
+  // Another partner cannot read this shop's money.
+  const rival = await openShop();
+  const denied = await api(`/partner/stores/${shop.storeId}/insights`, { token: rival.token });
+  assert.equal(denied.status, 403);
+});
+
 test('a customer orders, stock is reserved, and cancelling puts it back', async () => {
   const shop = await openShop();
   const created = await api(`/partner/stores/${shop.storeId}/items`, {

@@ -159,6 +159,100 @@ function reorderSuggestions(store, limit = 20) {
   return out.slice(0, limit);
 }
 
+/**
+ * "How is my shop doing?" — the numbers behind the partner insights screen.
+ * Joins the two records a sale leaves behind:
+ *   * stockMoves — every sale event with a real timestamp (walk-in taps and
+ *     app orders alike), which gives per-item counts and the hour-by-hour
+ *     rhythm of the day;
+ *   * storeOrders — the exact charged price for app orders. A walk-in sale
+ *     records no price, so its revenue is estimated at the item's current
+ *     price — the same honest approximation storeStats already makes.
+ * Cancelled orders are excluded: money that went back is not a sale, even
+ * though the daily counters (deliberately) never un-count it.
+ * `sinceMs` is the start of the shopkeeper's "today" — the CLIENT's midnight,
+ * because the server may live in a different timezone than the shop.
+ */
+function salesInsights(store, sinceMs) {
+  const now = Date.now();
+  const since = Number.isFinite(sinceMs) ? sinceMs : now - 86400000;
+  const itemsById = new Map(store.items.map((i) => [i.id, i]));
+  const ordersById = new Map();
+  for (const o of db.storeOrders || []) {
+    if (o.storeId === store.id) ordersById.set(o.id, o);
+  }
+
+  const perItem = new Map(); // itemId -> aggregate row
+  const events = [];         // [{ at, qty }] for the client's hour histogram
+  const orderIds = new Set();
+  let walkinUnits = 0;
+  let orderUnits = 0;
+  let revenue = 0;
+
+  for (const m of db.stockMoves || []) {
+    if (m.storeId !== store.id || m.at < since || m.qty >= 0) continue;
+    if (m.reason !== 'sale_counter' && m.reason !== 'order') continue;
+    const qty = -m.qty;
+    let amount = 0;
+    if (m.reason === 'order') {
+      const order = ordersById.get(m.refId);
+      if (!order || order.status === 'cancelled') continue; // refunded — not a sale
+      const line = (order.items || []).find((l) => l.itemId === m.itemId);
+      amount = line ? line.price * qty : 0;
+      orderIds.add(order.id);
+      orderUnits += qty;
+    } else {
+      const item = itemsById.get(m.itemId);
+      amount = (item ? Number(item.price) || 0 : 0) * qty;
+      walkinUnits += qty;
+    }
+    revenue += amount;
+    const row = perItem.get(m.itemId) || {
+      itemId: m.itemId, name: m.itemName, unit: '', qty: 0, revenue: 0, walkinQty: 0, orderQty: 0
+    };
+    const item = itemsById.get(m.itemId);
+    if (item) {
+      row.name = item.name; // ledger rows keep the name at sale time; show the current one
+      row.unit = (UNITS[item.unit] || UNITS.each).label;
+    }
+    row.qty = Math.round((row.qty + qty) * 100) / 100;
+    row.revenue = Math.round(row.revenue + amount);
+    if (m.reason === 'order') row.orderQty = Math.round((row.orderQty + qty) * 100) / 100;
+    else row.walkinQty = Math.round((row.walkinQty + qty) * 100) / 100;
+    perItem.set(m.itemId, row);
+    events.push({ at: m.at, qty });
+  }
+
+  const topItems = [...perItem.values()]
+    .sort((a, b) => b.revenue - a.revenue || b.qty - a.qty)
+    .slice(0, 20);
+  events.sort((a, b) => a.at - b.at);
+
+  // Seven-day rhythm from the daily buckets — walk-ins and orders together,
+  // gross of cancellations, exactly as the reorder analytics count them.
+  const week = [];
+  for (let i = 6; i >= 0; i -= 1) {
+    const key = new Date(now - i * 86400000).toISOString().slice(0, 10);
+    let units = 0;
+    for (const item of store.items) units += ((item.salesDaily || {})[key] || 0);
+    week.push({ date: key, units: Math.round(units * 10) / 10 });
+  }
+
+  return {
+    since,
+    totals: {
+      units: Math.round((walkinUnits + orderUnits) * 100) / 100,
+      revenue: Math.round(revenue),
+      orders: orderIds.size,
+      walkinUnits: Math.round(walkinUnits * 100) / 100,
+      orderUnits: Math.round(orderUnits * 100) / 100
+    },
+    topItems,
+    events,
+    week
+  };
+}
+
 // Headline numbers for the shopkeeper's dashboard.
 function storeStats(store) {
   const items = store.items.filter((i) => !i.archived);
@@ -247,6 +341,7 @@ module.exports = {
   lowStockThreshold,
   reorderSuggestions,
   storeStats,
+  salesInsights,
   canManageStore,
   helperFor,
   HELPER_PERMS,
