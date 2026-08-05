@@ -430,6 +430,7 @@ function overviewView() {
   <div class="card">
     <div class="list-row"><div>🚗 Ride commission (20%)</div><div class="rt"><b>${money(s.rideCommission)}</b></div></div>
     <div class="list-row"><div>🍔 Food commission</div><div class="rt"><b>${money(s.foodCommission)}</b></div></div>
+    <div class="list-row"><div>🏪 Store commission</div><div class="rt"><b>${money(s.storeCommission || 0)}</b></div></div>
     <div class="list-row"><div>🏨 Stay commission</div><div class="rt"><b>${money(s.stayCommission)}</b></div></div>
     <div class="list-row"><div>🧰 Task fees</div><div class="rt"><b>${money(s.taskFees)}</b></div></div>
     <div class="list-row"><div>🏦 Withdrawal fees</div><div class="rt"><b>${money(s.withdrawalFees)}</b></div></div>

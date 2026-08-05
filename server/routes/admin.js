@@ -80,6 +80,7 @@ router.get('/admin/overview', authAdmin, (req, res) => {
   const taskFees = ledger('task_fee');
   const withdrawalFees = ledger('withdraw_fee');
   const foodCommission = ledger('food_commission');
+  const storeCommission = ledger('store_commission');
   const stayCommission = ledger('stay_commission');
   const serviceFees = ledger('service_fee');
   const cancelFees = ledger('cancel_fee');
@@ -146,6 +147,7 @@ router.get('/admin/overview', authAdmin, (req, res) => {
       taskFees,
       withdrawalFees,
       foodCommission,
+      storeCommission,
       stayCommission,
       serviceFees,
       cancelFees,

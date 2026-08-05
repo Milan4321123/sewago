@@ -845,4 +845,6 @@ test('the platform ledger reconciles with revenue recomputed from store bookings
     `ledger (${data.reconciliation.ledgerTotal}) and recomputed revenue (${data.reconciliation.derivedTotal}) must agree — ` +
     'a non-zero drift means some money path writes one but not the other'
   );
+  // And the store vertical is visible as its own line, not buried in the total.
+  assert.ok(data.stats.storeCommission > 0, 'store commission must surface as its own revenue stat');
 });
