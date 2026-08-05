@@ -13,8 +13,12 @@ const path = require('node:path');
 const fs = require('node:fs');
 const os = require('node:os');
 
-const PORT = 4993;
-const BASE = `http://localhost:${PORT}/api`;
+const { freePort } = require('./freePort');
+
+// Assigned in before(): the OS picks a free port, so parallel checkouts
+// (agent worktrees, a second clone) can run this suite at the same time.
+let PORT;
+let BASE;
 const ADMIN_EMAIL = 'admin@test.local';
 const ADMIN_PASSWORD = 'test-admin-pass';
 
@@ -129,6 +133,8 @@ async function waitForRun(courierToken, tries = 45) {
 }
 
 before(async () => {
+  PORT = await freePort();
+  BASE = `http://localhost:${PORT}/api`;
   dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sewago-runs-'));
   server = spawn(process.execPath, [path.join(__dirname, '..', 'server', 'index.js')], {
     env: {
