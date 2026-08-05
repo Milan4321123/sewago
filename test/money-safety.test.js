@@ -11,8 +11,9 @@ const path = require('node:path');
 const fs = require('node:fs');
 const os = require('node:os');
 
-const PORT = 4983;
-const BASE = `http://localhost:${PORT}/api`;
+const { freePort } = require('./net');
+let PORT; // OS-assigned in before() — hardcoded ports collide across parallel checkouts
+let BASE;
 const ADMIN_EMAIL = 'admin@test.local';
 const ADMIN_PASSWORD = 'test-admin-pass';
 const LICENSE_CODE = '123456';
@@ -47,6 +48,8 @@ async function verifyPhone(token) {
 }
 
 before(async () => {
+  PORT = await freePort();
+  BASE = `http://localhost:${PORT}/api`;
   dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sewago-safety-'));
   server = spawn(process.execPath, [path.join(__dirname, '..', 'server', 'index.js')], {
     env: {
