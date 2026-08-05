@@ -2254,7 +2254,7 @@ function helperBlock() {
         ${t('Give {name} this code to join in the SewaGo app.', { name: esc(state.helperInvite.name || t('your helper')) })} ${t('They can add items and count stock — never change prices or see your money.')}
       </div>
       <div style="font-size:26px;font-weight:900;letter-spacing:4px;text-align:center">${esc(state.helperInvite.code)}</div>
-      <button class="btn ghost" style="margin-top:10px" onclick="dismissHelperInvite()">${t('Done')}</button>
+      <button class="btn ghost" style="margin-top:10px" onclick="dismissHelperInvite()">${t('Got it')}</button>
     </div>`;
   }
   if (state.helperForm) {
