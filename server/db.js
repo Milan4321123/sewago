@@ -184,6 +184,8 @@ function migrate(data) {
   data.itemSubscriptions = data.itemSubscriptions || [];
   data.subscriptionRequests = data.subscriptionRequests || [];
   data.deliveryRuns = data.deliveryRuns || [];
+  // Group food orders (eat together).
+  data.groupOrders = data.groupOrders || [];
   data.otpCodes = data.otpCodes || [];
   data.passwordResetTokens = data.passwordResetTokens || [];
   data.uploads = data.uploads || [];
@@ -240,6 +242,7 @@ function migrate(data) {
   // Orders created before live fulfillment existed keep the demo timers.
   for (const order of data.orders) {
     if (!order.fulfillment) order.fulfillment = 'sim';
+    if (!order.mode) order.mode = 'delivery'; // order-ahead arrived later
   }
   // Seeded ratings become weighted starting points for real customer ratings:
   // the count says how many "votes" the seed value is worth.

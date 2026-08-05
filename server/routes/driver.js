@@ -575,7 +575,9 @@ router.get('/driver/deliveries', authDriver, (req, res) => {
   if (currentJob(req.driver.id) || currentDelivery(req.driver.id)) return res.json({ deliveries: [] });
   if (runs.runForCourier(req.driver.id)) return res.json({ deliveries: [] });
   const deliveries = db.orders
-    .filter((o) => o.fulfillment === 'live' && !o.courierId && orderWithStatus(o).status === 'preparing')
+    // Pickup / dine-in orders never enter the courier pool — nobody rides.
+    .filter((o) => o.fulfillment === 'live' && (!o.mode || o.mode === 'delivery') &&
+      !o.courierId && orderWithStatus(o).status === 'preparing')
     // Regional: only restaurants this courier can realistically reach.
     .filter((o) => {
       const restaurant = db.restaurants.find((r) => r.id === o.restaurantId);
@@ -599,7 +601,8 @@ router.post('/driver/deliveries/:id/accept', authDriver, (req, res) => {
   if (currentJob(req.driver.id)) return res.status(409).json({ error: 'Finish your current trip first.' });
   if (currentDelivery(req.driver.id)) return res.status(409).json({ error: 'Finish your current delivery first.' });
   if (runs.runForCourier(req.driver.id)) return res.status(409).json({ error: 'Finish your delivery run first.' });
-  const order = db.orders.find((o) => o.id === req.params.id && o.fulfillment === 'live');
+  const order = db.orders.find((o) => o.id === req.params.id && o.fulfillment === 'live' &&
+    (!o.mode || o.mode === 'delivery')); // order-ahead is never a courier job
   if (!order) return res.status(404).json({ error: 'Delivery not found.' });
   // Cash float check on the PROJECTED debt: refuse the job before the cash is in
   // the courier's hand, not after. A snapshot check would let a courier at the

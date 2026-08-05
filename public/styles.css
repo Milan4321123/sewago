@@ -1346,6 +1346,30 @@ a.link { text-decoration: none; }
   bottom: calc(10px + env(safe-area-inset-bottom, 0px));
 }
 
+/* Order-ahead "When?" chips (and the group-order time chips): the picked one
+   lights up like an active pipe-tab. */
+.chip.on {
+  background: var(--accent-soft);
+  border-color: rgba(52, 211, 153, 0.5);
+  color: var(--accent);
+}
+
+/* Collect / share code: big dashed ticket the counter reads at arm's length —
+   store pickups, order-ahead food and group join codes all use it. */
+.code-card {
+  margin-top: 10px;
+  padding: 10px;
+  text-align: center;
+  border: 1px dashed var(--accent);
+  border-radius: 12px;
+}
+.code-card .code {
+  font-size: 30px;
+  font-weight: 900;
+  letter-spacing: 8px;
+  font-variant-numeric: tabular-nums;
+}
+
 /* ===== app-specific: driver ===== */
 
 /* Quiet, centered "Pass" / dismiss link under a full-width Accept bar on
@@ -1407,6 +1431,20 @@ a.link { text-decoration: none; }
 @media (prefers-reduced-motion: reduce) {
   .mic-btn.listening { animation: none; }
 }
+
+/* Order-ahead / group chips on pipeline cards — they wrap on narrow phones. */
+.order-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+
+/* Expandable who-pays-what table on a group order card. */
+.member-split {
+  margin-top: 10px;
+  padding: 2px 12px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
+.member-split .row { padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+.member-split .row:last-of-type { border-bottom: none; }
+.member-split s { margin-right: 4px; }
 
 /* ===== app-specific: admin ===== */
 

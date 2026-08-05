@@ -1,3 +1,4 @@
+const crypto = require('crypto');
 const express = require('express');
 const { db, save, uid } = require('../db');
 const { config } = require('../config');
@@ -49,8 +50,17 @@ router.get('/restaurants/:id', authRequired, (req, res) => {
   res.json({ restaurant });
 });
 
+// How far ahead an order can be scheduled — and how far "behind": a couple of
+// minutes of clock skew must not reject a phone that says "now".
+const SCHEDULE_PAST_GRACE_MS = 2 * 60 * 1000;
+const SCHEDULE_MAX_AHEAD_MS = 7 * 24 * 60 * 60 * 1000;
+
 router.post('/orders', authRequired, (req, res) => {
   const { restaurantId, items, deliveryTo, payment } = req.body || {};
+  // Order-ahead: 'pickup' (take it away) and 'dinein' (eat there) skip the
+  // courier entirely — the customer walks to the counter with a code. Anything
+  // else is a plain delivery, exactly as before.
+  const mode = ['pickup', 'dinein'].includes((req.body || {}).mode) ? req.body.mode : 'delivery';
   const restaurant = db.restaurants.find((r) => r.id === restaurantId && orderable(r));
   if (!restaurant) return res.status(404).json({ error: 'Restaurant not found.' });
   if (!Array.isArray(items) || items.length === 0) {
@@ -60,8 +70,29 @@ router.post('/orders', authRequired, (req, res) => {
   // a courier delivers, so a delivery address is required. Seeded demo
   // restaurants keep the simulated timeline.
   const fulfillment = restaurant.ownerId ? 'live' : 'sim';
+  // Only real partner kitchens can do order-ahead — a sim restaurant has no
+  // counter to walk up to and nobody to check the code.
+  if (mode !== 'delivery' && fulfillment !== 'live') {
+    return res.status(400).json({ error: 'Pickup and eat-there work at partner restaurants only — this one delivers.' });
+  }
+  // Paid up front is the whole point: the kitchen starts cooking on money that
+  // is already in hand, and the counter handover is just a code check.
+  if (mode !== 'delivery' && payment === 'cash') {
+    return res.status(400).json({ error: 'Order-ahead is paid from your wallet so the kitchen can start cooking.' });
+  }
+  // "When?" — absent means ASAP; anything else must be a real timestamp inside
+  // the schedulable window.
+  let scheduledFor = null;
+  if ((req.body || {}).scheduledFor !== undefined && (req.body || {}).scheduledFor !== null) {
+    scheduledFor = Math.round(Number(req.body.scheduledFor));
+    if (!Number.isFinite(scheduledFor) ||
+        scheduledFor < Date.now() - SCHEDULE_PAST_GRACE_MS ||
+        scheduledFor > Date.now() + SCHEDULE_MAX_AHEAD_MS) {
+      return res.status(400).json({ error: 'Pick a time between now and 7 days from now.' });
+    }
+  }
   let deliveryLoc = null;
-  if (fulfillment === 'live') {
+  if (fulfillment === 'live' && mode === 'delivery') {
     const resolved = resolveLocation(deliveryTo);
     if (resolved.error === 'outside') {
       return res.status(400).json({ error: 'That delivery point is outside the Kathmandu valley.' });
@@ -102,10 +133,15 @@ router.post('/orders', authRequired, (req, res) => {
     return res.status(400).json({ error: `Orders are limited to ${MAX_ORDER_SUBTOTAL} in food value — please split large orders.` });
   }
   // Live orders price delivery by road distance; sim orders keep the flat fee.
-  const delivery = fulfillment === 'live'
-    ? deliveryFeeFor(restaurant, deliveryLoc)
-    : { fee: restaurant.deliveryFee, distanceKm: null };
-  const total = subtotal + delivery.fee + FOOD_SERVICE_FEE;
+  // Order-ahead has no courier leg at all, so there is nothing to price — no
+  // delivery fee, no service fee, total = the food.
+  const delivery = mode !== 'delivery'
+    ? { fee: 0, distanceKm: null }
+    : fulfillment === 'live'
+      ? deliveryFeeFor(restaurant, deliveryLoc)
+      : { fee: restaurant.deliveryFee, distanceKm: null };
+  const serviceFee = mode !== 'delivery' ? 0 : FOOD_SERVICE_FEE;
+  const total = subtotal + delivery.fee + serviceFee;
   // Cash on delivery: the courier collects the total at the door, so nothing is
   // debited now and the customer needs no wallet balance to order. Only real
   // (live) orders can be COD — a simulated order has no courier to collect.
@@ -135,10 +171,16 @@ router.post('/orders', authRequired, (req, res) => {
     subtotal,
     deliveryFee: delivery.fee,
     deliveryDistanceKm: delivery.distanceKm,
-    serviceFee: FOOD_SERVICE_FEE,
+    serviceFee,
     total,
     payment: payMethod,
     fulfillment,
+    mode,
+    scheduledFor,
+    // The customer's proof at the counter — same 4-digit shape as store
+    // pickups. Only they see it; the kitchen hears it from their mouth.
+    collectCode: mode !== 'delivery' ? String(crypto.randomInt(1000, 10000)) : null,
+    collectedAt: null,
     restaurantLoc: restaurant.loc || null,
     deliveryLoc,
     courierId: null,
@@ -184,14 +226,17 @@ router.post('/orders', authRequired, (req, res) => {
     if (payMethod === 'wallet') {
       recordPlatformRevenue({
         source: 'food_commission',
-        label: `Food commission + delivery: ${restaurant.name}`,
+        label: mode === 'delivery'
+          ? `Food commission + delivery: ${restaurant.name}`
+          : `Food commission: ${restaurant.name}`,
         amount: total - order.partnerCut - order.serviceFee,
         refId: order.id
       });
     }
   }
   // Service fee is its own revenue line so commissions and fees stay separable.
-  if (payMethod === 'wallet') {
+  // Order-ahead charges none, so there is nothing to book.
+  if (payMethod === 'wallet' && order.serviceFee > 0) {
     recordPlatformRevenue({
       source: 'service_fee',
       label: `Order service fee: ${restaurant.name}`,
@@ -236,7 +281,8 @@ router.post('/orders/:id/rate', authRequired, (req, res) => {
   if (!order) return res.status(404).json({ error: 'Order not found.' });
   const stars = Number((req.body || {}).stars);
   if (!(stars >= 1 && stars <= 5)) return res.status(400).json({ error: 'Rating must be 1-5 stars.' });
-  if (withStatus(order).status !== 'delivered') {
+  // 'delivered' for courier orders, 'completed' for collected order-ahead.
+  if (!['delivered', 'completed'].includes(withStatus(order).status)) {
     return res.status(400).json({ error: 'You can rate an order after it arrives.' });
   }
   if (order.ratingStars) return res.status(409).json({ error: 'You already rated this order.' });
@@ -257,6 +303,386 @@ router.post('/orders/:id/rate', authRequired, (req, res) => {
   }
   save();
   res.json({ order: { ...order } });
+});
+
+/* ---------------- group orders (eat together) ---------------- */
+// Friends pool one pickup / dine-in order and unlock the restaurant's group
+// discount. The group is a lobby: everyone picks their own items and confirms,
+// then the host places ONE order — each participant's wallet pays their own
+// (discounted) share at that moment, all-or-nothing.
+
+const GROUP_MAX_MEMBERS = 12;
+// A group needs runway for friends to join, and the same one-week horizon as
+// any scheduled order.
+const GROUP_MIN_LEAD_MS = 30 * 60 * 1000;
+const GROUP_MAX_LEAD_MS = SCHEDULE_MAX_AHEAD_MS;
+
+// 6-digit join code, unique among OPEN groups so a code always finds one lobby.
+function groupCode() {
+  let code;
+  do {
+    code = String(crypto.randomInt(100000, 1000000));
+  } while (db.groupOrders.some((g) => g.status === 'open' && g.code === code));
+  return code;
+}
+
+// Resolve the group and check the caller is actually in it.
+function myGroup(req, res) {
+  const group = db.groupOrders.find((g) => g.id === req.params.id);
+  if (!group) {
+    res.status(404).json({ error: 'Group order not found.' });
+    return null;
+  }
+  if (!group.members.some((m) => m.userId === req.user.id)) {
+    res.status(403).json({ error: 'You are not in this group.' });
+    return null;
+  }
+  return group;
+}
+
+// Price one member's picks from the CURRENT menu — an item that vanished from
+// the menu since it was picked simply stops counting.
+function memberSubtotal(restaurant, member) {
+  return member.items.reduce((sum, line) => {
+    const menuItem = restaurant && restaurant.menu.find((m) => m.id === line.id);
+    return sum + (menuItem ? menuItem.price * line.qty : 0);
+  }, 0);
+}
+
+// What every member's screen shows: who's in, who confirmed, what the discount
+// is doing right now, and (after place) the shared counter code.
+function groupView(group, userId) {
+  const restaurant = db.restaurants.find((r) => r.id === group.restaurantId);
+  const discount = (restaurant && restaurant.groupDiscount) || null;
+  const members = group.members.map((m) => ({
+    userId: m.userId,
+    name: m.name,
+    itemCount: m.items.reduce((sum, line) => sum + line.qty, 0),
+    subtotal: memberSubtotal(restaurant, m),
+    confirmed: !!m.confirmed
+  }));
+  const participants = group.members.filter((m) => m.confirmed && m.items.length > 0);
+  const confirmedCount = participants.length;
+  const currentPct = discount && confirmedCount >= discount.minPeople ? discount.pct : 0;
+  // What the group is saving at the current head count.
+  const savings = currentPct
+    ? participants.reduce((sum, m) => {
+      const sub = memberSubtotal(restaurant, m);
+      return sum + (sub - Math.round(sub * (1 - currentPct / 100)));
+    }, 0)
+    : 0;
+  const me = group.members.find((m) => m.userId === userId);
+  const order = group.orderId ? db.orders.find((o) => o.id === group.orderId) : null;
+  return {
+    id: group.id,
+    code: group.code,
+    restaurantId: group.restaurantId,
+    restaurantName: group.restaurantName,
+    restaurantIcon: restaurant ? restaurant.icon : '🍽️',
+    hostUserId: group.hostUserId,
+    hostName: (group.members.find((m) => m.userId === group.hostUserId) || {}).name || 'Host',
+    mode: group.mode,
+    scheduledFor: group.scheduledFor,
+    status: group.status,
+    createdAt: group.createdAt,
+    discount,
+    members,
+    confirmedCount,
+    currentPct,
+    savings,
+    // "N more people for X% off" — null once unlocked (or with no offer at all).
+    needMore: discount && !currentPct
+      ? { people: discount.minPeople - confirmedCount, pct: discount.pct }
+      : null,
+    myItems: me ? me.items : [],
+    myConfirmed: me ? !!me.confirmed : false,
+    // After the host places, every member shows the shared counter code.
+    order: order
+      ? {
+        id: order.id,
+        status: withStatus(order).status,
+        collectCode: order.collectCode,
+        total: order.total,
+        scheduledFor: order.scheduledFor
+      }
+      : null
+  };
+}
+
+// Everyone's screen stays live: nudge each member's app after any change.
+function publishGroup(group) {
+  for (const m of group.members) events.publish(`user:${m.userId}`, { topic: 'group' });
+}
+
+// Host opens the lobby. Live partner restaurants only, pickup or eat-there
+// only — a group feast has no courier.
+router.post('/group-orders', authRequired, (req, res) => {
+  const { restaurantId, mode, scheduledFor } = req.body || {};
+  const restaurant = db.restaurants.find((r) => r.id === restaurantId && orderable(r));
+  if (!restaurant || !restaurant.ownerId) {
+    return res.status(404).json({ error: 'Group orders work at partner restaurants only.' });
+  }
+  if (mode !== 'pickup' && mode !== 'dinein') {
+    return res.status(400).json({ error: 'Choose pickup or eat-there for the group.' });
+  }
+  const when = Math.round(Number(scheduledFor));
+  if (!Number.isFinite(when) || when < Date.now() + GROUP_MIN_LEAD_MS || when > Date.now() + GROUP_MAX_LEAD_MS) {
+    return res.status(400).json({ error: 'Pick a time at least 30 minutes from now (and within a week) so everyone can join.' });
+  }
+  const group = {
+    id: uid(),
+    code: groupCode(),
+    restaurantId: restaurant.id,
+    restaurantName: restaurant.name,
+    hostUserId: req.user.id,
+    mode,
+    scheduledFor: when,
+    status: 'open',
+    members: [{ userId: req.user.id, name: req.user.name, items: [], confirmed: false }],
+    orderId: null,
+    createdAt: Date.now()
+  };
+  db.groupOrders.push(group);
+  save();
+  res.json({ group: groupView(group, req.user.id) });
+});
+
+// Join with the 6-digit code the host shared. Joining twice just returns the
+// group — a re-tapped invite link must not error.
+router.post('/group-orders/join', authRequired, (req, res) => {
+  const code = String((req.body || {}).code || '').trim();
+  const group = db.groupOrders.find((g) => g.status === 'open' && g.code === code);
+  if (!group) return res.status(404).json({ error: 'No open group with that code — check the 6 digits with your host.' });
+  if (!group.members.some((m) => m.userId === req.user.id)) {
+    if (group.members.length >= GROUP_MAX_MEMBERS) {
+      return res.status(409).json({ error: `This group is full (${GROUP_MAX_MEMBERS} people max).` });
+    }
+    group.members.push({ userId: req.user.id, name: req.user.name, items: [], confirmed: false });
+    save();
+    publishGroup(group);
+  }
+  res.json({ group: groupView(group, req.user.id) });
+});
+
+// My active groups: open lobbies plus placed ones whose order is still cooking.
+router.get('/group-orders', authRequired, (req, res) => {
+  const groups = db.groupOrders
+    .filter((g) => g.members.some((m) => m.userId === req.user.id))
+    .filter((g) => {
+      if (g.status === 'open') return true;
+      if (g.status !== 'placed') return false;
+      const order = db.orders.find((o) => o.id === g.orderId);
+      return order && !['completed', 'delivered', 'cancelled'].includes(withStatus(order).status);
+    })
+    .map((g) => groupView(g, req.user.id))
+    .reverse();
+  res.json({ groups });
+});
+
+// Set MY plate. Editing after confirming un-confirms it — what you locked in
+// is what everyone else planned around. Same bounds as a normal order, per
+// member, de-duplicated first so a repeated id cannot defeat the per-item cap.
+router.post('/group-orders/:id/items', authRequired, (req, res) => {
+  const group = myGroup(req, res);
+  if (!group) return;
+  if (group.status !== 'open') return res.status(400).json({ error: 'This group order is closed.' });
+  const restaurant = db.restaurants.find((r) => r.id === group.restaurantId);
+  if (!restaurant) return res.status(404).json({ error: 'Restaurant not found.' });
+  const items = (req.body || {}).items;
+  if (!Array.isArray(items)) return res.status(400).json({ error: 'Send your items as a list.' });
+  if (items.length > MAX_ORDER_LINES) {
+    return res.status(400).json({ error: `You can pick at most ${MAX_ORDER_LINES} different items.` });
+  }
+  const qtyById = new Map();
+  for (const { id, qty } of items) {
+    const quantity = Number(qty);
+    if (!restaurant.menu.some((m) => m.id === id) || !Number.isInteger(quantity) || quantity < 1) {
+      return res.status(400).json({ error: 'Invalid item in your picks.' });
+    }
+    qtyById.set(id, (qtyById.get(id) || 0) + quantity);
+  }
+  let subtotal = 0;
+  const lines = [];
+  for (const [id, quantity] of qtyById) {
+    if (quantity > MAX_ITEM_QTY) {
+      return res.status(400).json({ error: `You can order at most ${MAX_ITEM_QTY} of the same item.` });
+    }
+    subtotal += restaurant.menu.find((m) => m.id === id).price * quantity;
+    lines.push({ id, qty: quantity });
+  }
+  if (subtotal > MAX_ORDER_SUBTOTAL) {
+    return res.status(400).json({ error: `Orders are limited to ${MAX_ORDER_SUBTOTAL} in food value — please split large orders.` });
+  }
+  const me = group.members.find((m) => m.userId === req.user.id);
+  me.items = lines;
+  me.confirmed = false;
+  save();
+  publishGroup(group);
+  res.json({ group: groupView(group, req.user.id) });
+});
+
+// "I'm in" / "let me change something" — the discount counts CONFIRMED people,
+// so a confirm needs something on the plate.
+router.post('/group-orders/:id/:action(confirm|unconfirm)', authRequired, (req, res) => {
+  const group = myGroup(req, res);
+  if (!group) return;
+  if (group.status !== 'open') return res.status(400).json({ error: 'This group order is closed.' });
+  const me = group.members.find((m) => m.userId === req.user.id);
+  if (req.params.action === 'confirm' && me.items.length === 0) {
+    return res.status(400).json({ error: 'Pick at least one item before confirming your part.' });
+  }
+  me.confirmed = req.params.action === 'confirm';
+  save();
+  publishGroup(group);
+  res.json({ group: groupView(group, req.user.id) });
+});
+
+// The host places ONE order for everyone who confirmed. Each participant's
+// wallet pays their own share at this moment — all-or-nothing, so nobody's
+// dinner rides on a friend who can't pay.
+router.post('/group-orders/:id/place', authRequired, (req, res) => {
+  const group = myGroup(req, res);
+  if (!group) return;
+  if (group.hostUserId !== req.user.id) return res.status(403).json({ error: 'Only the host can place the group order.' });
+  if (group.status !== 'open') return res.status(400).json({ error: 'This group order is closed.' });
+  const restaurant = db.restaurants.find((r) => r.id === group.restaurantId && orderable(r));
+  if (!restaurant || !restaurant.ownerId) return res.status(404).json({ error: 'Restaurant not found.' });
+
+  const participants = group.members.filter((m) => m.confirmed && m.items.length > 0);
+  const shares = participants
+    .map((m) => ({ member: m, user: db.users.find((u) => u.id === m.userId), subtotal: memberSubtotal(restaurant, m) }))
+    .filter((s) => s.user && s.subtotal > 0);
+  if (shares.length === 0) return res.status(400).json({ error: 'Nobody has confirmed items yet.' });
+
+  const discount = restaurant.groupDiscount || null;
+  const pct = discount && shares.length >= discount.minPeople ? discount.pct : 0;
+  for (const s of shares) s.paid = Math.round(s.subtotal * (1 - pct / 100));
+
+  // All-or-nothing: if anyone is short, charge NOBODY and name names so the
+  // host knows exactly who to nudge.
+  const short = shares.filter((s) => s.user.wallet < s.paid);
+  if (short.length) {
+    return res.status(402).json({
+      error: `Not enough wallet balance: ${short.map((s) => s.member.name).join(', ')}. Everyone tops up, then place again.`
+    });
+  }
+  const orderId = uid();
+  for (const s of shares) {
+    debitWallet(s.user, s.paid);
+    recordTxn('user', s.user, {
+      type: 'food',
+      label: `Group order: ${restaurant.name}`,
+      amount: s.paid,
+      sign: -1,
+      refId: orderId
+    });
+  }
+
+  // One order lands in the kitchen queue with everyone's plates merged. Its
+  // subtotal is the sum of the DISCOUNTED shares — the money that actually
+  // moved — and the partner's 85% is cut from that.
+  const qtyById = new Map();
+  for (const s of shares) {
+    for (const line of s.member.items) qtyById.set(line.id, (qtyById.get(line.id) || 0) + line.qty);
+  }
+  const lines = [];
+  for (const [id, quantity] of qtyById) {
+    const menuItem = restaurant.menu.find((m) => m.id === id);
+    if (menuItem) lines.push({ id: menuItem.id, name: menuItem.name, price: menuItem.price, qty: quantity });
+  }
+  const subtotal = shares.reduce((sum, s) => sum + s.paid, 0);
+  const order = {
+    id: orderId,
+    userId: req.user.id,
+    customerName: shares.length > 1 ? `${req.user.name} + ${shares.length - 1}` : req.user.name,
+    restaurantId: restaurant.id,
+    restaurantName: restaurant.name,
+    restaurantIcon: restaurant.icon,
+    items: lines,
+    subtotal,
+    deliveryFee: 0,
+    deliveryDistanceKm: null,
+    serviceFee: 0,
+    total: subtotal,
+    payment: 'wallet',
+    fulfillment: 'live',
+    mode: group.mode,
+    scheduledFor: group.scheduledFor,
+    collectCode: String(crypto.randomInt(1000, 10000)),
+    collectedAt: null,
+    // Who paid what — userId included so a refund can send each share home.
+    group: {
+      id: group.id,
+      size: shares.length,
+      pct,
+      perMember: shares.map((s) => ({ userId: s.member.userId, name: s.member.name, subtotal: s.subtotal, paid: s.paid }))
+    },
+    restaurantLoc: restaurant.loc || null,
+    deliveryLoc: null,
+    courierId: null,
+    courier: null,
+    partnerSettled: false,
+    status: 'placed',
+    createdAt: Date.now()
+  };
+  const owner = db.partners.find((p) => p.id === restaurant.ownerId);
+  if (owner) {
+    order.partnerId = owner.id;
+    order.partnerCut = Math.round(subtotal * 0.85);
+    // Pending until collected at the counter, same as every other live order.
+    owner.pendingEarnings = (owner.pendingEarnings || 0) + order.partnerCut;
+    recordTxn('partner', owner, {
+      type: 'order_income_pending',
+      label: `Group order placed (pending collection): ${restaurant.name}`,
+      amount: order.partnerCut,
+      sign: 1,
+      refId: order.id
+    });
+    recordPlatformRevenue({
+      source: 'food_commission',
+      label: `Food commission (group): ${restaurant.name}`,
+      amount: order.total - order.partnerCut,
+      refId: order.id
+    });
+  }
+  db.orders.push(order);
+  group.status = 'placed';
+  group.orderId = order.id;
+  save();
+  publishGroup(group);
+  if (order.partnerId) events.publish(`partner:${order.partnerId}`, { topic: 'orders' });
+  events.publish('admin', { topic: 'orders' });
+  res.json({ group: groupView(group, req.user.id), order: withStatus(order), user: publicUser(req.user) });
+});
+
+// A friend backs out of an open lobby. The host's exit is cancel, below.
+router.post('/group-orders/:id/leave', authRequired, (req, res) => {
+  const group = myGroup(req, res);
+  if (!group) return;
+  if (group.status !== 'open') return res.status(400).json({ error: 'This group order is closed.' });
+  if (group.hostUserId === req.user.id) {
+    return res.status(400).json({ error: 'The host cannot leave — cancel the group instead.' });
+  }
+  const wasMembers = group.members;
+  group.members = group.members.filter((m) => m.userId !== req.user.id);
+  save();
+  // Tell everyone, including the person who just left.
+  for (const m of wasMembers) events.publish(`user:${m.userId}`, { topic: 'group' });
+  res.json({ ok: true });
+});
+
+// Host closes the lobby. No money has moved before place, so there is nothing
+// to unwind — screens just update.
+router.post('/group-orders/:id/cancel', authRequired, (req, res) => {
+  const group = myGroup(req, res);
+  if (!group) return;
+  if (group.status !== 'open') return res.status(400).json({ error: 'This group order is closed.' });
+  if (group.hostUserId !== req.user.id) return res.status(403).json({ error: 'Only the host can cancel the group.' });
+  group.status = 'cancelled';
+  group.cancelledAt = Date.now();
+  save();
+  publishGroup(group);
+  res.json({ group: groupView(group, req.user.id) });
 });
 
 // Reviews from past diners, newest first — every order rating lands here.

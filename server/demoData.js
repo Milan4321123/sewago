@@ -54,6 +54,13 @@ function removeDemoData() {
   if (Array.isArray(db.deliveryRuns)) {
     db.deliveryRuns = db.deliveryRuns.filter((r) => !String(r.id || '').startsWith('demo-') && !demoStoreRef(r));
   }
+  if (Array.isArray(db.groupOrders)) {
+    db.groupOrders = db.groupOrders.filter(
+      (g) => !String(g.id || '').startsWith('demo-') &&
+        !String(g.restaurantId || '').startsWith('demo-') &&
+        !String(g.hostUserId || '').startsWith('demo-')
+    );
+  }
   if (Array.isArray(db.transactions)) {
     db.transactions = db.transactions.filter((txn) =>
       !String(txn.id || '').startsWith('demo-') &&
@@ -380,6 +387,8 @@ function addDemoPartnerInventory() {
     etaMinutes: 28,
     deliveryFee: 65,
     icon: '🥘',
+    // Eat-together offer: 4+ friends who order as a group save 10%.
+    groupDiscount: { pct: 10, minPeople: 4 },
     status: 'approved',
     reviewNote: '',
     submittedAt: now() - 13 * 24 * 60 * 60 * 1000,
@@ -754,6 +763,30 @@ function seedDemoData({ persist = true } = {}) {
   addOrder({ id: 'aarav-active-momo', user: users.aarav, restaurant: momo, itemIds: [['mg-1', 2], ['mg-3', 1]], status: 'active', ageSeconds: 28 });
   addOrder({ id: 'aarav-delivered-newa', user: users.aarav, restaurant, itemIds: [[demoId('menu', 'chatamari'), 1], [demoId('menu', 'bara'), 1]], status: 'delivered', ageSeconds: 86400 });
   addOrder({ id: 'maya-active-thakali', user: users.maya, restaurant: thakali, itemIds: [['tk-1', 1], ['tk-4', 1]], status: 'active', ageSeconds: 55 });
+
+  // An open "eat together" lobby so the group screens have life: Maya is
+  // hosting dinner at the demo restaurant tonight (or tomorrow if 19:30 is
+  // already too close), one friend short of the 4-person discount.
+  const groupAt = new Date(t);
+  groupAt.setHours(19, 30, 0, 0);
+  if (groupAt.getTime() < t + 45 * 60 * 1000) groupAt.setDate(groupAt.getDate() + 1);
+  db.groupOrders.push({
+    id: demoId('group', 'maya-newa-dinner'),
+    code: '824613',
+    restaurantId: restaurant.id,
+    restaurantName: restaurant.name,
+    hostUserId: users.maya.id,
+    mode: 'dinein',
+    scheduledFor: groupAt.getTime(),
+    status: 'open',
+    members: [
+      { userId: users.maya.id, name: users.maya.name, items: [{ id: demoId('menu', 'choila'), qty: 1 }], confirmed: true },
+      { userId: users.nisha.id, name: users.nisha.name, items: [{ id: demoId('menu', 'chatamari'), qty: 2 }], confirmed: true },
+      { userId: users.kabir.id, name: users.kabir.name, items: [{ id: demoId('menu', 'bara'), qty: 1 }], confirmed: true }
+    ],
+    orderId: null,
+    createdAt: t - 2 * 3600000
+  });
 
   addBooking({ id: 'aarav-lakeside', user: users.aarav, hotel: lakeside, room: lakeside.rooms[1], checkIn: daysFromNow(5), checkOut: daysFromNow(7), status: 'active', ageDays: 1 });
   addBooking({ id: 'aarav-city-view', user: users.aarav, hotel, room: hotel.rooms[0], checkIn: daysFromNow(12), checkOut: daysFromNow(13), status: 'active', ageDays: 0.5 });

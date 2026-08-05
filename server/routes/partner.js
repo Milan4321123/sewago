@@ -309,7 +309,9 @@ router.post('/partner/withdraw', authPartner, (req, res) => {
 
 /* ---------------- live order queue ---------------- */
 
-// What the restaurant needs to fulfil an order — no customer wallet data.
+// What the restaurant needs to fulfil an order — no customer wallet data, and
+// NEVER the collect code: the counter check proves nothing if the kitchen can
+// read the answer through the API.
 function partnerOrderView(order) {
   const o = orderWithStatus(order);
   return {
@@ -321,14 +323,27 @@ function partnerOrderView(order) {
     subtotal: o.subtotal,
     partnerCut: o.partnerCut || 0,
     deliveryLoc: o.deliveryLoc,
+    mode: o.mode || 'delivery',
+    scheduledFor: o.scheduledFor || null,
+    // Per-member breakdown for group orders (name · share) — no wallet data.
+    group: o.group || null,
     status: o.status,
     cancelReason: o.cancelReason || null,
     courier: o.courier || null,
     createdAt: o.createdAt,
     acceptedAt: o.acceptedAt || null,
+    readyAt: o.readyAt || null,
     pickedUpAt: o.pickedUpAt || null,
-    deliveredAt: o.deliveredAt || null
+    deliveredAt: o.deliveredAt || null,
+    collectedAt: o.collectedAt || null
   };
+}
+
+// Group members watch the 'group' topic — nudge them all when their order moves.
+function pingGroupMembers(order) {
+  if (!order.group) return;
+  const group = (db.groupOrders || []).find((g) => g.id === order.group.id);
+  if (group) for (const m of group.members) events.publish(`user:${m.userId}`, { topic: 'group' });
 }
 
 router.get('/partner/orders', authPartner, (req, res) => {
@@ -337,7 +352,7 @@ router.get('/partner/orders', authPartner, (req, res) => {
     .map(partnerOrderView)
     .reverse();
   // Actionable orders first, then the recent history.
-  const rank = { placed: 0, preparing: 1, out_for_delivery: 2 };
+  const rank = { placed: 0, preparing: 1, ready: 2, out_for_delivery: 2 };
   orders.sort((a, b) => (rank[a.status] ?? 9) - (rank[b.status] ?? 9));
   res.json({ orders: orders.slice(0, 40) });
 });
@@ -351,9 +366,11 @@ router.post('/partner/orders/:id/accept', authPartner, (req, res) => {
   order.status = 'preparing';
   order.acceptedAt = Date.now();
   save();
-  // Customer sees "preparing"; bike couriers get the delivery job offer.
+  // Customer sees "preparing"; bike couriers get the delivery job offer —
+  // unless the customer is walking to the counter themselves.
   events.publish(`user:${order.userId}`, { topic: 'order' });
-  events.publish('drivers:bike', { topic: 'delivery_request' });
+  if ((order.mode || 'delivery') === 'delivery') events.publish('drivers:bike', { topic: 'delivery_request' });
+  pingGroupMembers(order);
   events.publish('admin', { topic: 'orders' });
   res.json({ order: partnerOrderView(order) });
 });
@@ -361,16 +378,89 @@ router.post('/partner/orders/:id/accept', authPartner, (req, res) => {
 router.post('/partner/orders/:id/reject', authPartner, (req, res) => {
   const order = db.orders.find((o) => o.id === req.params.id && o.partnerId === req.partner.id);
   if (!order) return res.status(404).json({ error: 'Order not found.' });
-  if (orderWithStatus(order).status !== 'placed') {
+  const status = orderWithStatus(order).status;
+  // Order-ahead has the same trap as store pickups: once the food is cooking,
+  // the only other exit is a code an absent customer holds. Reject-at-ready is
+  // the no-show refund path — without it the money is stranded forever.
+  const noShow = (order.mode === 'pickup' || order.mode === 'dinein') &&
+    (status === 'preparing' || status === 'ready');
+  if (status !== 'placed' && !noShow) {
     return res.status(409).json({ error: 'Only unconfirmed orders can be rejected.' });
   }
   order.status = 'cancelled';
-  order.cancelReason = 'restaurant';
+  order.cancelReason = noShow ? 'not_collected' : 'restaurant';
   order.rejectNote = String((req.body || {}).note || '').slice(0, 200);
   order.cancelledAt = Date.now();
-  refundOrder(order, { label: `Restaurant couldn't take the order — refund: ${order.restaurantName}` });
+  refundOrder(order, {
+    label: noShow
+      ? `Order not collected — refund: ${order.restaurantName}`
+      : `Restaurant couldn't take the order — refund: ${order.restaurantName}`
+  });
   save();
   events.publish(`user:${order.userId}`, { topic: 'order' });
+  pingGroupMembers(order);
+  events.publish('admin', { topic: 'orders' });
+  res.json({ order: partnerOrderView(order) });
+});
+
+// Order-ahead only: the kitchen is done, the counter is waiting for the code.
+router.post('/partner/orders/:id/ready', authPartner, (req, res) => {
+  const order = db.orders.find((o) => o.id === req.params.id && o.partnerId === req.partner.id);
+  if (!order) return res.status(404).json({ error: 'Order not found.' });
+  if (order.mode !== 'pickup' && order.mode !== 'dinein') {
+    return res.status(400).json({ error: 'Delivery orders go out with a courier — only order-ahead is marked ready.' });
+  }
+  if (orderWithStatus(order).status !== 'preparing') {
+    return res.status(409).json({ error: 'Accept the order first.' });
+  }
+  order.status = 'ready';
+  order.readyAt = Date.now();
+  save();
+  events.publish(`user:${order.userId}`, { topic: 'order' });
+  pingGroupMembers(order);
+  events.publish('admin', { topic: 'orders' });
+  res.json({ order: partnerOrderView(order) });
+});
+
+// The customer read out their 4-digit code at the counter: the food changes
+// hands, and this is the moment the kitchen's income becomes really theirs
+// (mirrors the courier deliver handler's settlement). Wrong code → 400, no
+// state change.
+router.post('/partner/orders/:id/collected', authPartner, (req, res) => {
+  const order = db.orders.find((o) => o.id === req.params.id && o.partnerId === req.partner.id);
+  if (!order) return res.status(404).json({ error: 'Order not found.' });
+  if (order.mode !== 'pickup' && order.mode !== 'dinein') {
+    return res.status(400).json({ error: 'Only pickup and eat-there orders are collected at the counter.' });
+  }
+  const status = orderWithStatus(order).status;
+  // 'ready' is the normal moment; 'preparing' covers the customer who shows up
+  // early while the last plate is still being packed.
+  if (status !== 'ready' && status !== 'preparing') {
+    return res.status(409).json({ error: 'This order is not waiting to be collected.' });
+  }
+  const code = String((req.body || {}).code || '').trim();
+  if (!code || code !== order.collectCode) {
+    return res.status(400).json({ error: 'Wrong code — ask the customer for the 4-digit code in their app.' });
+  }
+  order.status = 'completed';
+  order.collectedAt = Date.now();
+  // Collection is the handover, so pending income settles into withdrawable
+  // earnings now — it can no longer be refunded, so it's truly theirs.
+  if (order.partnerCut && !order.partnerSettled) {
+    req.partner.pendingEarnings = (req.partner.pendingEarnings || 0) - order.partnerCut;
+    req.partner.earnings = (req.partner.earnings || 0) + order.partnerCut;
+    recordTxn('partner', req.partner, {
+      type: 'order_income',
+      label: `Order collected — income: ${order.restaurantName}`,
+      amount: order.partnerCut,
+      sign: 1,
+      refId: order.id
+    });
+    order.partnerSettled = true;
+  }
+  save();
+  events.publish(`user:${order.userId}`, { topic: 'order' });
+  pingGroupMembers(order);
   events.publish('admin', { topic: 'orders' });
   res.json({ order: partnerOrderView(order) });
 });
@@ -461,6 +551,31 @@ router.post('/partner/restaurants/:id/menu', authPartner, (req, res) => {
     photos: gallery.photos
   };
   restaurant.menu.push(item);
+  save();
+  res.json({ restaurant });
+});
+
+// Group discount: "N people or more who order together get X% off". One knob,
+// two numbers — validated here so the customer app can trust what it shows.
+// Sending neither number clears the offer.
+router.post('/partner/restaurants/:id/group-discount', authPartner, (req, res) => {
+  const restaurant = db.restaurants.find((r) => r.id === req.params.id && r.ownerId === req.partner.id);
+  if (!restaurant) return res.status(404).json({ error: 'Restaurant not found.' });
+  const { pct, minPeople } = req.body || {};
+  if (pct == null && minPeople == null) {
+    restaurant.groupDiscount = null;
+    save();
+    return res.json({ restaurant });
+  }
+  const p = Number(pct);
+  const n = Number(minPeople);
+  if (!Number.isInteger(p) || p < 1 || p > 50) {
+    return res.status(400).json({ error: 'Discount must be a whole number between 1% and 50%.' });
+  }
+  if (!Number.isInteger(n) || n < 2 || n > 50) {
+    return res.status(400).json({ error: 'Minimum group size must be between 2 and 50 people.' });
+  }
+  restaurant.groupDiscount = { pct: p, minPeople: n };
   save();
   res.json({ restaurant });
 });

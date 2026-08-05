@@ -30,10 +30,21 @@ const state = {
   deliverTo: '',
   deliverToLoc: null,
   foodPayMethod: 'wallet', // 'cash' = pay the courier at the door (COD)
+  foodMode: 'delivery', // 'delivery' | 'pickup' | 'dinein' (order-ahead)
+  foodWhen: 'asap', // 'asap' | minutes-from-now | 'custom' — order-ahead time
+  foodWhenTime: '', // HH:MM when foodWhen === 'custom'
   dismissedOrders: {},
   restaurant: null, // currently open menu
   cart: {}, // itemId -> qty
   orders: [],
+  groups: null, // my group orders (null until first load — SSE diffs need "loaded")
+  group: null, // open group takeover screen (one of state.groups)
+  groupMenu: null, // that group's restaurant (menu for the my-plate editor)
+  groupCart: {}, // itemId -> qty — my picks in the open group
+  groupStart: { restaurantId: '', mode: 'dinein', when: '60', whenTime: '' },
+  // shops
+  baskets: {}, // storeId -> { store, items } — one basket per shop, several at once
+  basketsSheet: false, // the all-baskets sheet is open
   // stays
   staySearch: { city: 'All', checkIn: '', checkOut: '' },
   hotels: null,
@@ -547,7 +558,10 @@ function renderTab() {
 // Counts hydrate lazily from whatever state is already loaded (boot, SSE,
 // a previous visit to the tab) — Home itself never fetches anything.
 function homeActiveCounts() {
-  const food = (state.orders || []).filter((o) => o.status !== 'delivered' && o.status !== 'cancelled').length;
+  // ORDER_DONE covers all three food endings: delivered (courier), completed
+  // (collected at the counter) and cancelled — so in-flight pickup/eat-there
+  // orders count on Home too.
+  const food = (state.orders || []).filter((o) => !ORDER_DONE.includes(o.status)).length;
   const shop = (state.shopOrders || []).filter((o) => o.status !== 'delivered' && o.status !== 'cancelled').length;
   return { food, shop };
 }
@@ -578,7 +592,7 @@ function homeView() {
     <div class="muted small" style="margin-top:3px">Good ${daypart} — what do you need today?</div>
   </div>
   ${rideLive ? homeCtxRow('rides', `🚗 ${RIDE_STEPS[RIDE_STEP_IDX[ride.status]]} — your ride is live`) : ''}
-  ${food ? homeCtxRow('food', `🍜 ${food} food order${food === 1 ? '' : 's'} on the way`) : ''}
+  ${food ? homeCtxRow('food', `🍜 ${food} food order${food === 1 ? '' : 's'} in progress`) : ''}
   ${shop ? homeCtxRow('shops', `🏪 ${shop} shop order${shop === 1 ? '' : 's'} in progress`) : ''}
   <div class="home-grid" style="margin-top:${rideLive || food || shop ? 16 : 0}px">
     ${TABS.map((t) => `
@@ -609,27 +623,33 @@ window.setTab = async (tab) => {
   state.tab = tab;
   localStorage.setItem('sewago_tab', tab); // reload lands back on the same tab
   state.restaurant = null;
+  state.group = null;
+  state.groupMenu = null;
   if (tab === 'home') {
-    // Back on the launcher: close service sub-screens. The basket survives —
-    // it follows you until it's ordered or cleared.
+    // Back on the launcher: close service sub-screens. The baskets survive —
+    // they follow you until they're ordered or cleared.
     state.shop = null;
-    state.basketSwitch = null;
+    state.basketsSheet = false;
+    state.showGroupStart = false;
+    state.showGroupJoin = false;
     state.showTaskForm = false;
     state.applyingTask = '';
   }
   try {
     if (tab === 'shops') {
       state.shop = null;
+      state.basketsSheet = false;
       const [o] = await Promise.all([api('/api/store-orders'), refreshShops(), loadSubscriptions()]);
       state.shopOrders = o.orders || [];
     } else if (tab === 'food') {
-      const [r, o] = await Promise.all([api('/api/restaurants'), api('/api/orders')]);
+      const [r, o, g] = await Promise.all([api('/api/restaurants'), api('/api/orders'), api('/api/group-orders')]);
       state.restaurants = r.restaurants;
       state.foodServiceFee = r.serviceFee || 0;
       state.deliveryFreeKm = r.deliveryFreeKm ?? 3;
       state.deliveryPerKm = r.deliveryPerKm ?? 15;
       state.deliveryMaxExtra = r.deliveryMaxExtra ?? 300;
       state.orders = o.orders;
+      state.groups = g.groups || [];
     } else if (tab === 'stays') {
       const [b, c] = await Promise.all([api('/api/bookings'), api('/api/cities')]);
       state.bookings = b.bookings;
@@ -1116,11 +1136,45 @@ window.cancelRide = async (fee) => {
 
 const ORDER_STEPS = ['Placed', 'Preparing', 'On the way', 'Delivered'];
 const ORDER_STEP_IDX = { placed: 0, preparing: 1, out_for_delivery: 2, delivered: 3 };
+// Order-ahead (pickup / eat-there) walks a different path: no courier leg —
+// the customer collects at the counter with a code.
+const AHEAD_STEPS = ['Sent', 'Cooking', 'Ready for you', 'Enjoy!'];
+const AHEAD_STEP_IDX = { placed: 0, preparing: 1, ready: 2, completed: 3 };
+// Terminal food statuses across all modes: courier delivered, counter
+// collected, or cancelled.
+const ORDER_DONE = ['delivered', 'completed', 'cancelled'];
+
+// "7:30 PM" for today, "Aug 6, 7:30 PM" otherwise — order-ahead times read the
+// way people say them.
+function fmtClock(ts) {
+  return new Date(ts).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+}
+
+function fmtWhen(ts) {
+  if (!ts) return 'ASAP';
+  return new Date(ts).toDateString() === new Date().toDateString() ? fmtClock(ts) : fmtDateTime(ts);
+}
+
+// Turn a when-choice ('asap' | minutes-from-now | 'custom' + HH:MM) into a
+// timestamp: null = ASAP, undefined = custom with nothing picked yet. A custom
+// clock time already behind us means tomorrow.
+function whenToTimestamp(when, timeStr) {
+  if (when === 'asap') return null;
+  if (when !== 'custom') return Date.now() + Number(when) * 60 * 1000;
+  if (!timeStr) return undefined;
+  const [h, m] = timeStr.split(':').map(Number);
+  const d = new Date();
+  d.setHours(h, m, 0, 0);
+  if (d.getTime() < Date.now() - 60 * 1000) d.setDate(d.getDate() + 1);
+  return d.getTime();
+}
 
 function foodView() {
   if (state.restaurant) return menuView();
+  if (state.group) return groupScreen();
   return `
     <div id="orders-slot">${ordersSlot()}</div>
+    ${eatTogetherSection()}
     <div class="section-title">Hungry? Order in 🍜</div>
     ${state.restaurants.map((r) => `
       <div class="tile" onclick="openRestaurant('${r.id}')">
@@ -1128,42 +1182,54 @@ function foodView() {
         <div>
           <h3>${esc(r.name)}${r.promotedUntil > Date.now() ? ' <span class="badge" style="background:#713f12;color:#fde68a">⭐ Featured</span>' : ''}</h3>
           <div class="sub">${esc(r.cuisine)} · ${r.etaMinutes} min · ${money(r.deliveryFee)} delivery</div>
+          ${r.groupDiscount ? `<div class="sub" style="color:var(--accent)">👥 ${r.groupDiscount.pct}% group discount</div>` : ''}
         </div>
         <div class="right"><span class="badge">${r.rating ? '★ ' + r.rating : 'NEW'}</span></div>
       </div>`).join('')}`;
 }
 
 function ordersSlot() {
-  // Fresh deliveries stay on screen until rated (or skipped) — one tap keeps
-  // restaurant ratings honest without nagging.
+  // Fresh deliveries (and counter collections) stay on screen until rated (or
+  // skipped) — one tap keeps restaurant ratings honest without nagging.
   const active = state.orders.filter((o) =>
-    (o.status !== 'delivered' && o.status !== 'cancelled') ||
-    (o.status === 'delivered' && !o.ratingStars && !state.dismissedOrders[o.id] &&
-      Date.now() - (o.deliveredAt || 0) < 60 * 60 * 1000));
+    !ORDER_DONE.includes(o.status) ||
+    ((o.status === 'delivered' || o.status === 'completed') && !o.ratingStars && !state.dismissedOrders[o.id] &&
+      Date.now() - (o.deliveredAt || o.collectedAt || 0) < 60 * 60 * 1000));
   if (active.length === 0) return '';
   return `<div class="section-title">Your orders, live 🔴</div>` + active.map((o) => {
-    const idx = ORDER_STEP_IDX[o.status] ?? 0;
+    // Order-ahead cards walk the counter steps; delivery cards are unchanged.
+    const ahead = o.mode === 'pickup' || o.mode === 'dinein';
+    const idx = (ahead ? AHEAD_STEP_IDX : ORDER_STEP_IDX)[o.status] ?? 0;
+    const done = o.status === 'delivered' || o.status === 'completed';
     return `
     <div class="card">
       <div class="row">
         <div>
-          <div><b>${o.restaurantIcon} ${esc(o.restaurantName)}</b></div>
+          <div><b>${o.restaurantIcon} ${esc(o.restaurantName)}</b>${
+            ahead ? ` <span class="badge">${o.mode === 'pickup' ? '🥡 PICKUP' : '🍽️ EAT THERE'}</span>` : ''}${
+            o.group ? ` <span class="badge green">👥 × ${o.group.size}</span>` : ''}</div>
           <div class="muted small">${o.items.map((i) => `${i.qty}× ${esc(i.name)}`).join(', ')}</div>
+          ${o.scheduledFor ? `<div class="muted small">⏰ for ${fmtWhen(o.scheduledFor)}</div>` : ''}
         </div>
         <div style="text-align:right">
           <b>${money(o.total)}</b>
           ${o.payment === 'cash' ? `<div class="muted small">💵 cash on delivery</div>` : ''}
         </div>
       </div>
-      ${o.payment === 'cash' && o.status !== 'delivered' && o.status !== 'cancelled'
+      ${o.payment === 'cash' && !ORDER_DONE.includes(o.status)
         ? `<div class="muted small" style="margin:8px 0;color:#fbbf24">💵 Have ${money(o.total)} in cash ready for the courier.</div>` : ''}
       ${o.fulfillment === 'live' && o.status === 'placed'
         ? `<div class="muted small" style="margin:8px 0">🕐 Waiting for ${esc(o.restaurantName)} to confirm your order…</div>` : ''}
-      ${stepper(ORDER_STEPS, idx)}
+      ${stepper(ahead ? AHEAD_STEPS : ORDER_STEPS, idx)}
+      ${ahead && !done && o.status !== 'cancelled' && o.collectCode ? `
+      <div class="code-card">
+        <div class="muted small">Show this at the counter</div>
+        <div class="code">${esc(o.collectCode)}</div>
+      </div>` : ''}
       ${o.courier ? `<div class="muted small" style="margin-top:8px">🛵 ${esc(o.courier.name)} is your courier · ${esc(o.courier.vehicle)} (${esc(o.courier.plate)})</div>` : ''}
       ${o.deliveryLoc ? `<div class="muted small" style="margin-top:4px">📍 Delivering to ${esc(o.deliveryLoc.name)}</div>` : ''}
       ${o.status === 'placed' ? `<button class="btn danger" style="margin-top:12px" onclick="cancelOrder('${o.id}')">Cancel order</button>` : ''}
-      ${o.status === 'delivered' && !o.ratingStars ? `
+      ${done && !o.ratingStars ? `
       <div class="divider"></div>
       <div style="text-align:center"><b>How was the food?</b></div>
       <div class="stars">
@@ -1213,6 +1279,9 @@ window.openRestaurant = (id) => {
   state.cart = {};
   state.deliverTo = '';
   state.deliverToLoc = null;
+  state.foodMode = 'delivery';
+  state.foodWhen = 'asap';
+  state.foodWhenTime = '';
   state.listingReviews = null;
   state._pageAnim = true;
   // Reviews load alongside the menu; the card fills in when they arrive.
@@ -1277,6 +1346,11 @@ function estimatedDeliveryFee(r) {
   return { fee: base + Math.min(state.deliveryMaxExtra ?? 300, extraKm * (state.deliveryPerKm ?? 15)), exact: true };
 }
 
+// Order-ahead only works at partner kitchens — sim restaurants have no counter.
+function activeFoodMode() {
+  return state.restaurant && state.restaurant.ownerId ? state.foodMode : 'delivery';
+}
+
 function cartTotals() {
   const r = state.restaurant;
   let count = 0;
@@ -1288,6 +1362,11 @@ function cartTotals() {
       subtotal += item.price * qty;
     }
   }
+  // Order-ahead has no courier leg: no delivery fee, no service fee — the food
+  // is the whole bill (mirrors the server exactly).
+  if (activeFoodMode() !== 'delivery') {
+    return { count, subtotal, serviceFee: 0, deliveryFee: 0, deliveryExact: true, total: subtotal };
+  }
   const serviceFee = state.foodServiceFee || 0;
   const delivery = estimatedDeliveryFee(r);
   return { count, subtotal, serviceFee, deliveryFee: delivery.fee, deliveryExact: delivery.exact, total: subtotal + delivery.fee + serviceFee };
@@ -1295,7 +1374,11 @@ function cartTotals() {
 
 function menuView() {
   const r = state.restaurant;
+  const mode = activeFoodMode();
   const { count, total, deliveryFee, deliveryExact } = cartTotals();
+  // The order-ahead clock, for the place button ("· eat there at 7:30 PM").
+  const when = whenToTimestamp(state.foodWhen, state.foodWhenTime);
+  const whenLabel = when === undefined ? 'at …' : when === null ? 'ASAP' : `at ${fmtClock(when)}`;
   return `
   <div class="row" style="margin-bottom:14px">
     <button class="btn ghost compact" onclick="closeMenu()">← Back</button>
@@ -1340,6 +1423,12 @@ function menuView() {
   }).join('')}
   ${r.ownerId && count > 0 ? `
   <div class="card">
+    <div class="pipe-tabs">
+      <button class="${mode === 'delivery' ? 'active' : ''}" onclick="setFoodMode('delivery')">🛵 Deliver</button>
+      <button class="${mode === 'pickup' ? 'active' : ''}" onclick="setFoodMode('pickup')">🥡 Pickup</button>
+      <button class="${mode === 'dinein' ? 'active' : ''}" onclick="setFoodMode('dinein')">🍽️ Eat there</button>
+    </div>
+    ${mode === 'delivery' ? `
     <label class="field"><span>Deliver to</span>
       <input id="deliver-to" list="deliver-places" value="${esc(state.deliverTo || '')}"
         placeholder="e.g. Thamel, New Baneshwor…" oninput="deliveryAddressTyped()" onchange="deliveryAddressChosen()" />
@@ -1353,7 +1442,17 @@ function menuView() {
     </div>
     ${state.foodPayMethod === 'cash'
       ? `<div class="muted small" style="text-align:center;margin-top:8px">Pay the courier at your door — no wallet top-up needed.</div>`
-      : `<div class="muted small" style="text-align:center;margin-top:8px">Paid from your wallet balance now.</div>`}
+      : `<div class="muted small" style="text-align:center;margin-top:8px">Paid from your wallet balance now.</div>`}` : `
+    <div class="muted small" style="margin-bottom:8px">When should it be ready?</div>
+    <div class="chips" style="margin-bottom:0">
+      <button class="chip ${state.foodWhen === 'asap' ? 'on' : ''}" onclick="setFoodWhen('asap')">ASAP</button>
+      <button class="chip ${state.foodWhen === '30' ? 'on' : ''}" onclick="setFoodWhen('30')">+30 min</button>
+      <button class="chip ${state.foodWhen === '60' ? 'on' : ''}" onclick="setFoodWhen('60')">+1 hr</button>
+      <button class="chip ${state.foodWhen === 'custom' ? 'on' : ''}" onclick="setFoodWhen('custom')">Pick a time</button>
+      ${state.foodWhen === 'custom' ? `<input type="time" id="food-when-time" value="${esc(state.foodWhenTime)}"
+        onchange="foodTimePicked(this.value)" style="width:auto;padding:6px 10px" />` : ''}
+    </div>
+    <div class="muted small" style="margin-top:10px">👛 Pay now — show your code at the counter and it's ready when you arrive.</div>`}
   </div>` : ''}
   <!-- Clearance for the fixed cart bar, which wraps to two lines with the fee
        breakdown — too little and it covers the payment picker above it. -->
@@ -1361,15 +1460,31 @@ function menuView() {
   ${count > 0 ? `
   <div class="cartbar">
     <button class="btn" onclick="placeOrder()">
-      Place order · ${count} item${count > 1 ? 's' : ''} · ${money(total)}
+      ${mode === 'delivery' ? `Place order · ${count} item${count > 1 ? 's' : ''} · ${money(total)}
       <span class="small" style="font-weight:600">(incl. ${money(deliveryFee)}${deliveryExact ? '' : '+'} delivery${
-        state.foodServiceFee ? ` + ${money(state.foodServiceFee)} service fee` : ''})</span>
+        state.foodServiceFee ? ` + ${money(state.foodServiceFee)} service fee` : ''})</span>`
+      : `Pay ${money(total)} · ${mode === 'pickup' ? 'pickup' : 'eat there'} ${whenLabel}`}
     </button>
   </div>` : ''}`;
 }
 
 window.setFoodPayMethod = (method) => {
   state.foodPayMethod = method;
+  render();
+};
+
+window.setFoodMode = (mode) => {
+  state.foodMode = mode;
+  render();
+};
+
+window.setFoodWhen = (when) => {
+  state.foodWhen = when;
+  render();
+};
+
+window.foodTimePicked = (value) => {
+  state.foodWhenTime = value;
   render();
 };
 
@@ -1395,29 +1510,35 @@ window.deliveryAddressChosen = () => {
 
 window.placeOrder = async () => {
   const items = Object.entries(state.cart).map(([id, qty]) => ({ id, qty }));
-  const addressInput = $('#deliver-to');
-  const typed = addressInput ? addressInput.value.trim() : '';
-  if (state.restaurant.ownerId && !typed && !state.deliverToLoc) {
-    return toast('Add a delivery location so the courier knows where to go.', true);
+  const mode = activeFoodMode();
+  const body = { restaurantId: state.restaurant.id, items, mode };
+  if (mode === 'delivery') {
+    const addressInput = $('#deliver-to');
+    const typed = addressInput ? addressInput.value.trim() : '';
+    if (state.restaurant.ownerId && !typed && !state.deliverToLoc) {
+      return toast('Add a delivery location so the courier knows where to go.', true);
+    }
+    body.deliveryTo = state.deliverToLoc && state.deliverToLoc.name === typed ? state.deliverToLoc : typed;
+    // Only partner restaurants can be COD (a real courier collects the cash).
+    body.payment = state.restaurant.ownerId ? state.foodPayMethod : 'wallet';
+  } else {
+    // Order-ahead is prepaid from the wallet — that's what lets the kitchen start.
+    body.payment = 'wallet';
+    const scheduledFor = whenToTimestamp(state.foodWhen, state.foodWhenTime);
+    if (scheduledFor === undefined) return toast('Pick a time, or choose ASAP.', true);
+    if (scheduledFor) body.scheduledFor = scheduledFor;
   }
-  const deliveryTo = state.deliverToLoc && state.deliverToLoc.name === typed ? state.deliverToLoc : typed;
   try {
-    const data = await api('/api/orders', {
-      method: 'POST',
-      body: {
-        restaurantId: state.restaurant.id,
-        items,
-        deliveryTo,
-        // Only partner restaurants can be COD (a real courier collects the cash).
-        payment: state.restaurant.ownerId ? state.foodPayMethod : 'wallet'
-      }
-    });
+    const data = await api('/api/orders', { method: 'POST', body });
     setUser(data.user);
+    const placed = data.order;
     state.restaurant = null;
     state.cart = {};
     const o = await api('/api/orders');
     state.orders = o.orders;
-    toast('Order placed! The kitchen is on it 👨‍🍳');
+    toast(mode === 'delivery'
+      ? 'Order placed! The kitchen is on it 👨‍🍳'
+      : `Paid ✓ — show code ${placed.collectCode} at the counter`);
     render();
   } catch (e) {
     toast(e.message, true);
@@ -1432,6 +1553,361 @@ window.cancelOrder = async (id) => {
     state.orders = o.orders;
     toast('Order cancelled — amount refunded.');
     render();
+  } catch (e) {
+    toast(e.message, true);
+  }
+};
+
+/* ---------------- group orders (eat together) ---------------- */
+/* A group is a lobby: the host opens it at a partner restaurant for a pickup
+   or eat-there time, friends join with a 6-digit code, everyone picks their
+   own plate and confirms, and the host places ONE order — each wallet pays its
+   own (discounted) share at that moment. SSE topic 'group' keeps every
+   member's screen live. */
+
+// Swap in a fresh server view of a group everywhere we hold one.
+function applyGroupUpdate(g) {
+  const groups = state.groups || [];
+  state.groups = groups.some((x) => x.id === g.id)
+    ? groups.map((x) => (x.id === g.id ? g : x))
+    : [g, ...groups];
+  if (state.group && state.group.id === g.id) state.group = g;
+}
+
+function eatTogetherSection() {
+  const groups = state.groups || [];
+  return `
+  <div class="section-title">Eat together 👥</div>
+  ${groups.map(groupRowCard).join('')}
+  <div class="card">
+    <div class="grid2">
+      <button class="btn ${state.showGroupStart ? '' : 'ghost'} compact" onclick="toggleGroupStart()">👥 Start a group order</button>
+      <button class="btn ${state.showGroupJoin ? '' : 'ghost'} compact" onclick="toggleGroupJoin()">🔢 Join with a code</button>
+    </div>
+    ${state.showGroupStart ? groupStartForm() : ''}
+    ${state.showGroupJoin ? `
+    <div class="inline-form">
+      <span>Type the 6-digit code your host shared</span>
+      <input id="join-code" inputmode="numeric" maxlength="6" placeholder="123456" />
+      <button class="btn" onclick="joinGroup()">Join</button>
+    </div>` : ''}
+    ${!groups.length && !state.showGroupStart && !state.showGroupJoin
+      ? `<div class="muted small" style="margin-top:10px">Order together, split the bill automatically — and unlock group discounts.</div>` : ''}
+  </div>`;
+}
+
+function groupRowCard(g) {
+  const saved = g.currentPct
+    ? `<span style="color:var(--accent)">💚 saving ${money(g.savings)}</span>`
+    : g.needMore && g.status === 'open'
+      ? `${g.needMore.people} more for ${g.needMore.pct}% off`
+      : '';
+  return `
+  <div class="card" style="cursor:pointer" onclick="openGroup('${g.id}')">
+    <div class="row">
+      <div class="grow">
+        <div style="font-weight:800">${g.restaurantIcon} ${esc(g.restaurantName)}</div>
+        <div class="muted small">${g.mode === 'dinein' ? '🍽️ eat there' : '🥡 pickup'} · ${fmtWhen(g.scheduledFor)} ·
+          ${g.members.length} ${g.members.length === 1 ? 'person' : 'people'}${saved ? ' · ' + saved : ''}</div>
+      </div>
+      ${g.status === 'open' ? '<span class="badge amber">OPEN</span>' : '<span class="badge">PLACED</span>'}
+    </div>
+  </div>`;
+}
+
+function groupStartForm() {
+  const live = state.restaurants.filter((r) => r.ownerId);
+  if (!live.length) return `<div class="muted small" style="margin-top:10px">No partner restaurants take group orders yet.</div>`;
+  const gs = state.groupStart;
+  return `
+  <div style="margin-top:12px">
+    <label class="field"><span>Where are you eating?</span>
+      <select id="gs-restaurant" onchange="groupStartChanged()">
+        ${live.map((r) => `<option value="${r.id}" ${gs.restaurantId === r.id ? 'selected' : ''}>${r.icon} ${esc(r.name)}${
+          r.groupDiscount ? ` — 👥 ${r.groupDiscount.pct}% off for ${r.groupDiscount.minPeople}+` : ''}</option>`).join('')}
+      </select>
+    </label>
+    <div class="pipe-tabs">
+      <button class="${gs.mode === 'pickup' ? 'active' : ''}" onclick="setGroupStartMode('pickup')">🥡 Pickup</button>
+      <button class="${gs.mode === 'dinein' ? 'active' : ''}" onclick="setGroupStartMode('dinein')">🍽️ Eat there</button>
+    </div>
+    <div class="muted small" style="margin-bottom:8px">When? At least 30 minutes from now, so friends have time to join.</div>
+    <div class="chips">
+      <button class="chip ${gs.when === '60' ? 'on' : ''}" onclick="setGroupStartWhen('60')">In 1 hour</button>
+      <button class="chip ${gs.when === '120' ? 'on' : ''}" onclick="setGroupStartWhen('120')">In 2 hours</button>
+      <button class="chip ${gs.when === 'custom' ? 'on' : ''}" onclick="setGroupStartWhen('custom')">Pick a time</button>
+      ${gs.when === 'custom' ? `<input type="time" id="gs-time" value="${esc(gs.whenTime)}"
+        onchange="groupStartTimePicked(this.value)" style="width:auto;padding:6px 10px" />` : ''}
+    </div>
+    <button class="btn" onclick="startGroup()">Open the group — friends join with your code</button>
+  </div>`;
+}
+
+window.toggleGroupStart = () => {
+  state.showGroupStart = !state.showGroupStart;
+  state.showGroupJoin = false;
+  render();
+};
+
+window.toggleGroupJoin = () => {
+  state.showGroupJoin = !state.showGroupJoin;
+  state.showGroupStart = false;
+  render();
+};
+
+// No render — a re-render would rebuild the select mid-tap. The choice is
+// re-applied via the `selected` attr whenever something else re-renders.
+window.groupStartChanged = () => {
+  state.groupStart.restaurantId = ($('#gs-restaurant') || {}).value || '';
+};
+
+window.setGroupStartMode = (mode) => {
+  state.groupStart.mode = mode;
+  render();
+};
+
+window.setGroupStartWhen = (when) => {
+  state.groupStart.when = when;
+  render();
+};
+
+window.groupStartTimePicked = (value) => {
+  state.groupStart.whenTime = value;
+  render();
+};
+
+window.startGroup = async () => {
+  const gs = state.groupStart;
+  const sel = $('#gs-restaurant');
+  const scheduledFor = whenToTimestamp(gs.when, gs.whenTime);
+  if (scheduledFor === undefined || scheduledFor === null) return toast('Pick a time first.', true);
+  try {
+    const data = await api('/api/group-orders', {
+      method: 'POST',
+      body: { restaurantId: sel ? sel.value : gs.restaurantId, mode: gs.mode, scheduledFor }
+    });
+    state.showGroupStart = false;
+    applyGroupUpdate(data.group);
+    openGroup(data.group.id);
+    toast('Group open — share the code so friends can join 👥');
+  } catch (e) {
+    toast(e.message, true);
+  }
+};
+
+window.joinGroup = async () => {
+  const code = (($('#join-code') || {}).value || '').trim();
+  try {
+    const data = await api('/api/group-orders/join', { method: 'POST', body: { code } });
+    state.showGroupJoin = false;
+    applyGroupUpdate(data.group);
+    openGroup(data.group.id);
+    toast(`You're in — ${data.group.restaurantName} with ${data.group.hostName} 🎉`);
+  } catch (e) {
+    toast(e.message, true);
+  }
+};
+
+window.openGroup = (id) => {
+  const g = (state.groups || []).find((x) => x.id === id);
+  if (!g) return;
+  state.group = g;
+  state.groupCart = {};
+  for (const line of g.myItems || []) state.groupCart[line.id] = line.qty;
+  state.groupPlaceArm = false;
+  state._pageAnim = true;
+  // The menu powers the my-plate editor; the screen fills in when it arrives.
+  state.groupMenu = null;
+  api(`/api/restaurants/${g.restaurantId}`).then((data) => {
+    if (state.group && state.group.restaurantId === data.restaurant.id) {
+      state.groupMenu = data.restaurant;
+      render();
+    }
+  }).catch(() => {});
+  render();
+};
+
+window.closeGroup = () => {
+  state.group = null;
+  state.groupMenu = null;
+  state._pageAnim = true;
+  render();
+};
+
+// The lobby: full-screen takeover like a shop front. Everyone sees the same
+// header / code / members; the middle is MY plate; the host holds the trigger.
+// After place it becomes the shared collect-code screen.
+function groupScreen() {
+  const g = state.group;
+  const isHost = g.hostUserId === state.user.id;
+  const open = g.status === 'open';
+  const menu = state.groupMenu;
+  const myCount = Object.values(state.groupCart).reduce((n, q) => n + q, 0);
+  const mySubtotal = menu
+    ? Object.entries(state.groupCart).reduce((sum, [id, qty]) => {
+      const item = menu.menu.find((m) => m.id === id);
+      return sum + (item ? item.price * qty : 0);
+    }, 0)
+    : ((g.members.find((m) => m.userId === state.user.id) || {}).subtotal || 0);
+  return `
+  <div class="row" style="margin-bottom:14px">
+    <button class="btn ghost compact" onclick="closeGroup()">← Food</button>
+    ${open ? '<span class="badge amber">OPEN — friends can join</span>' : '<span class="badge">PLACED</span>'}
+  </div>
+  <div class="card">
+    <div style="font-size:19px;font-weight:900">${g.restaurantIcon} ${esc(g.restaurantName)}</div>
+    <div class="muted small" style="margin-top:2px">${g.mode === 'dinein' ? '🍽️ Eat there' : '🥡 Pickup'} ·
+      ${fmtWhen(g.scheduledFor)} · hosted by ${isHost ? 'you' : esc(g.hostName)}</div>
+    ${open ? `
+    <div class="code-card">
+      <div class="muted small">Share this code with friends</div>
+      <div class="code">${esc(g.code)}</div>
+      <div class="muted small">They tap "Join with a code" on their Food tab</div>
+    </div>` : ''}
+    ${g.discount ? (g.currentPct
+      ? `<div class="eta-line" style="margin-top:10px">💚 Unlocked: ${g.currentPct}% off — saving ${money(g.savings)} together</div>`
+      : open
+        ? `<div class="eta-line" style="margin-top:10px">👥 ${g.discount.pct}% off when ${g.discount.minPeople} people confirm — ${g.needMore.people} more to go</div>`
+        : '') : ''}
+  </div>
+  ${g.order ? `
+  <div class="card">
+    ${stepper(AHEAD_STEPS, AHEAD_STEP_IDX[g.order.status] ?? 0)}
+    <div class="code-card">
+      <div class="muted small">Show this at the counter — any of you can collect</div>
+      <div class="code">${esc(g.order.collectCode)}</div>
+    </div>
+    <div class="muted small" style="text-align:center;margin-top:8px">${money(g.order.total)} paid — everyone covered their own share</div>
+  </div>` : ''}
+  <div class="card">
+    <div style="font-weight:900;margin-bottom:8px">Who's in (${g.members.length})</div>
+    ${g.members.map((m) => `
+    <div class="row" style="margin-bottom:8px">
+      <div class="grow">
+        <div style="font-weight:700">${esc(m.name)}${m.userId === g.hostUserId ? ' <span class="muted small">· host</span>' : ''}${
+          m.userId === state.user.id ? ' <span class="muted small">· you</span>' : ''}</div>
+        <div class="muted small">${m.itemCount ? `${m.itemCount} item${m.itemCount === 1 ? '' : 's'} · ${money(m.subtotal)}` : 'still picking…'}</div>
+      </div>
+      ${m.confirmed ? '<span class="badge">✓ IN</span>' : '<span class="badge gray">PICKING</span>'}
+    </div>`).join('')}
+  </div>
+  ${open ? (g.myConfirmed ? `
+  <div class="card">
+    <div class="row">
+      <div>
+        <div style="font-weight:900">Your part is locked in ✓</div>
+        <div class="muted small">${myCount} item${myCount === 1 ? '' : 's'} · ${money(mySubtotal)}${
+          g.currentPct ? ` → you pay ${money(Math.round(mySubtotal * (1 - g.currentPct / 100)))}` : ''}</div>
+      </div>
+      <button class="btn ghost compact" onclick="confirmGroupPart(false)">Edit again</button>
+    </div>
+  </div>` : `
+  <div class="section-title">Pick your food 🍽️</div>
+  ${menu ? menu.menu.map((m) => `
+  <div class="card">
+    <div class="row">
+      <div class="grow">
+        <div><b>${esc(m.name)}</b></div>
+        <div class="muted small">${esc(m.desc)}</div>
+        <div style="margin-top:6px;font-weight:800">${money(m.price)}</div>
+      </div>
+      ${qtyControl(state.groupCart[m.id] || 0, 'groupItemAdd', [m.id])}
+    </div>
+  </div>`).join('') : '<div class="muted small">Loading the menu…</div>'}
+  <button class="btn" ${myCount ? '' : 'disabled'} onclick="confirmGroupPart(true)">✓ Confirm my part · ${money(mySubtotal)}</button>`) : ''}
+  ${open && isHost ? (state.groupPlaceArm ? `
+  <div class="inline-form">
+    <span>This charges every confirmed member's wallet their own share${g.currentPct ? ` (${g.currentPct}% off)` : ''} and sends the kitchen one order.</span>
+    <button class="btn" onclick="placeGroupOrder()">Charge everyone · place it</button>
+    <button class="btn ghost" onclick="armGroupPlace(false)">Not yet</button>
+  </div>` : `
+  <button class="btn" style="margin-top:10px" ${g.confirmedCount ? '' : 'disabled'} onclick="armGroupPlace(true)">Place group order (charges everyone)</button>`) : ''}
+  ${open && isHost ? `<button class="btn danger" style="margin-top:8px" onclick="cancelGroup()">Cancel the group</button>` : ''}
+  ${open && !isHost ? `<button class="btn danger" style="margin-top:10px" onclick="leaveGroup()">Leave this group</button>` : ''}`;
+}
+
+window.groupItemAdd = (itemId, delta) => {
+  const next = (state.groupCart[itemId] || 0) + delta;
+  if (next <= 0) delete state.groupCart[itemId];
+  else state.groupCart[itemId] = Math.min(20, next);
+  render();
+  pushGroupItems();
+};
+
+// Debounced save — a burst of stepper taps sends one request. The reply is the
+// fresh group view (my edit also un-confirms me server-side).
+let groupItemsTimer;
+function pushGroupItems() {
+  clearTimeout(groupItemsTimer);
+  groupItemsTimer = setTimeout(async () => {
+    if (!state.group) return;
+    const items = Object.entries(state.groupCart).map(([id, qty]) => ({ id, qty }));
+    try {
+      const data = await api(`/api/group-orders/${state.group.id}/items`, { method: 'POST', body: { items } });
+      applyGroupUpdate(data.group);
+      render();
+    } catch (e) {
+      toast(e.message, true);
+    }
+  }, 450);
+}
+
+window.confirmGroupPart = async (confirm) => {
+  try {
+    if (confirm) {
+      // Flush pending stepper edits first so the server confirms what's on screen.
+      clearTimeout(groupItemsTimer);
+      const items = Object.entries(state.groupCart).map(([id, qty]) => ({ id, qty }));
+      const saved = await api(`/api/group-orders/${state.group.id}/items`, { method: 'POST', body: { items } });
+      applyGroupUpdate(saved.group);
+    }
+    const data = await api(`/api/group-orders/${state.group.id}/${confirm ? 'confirm' : 'unconfirm'}`, { method: 'POST' });
+    applyGroupUpdate(data.group);
+    toast(confirm ? "You're in — waiting for the host to place it ✓" : 'Change what you like, then confirm again.');
+    render();
+  } catch (e) {
+    toast(e.message, true);
+  }
+};
+
+window.armGroupPlace = (on) => {
+  state.groupPlaceArm = on;
+  render();
+};
+
+window.placeGroupOrder = async () => {
+  try {
+    const data = await api(`/api/group-orders/${state.group.id}/place`, { method: 'POST' });
+    state.groupPlaceArm = false;
+    applyGroupUpdate(data.group);
+    if (data.user) setUser(data.user);
+    // The host's copy of the order joins the live-orders slot too.
+    const o = await api('/api/orders').catch(() => null);
+    if (o) state.orders = o.orders;
+    toast(data.group.savings ? `Order placed — ${money(data.group.savings)} saved 🎉` : 'Group order placed 🎉');
+    render();
+  } catch (e) {
+    toast(e.message, true);
+  }
+};
+
+window.leaveGroup = async () => {
+  try {
+    await api(`/api/group-orders/${state.group.id}/leave`, { method: 'POST' });
+    state.groups = (state.groups || []).filter((x) => x.id !== state.group.id);
+    closeGroup();
+    toast('You left the group.');
+  } catch (e) {
+    toast(e.message, true);
+  }
+};
+
+window.cancelGroup = async () => {
+  try {
+    const data = await api(`/api/group-orders/${state.group.id}/cancel`, { method: 'POST' });
+    state.groups = (state.groups || []).filter((x) => x.id !== data.group.id);
+    closeGroup();
+    toast('Group cancelled — nobody was charged.');
   } catch (e) {
     toast(e.message, true);
   }
@@ -1893,6 +2369,7 @@ const STATUS_LABEL = {
   in_progress: ['On trip', 'amber'], completed: ['Completed', ''], cancelled: ['Cancelled', 'red'],
   placed: ['Placed', 'amber'], preparing: ['Preparing', 'amber'],
   out_for_delivery: ['On the way', 'amber'], delivered: ['Delivered', ''],
+  ready: ['Ready for you', 'amber'],
   active: ['Confirmed', '']
 };
 
@@ -2346,6 +2823,42 @@ function connectEvents() {
     if (msg.topic === 'order' && (state.tab === 'food' || state.tab === 'home')) {
       api('/api/orders').then((o) => { state.orders = o.orders; render(); }).catch(() => {});
     }
+    if (msg.topic === 'group') {
+      // A friend joined / picked / confirmed, or the host placed or cancelled —
+      // re-pull my groups, toast the headline moments, keep an open lobby live.
+      api('/api/group-orders').then((g) => {
+        const prev = state.groups;
+        const groups = g.groups || [];
+        if (Array.isArray(prev)) {
+          for (const next of groups) {
+            const before = prev.find((x) => x.id === next.id);
+            if (!before) continue;
+            const newcomer = next.members.find((m) => !before.members.some((b) => b.userId === m.userId));
+            if (newcomer && newcomer.userId !== state.user.id) toast(`${newcomer.name.split(' ')[0]} joined 🎉`);
+            if (before.status === 'open' && next.status === 'placed') {
+              toast(next.savings ? `Order placed — ${money(next.savings)} saved 🎉` : 'Group order placed 🎉');
+              // My share just left my wallet — refresh the chip.
+              api('/api/auth/me').then((me) => setUser(me.user)).catch(() => {});
+            }
+          }
+        }
+        state.groups = groups;
+        if (state.group) {
+          const cur = groups.find((x) => x.id === state.group.id);
+          if (cur) {
+            state.group = cur;
+          } else {
+            // The lobby I was looking at is gone: collected if it had been
+            // placed, otherwise the host closed it.
+            const wasPlaced = state.group.status === 'placed';
+            state.group = null;
+            state.groupMenu = null;
+            toast(wasPlaced ? 'Order collected — enjoy! 🍽️' : 'The host closed this group order.', !wasPlaced);
+          }
+        }
+        if (state.tab === 'food' || state.tab === 'home') render();
+      }).catch(() => {});
+    }
     if (msg.topic === 'store_order') {
       // The shopkeeper moved an order along. The moment one turns "ready" is
       // the come-and-get-it signal for a pickup order, so shout it.
@@ -2407,7 +2920,7 @@ setInterval(async () => {
       }
     }
     if (state.tab === 'food' && !state.restaurant &&
-        state.orders.some((o) => o.status !== 'delivered' && o.status !== 'cancelled')) {
+        state.orders.some((o) => !ORDER_DONE.includes(o.status))) {
       const o = await api('/api/orders');
       state.orders = o.orders;
       const slot = $('#orders-slot');
@@ -2501,44 +3014,59 @@ window.addEventListener('popstate', () => {
    you buy every week for a lower price.
 */
 
-/* ---------------- basket (one shop at a time) ---------------- */
-/* The basket outlives any single view: ADD from search, a category browse or a
-   shop front and the floating .basket-bar follows you around the tab. Lines
-   snapshot name/price for the bar's running total only — the shop front and the
-   server both recompute from the live shelf, so a stale snapshot never
+/* ---------------- baskets (one per shop, several at once) ---------------- */
+/* A basket per shop, all alive at once: ADD from search, a category browse or
+   any shop front and the right shop's basket grows — no "switch basket?"
+   interruption, the floating .basket-bar carries them all around the tab.
+   Lines snapshot name/price for the bar's running totals only — the shop front
+   and the server both recompute from the live shelf, so a stale snapshot never
    mischarges anyone. */
 
+const MAX_BASKETS = 5; // concurrent shops — enough for a real errand run
+
 function basketQty(storeId, itemId) {
-  const b = state.basket;
-  return b && b.store.id === storeId && b.items[itemId] ? b.items[itemId].qty : 0;
+  const b = state.baskets[storeId];
+  return b && b.items[itemId] ? b.items[itemId].qty : 0;
 }
 
-function basketSummary() {
-  const lines = state.basket ? Object.values(state.basket.items) : [];
+// Lines rolled up for ONE shop's basket.
+function basketSummary(b) {
+  const lines = b ? Object.values(b.items) : [];
   return {
     count: lines.reduce((n, l) => n + l.qty, 0),
     total: lines.reduce((n, l) => n + l.qty * l.price, 0)
   };
 }
 
-// The one write path. Adding from a different shop than the basket's asks which
-// basket survives (basketSwitchSheet) instead of silently merging or wiping.
+// Every basket rolled together, for the floating bar.
+function basketsOverview() {
+  const baskets = Object.values(state.baskets);
+  let count = 0;
+  let total = 0;
+  for (const b of baskets) {
+    const s = basketSummary(b);
+    count += s.count;
+    total += s.total;
+  }
+  return { baskets, count, total };
+}
+
+// The one write path: adding always lands in that shop's own basket.
 function basketChange(store, item, delta) {
-  if (state.basket && state.basket.store.id !== store.id) {
-    if (delta > 0) { state.basketSwitch = { store, item }; render(); }
-    return;
-  }
-  if (!state.basket) {
+  let b = state.baskets[store.id];
+  if (!b) {
     if (delta <= 0) return;
-    state.basket = { store, items: {} };
+    if (Object.keys(state.baskets).length >= MAX_BASKETS) {
+      return toast(`Baskets at ${MAX_BASKETS} shops is the limit — check one out first.`, true);
+    }
+    b = state.baskets[store.id] = { store, items: {} };
   }
-  const items = state.basket.items;
-  const line = items[item.id] || { id: item.id, name: item.name, price: item.price, qty: 0 };
+  const line = b.items[item.id] || { id: item.id, name: item.name, price: item.price, qty: 0 };
   line.qty = Math.min(50, line.qty + delta);
   line.price = item.price; // freshest price we've seen wins
-  if (line.qty <= 0) delete items[item.id];
-  else items[item.id] = line;
-  if (!Object.keys(items).length) state.basket = null;
+  if (line.qty <= 0) delete b.items[item.id];
+  else b.items[item.id] = line;
+  if (!Object.keys(b.items).length) delete state.baskets[store.id];
   render();
   if (delta > 0) {
     const bar = document.querySelector('.basket-bar');
@@ -2560,47 +3088,84 @@ function qtyControl(qty, fn, ids) {
   </div>`;
 }
 
-// Floating pill hugging the bottom edge on every shops surface except the
-// basket's own shop front (the full cartbar checkout takes over there).
-// Tapping it opens that shop — the basket IS the shop.
+// Floating pill hugging the bottom edge on every shops surface except a shop
+// front with lines of its own (the full cartbar checkout takes over there).
+// One basket: tapping opens that shop — the basket IS the shop. Several:
+// tapping opens the all-baskets sheet, one section per shop.
 function basketBar() {
-  const b = state.basket;
-  if (!b) return '';
-  const { count, total } = basketSummary();
-  return `
+  const { baskets, count, total } = basketsOverview();
+  if (!baskets.length) return '';
+  if (baskets.length === 1) {
+    const b = baskets[0];
+    return `
   <button class="basket-bar" onclick="openShopFront('${b.store.id}')" onanimationend="this.classList.remove('bump')">
     <span>${b.store.icon} ${count} item${count === 1 ? '' : 's'} · ${money(total)}</span>
     <span class="go">View basket →</span>
   </button>`;
+  }
+  return `
+  <button class="basket-bar" onclick="openBasketsSheet()" onanimationend="this.classList.remove('bump')">
+    <span>🧺 ${baskets.length} shops · ${count} item${count === 1 ? '' : 's'} · ${money(total)}</span>
+    <span class="go">View baskets →</span>
+  </button>`;
 }
 
-function basketSwitchSheet() {
-  const sw = state.basketSwitch;
-  if (!sw || !state.basket) return '';
-  const { count } = basketSummary();
+// All the baskets on one sheet: a section per shop with steppers, that shop's
+// subtotal and a checkout button that jumps into its shop front — checkout
+// itself stays per-shop, exactly as before.
+function basketsSheet() {
+  if (!state.basketsSheet) return '';
+  const { baskets } = basketsOverview();
+  if (!baskets.length) return '';
   return `
-  <div class="offer-sheet" onclick="if (event.target === this) dismissBasketSwitch()">
-    <div class="card">
-      <div style="font-weight:900;font-size:17px">Start a new basket at ${esc(sw.store.name)}?</div>
-      <div class="muted small" style="margin:8px 0 14px">
-        You have ${count} item${count === 1 ? '' : 's'} from ${esc(state.basket.store.name)} — one basket
-        at a time, so starting here clears that one.
+  <div class="offer-sheet" onclick="if (event.target === this) closeBasketsSheet()">
+    <div class="card" style="max-height:80vh;overflow-y:auto">
+      <div class="row" style="margin-bottom:4px">
+        <div style="font-weight:900;font-size:17px">Your baskets 🧺</div>
+        <button class="btn ghost compact" onclick="closeBasketsSheet()">Close</button>
       </div>
-      <button class="btn" onclick="confirmBasketSwitch()">Clear it — add this instead</button>
-      <button class="btn ghost" style="margin-top:8px" onclick="dismissBasketSwitch()">Keep my ${esc(state.basket.store.name)} basket</button>
+      ${baskets.map((b) => {
+        const { count, total } = basketSummary(b);
+        return `
+      <div class="divider"></div>
+      <div style="font-weight:900;margin-bottom:8px">${b.store.icon} ${esc(b.store.name)}</div>
+      ${Object.values(b.items).map((l) => `
+      <div class="row" style="margin-bottom:8px">
+        <div class="grow">
+          <div style="font-weight:700">${esc(l.name)}</div>
+          <div class="muted small">${money(l.price)} each</div>
+        </div>
+        ${qtyControl(l.qty, 'sheetBasketAdd', [b.store.id, l.id])}
+      </div>`).join('')}
+      <button class="btn" style="margin-top:4px" onclick="checkoutBasket('${b.store.id}')">
+        Checkout at ${esc(b.store.name)} · ${count} item${count === 1 ? '' : 's'} · ${money(total)}
+      </button>`;
+      }).join('')}
     </div>
   </div>`;
 }
 
-window.confirmBasketSwitch = () => {
-  const sw = state.basketSwitch;
-  state.basketSwitch = null;
-  if (!sw) return render();
-  state.basket = null;
-  basketChange(sw.store, sw.item, 1);
+window.openBasketsSheet = () => { state.basketsSheet = true; render(); };
+
+window.closeBasketsSheet = () => { state.basketsSheet = false; render(); };
+
+// Steppers inside the sheet edit the line snapshots directly.
+window.sheetBasketAdd = (storeId, itemId, delta) => {
+  const b = state.baskets[storeId];
+  const line = b && b.items[itemId];
+  if (!line) return;
+  basketChange(b.store, { id: line.id, name: line.name, price: line.price }, delta);
+  if (!Object.keys(state.baskets).length) {
+    state.basketsSheet = false; // last line of the last basket — drop the sheet
+    render();
+  }
 };
 
-window.dismissBasketSwitch = () => { state.basketSwitch = null; render(); };
+// The sheet's per-shop checkout: into that shop front, where the cartbar takes over.
+window.checkoutBasket = (storeId) => {
+  state.basketsSheet = false;
+  openShopFront(storeId);
+};
 
 // ADD straight from a search / category row — no need to open the shop first.
 window.searchBasketAdd = (storeId, itemId, delta) => {
@@ -2663,9 +3228,9 @@ function shopsView() {
   ${(state.subscriptions || []).length ? `
     <div class="section-title">Your subscriptions 🔁</div>
     ${state.subscriptions.map(subscriptionCard).join('')}` : ''}
-  ${state.basket ? '<div style="height:76px"></div>' : ''}
+  ${Object.keys(state.baskets).length ? '<div style="height:76px"></div>' : ''}
   ${basketBar()}
-  ${basketSwitchSheet()}`;
+  ${basketsSheet()}`;
 }
 
 // One search hit, two actions: ADD drops the product straight into the basket,
@@ -2748,9 +3313,9 @@ function shopOrderCard(o) {
       </div>
     </div>
     ${pickup && o.status === 'ready' && o.pickupCode ? `
-    <div style="margin-top:10px;text-align:center;border:1px dashed var(--accent);border-radius:12px;padding:10px">
+    <div class="code-card">
       <div class="muted small">Show this code at the counter</div>
-      <div style="font-size:30px;font-weight:900;letter-spacing:8px">${esc(o.pickupCode)}</div>
+      <div class="code">${esc(o.pickupCode)}</div>
     </div>` : ''}
     ${o.status === 'placed' ? `<button class="btn danger compact" style="margin-top:10px" onclick="cancelShopOrder('${o.id}')">Cancel order</button>` : ''}
   </div>`;
@@ -2758,8 +3323,8 @@ function shopOrderCard(o) {
 
 function shopDetailView() {
   const s = state.shop;
-  // The persistent basket IS the cart — but only when it belongs to this shop.
-  const mine = state.basket && state.basket.store.id === s.store.id ? state.basket : null;
+  // This shop's persistent basket IS the cart; other shops' baskets stay put.
+  const mine = state.baskets[s.store.id] || null;
   const cart = {};
   if (mine) for (const l of Object.values(mine.items)) cart[l.id] = l.qty;
   const lines = s.items.filter((i) => cart[i.id]);
@@ -2778,7 +3343,7 @@ function shopDetailView() {
   </div>
   ${s.items.length ? s.items.map((i) => shopItemRow(i, cart[i.id] || 0)).join('')
     : `<div class="empty"><div class="big">📦</div>This shop has not added items yet.</div>`}
-  <div style="height:${lines.length ? 190 : state.basket ? 140 : 70}px"></div>
+  <div style="height:${lines.length ? 190 : Object.keys(state.baskets).length ? 140 : 70}px"></div>
   ${lines.length ? `
   <div class="cartbar">
     ${canDeliver ? `
@@ -2800,8 +3365,8 @@ function shopDetailView() {
       <span class="small" style="font-weight:600">(${money(subtotal)} goods${fee ? ` + ${money(fee)} delivery` : ''}${service ? ` + ${money(service)} fee` : ''})</span>
     </button>
     ${fulfil === 'pickup' ? `<div class="muted small" style="text-align:center;margin-top:6px">Pack it while you walk over — show your code, grab it, go 🏃</div>` : ''}
-  </div>` : basketBar() /* browsing shop B with a shop-A basket: keep it a tap away */}
-  ${basketSwitchSheet()}`;
+  </div>` : basketBar() /* browsing shop B with baskets elsewhere: keep them a tap away */}
+  ${basketsSheet()}`;
 }
 
 function shopItemRow(i, qty) {
@@ -2836,21 +3401,23 @@ window.openShopFront = async (id) => {
     state.shop = data;
     state.shopFulfil = 'pickup';
     state.shopServiceFee = data.serviceFee || 0;
-    // The shelf is authoritative: sync basket snapshots to it (renames, price
-    // changes) and drop lines the shop no longer sells or has run out of.
-    if (state.basket && state.basket.store.id === data.store.id) {
-      for (const l of Object.values(state.basket.items)) {
+    // The shelf is authoritative: sync this shop's basket snapshots to it
+    // (renames, price changes) and drop lines the shop no longer sells or has
+    // run out of. Other shops' baskets are untouched.
+    const b = state.baskets[data.store.id];
+    if (b) {
+      for (const l of Object.values(b.items)) {
         const live = data.items.find((i) => i.id === l.id);
-        if (!live || !live.inStock) delete state.basket.items[l.id];
+        if (!live || !live.inStock) delete b.items[l.id];
         else { l.name = live.name; l.price = live.price; }
       }
-      if (!Object.keys(state.basket.items).length) state.basket = null;
+      if (!Object.keys(b.items).length) delete state.baskets[data.store.id];
     }
     render();
   } catch (e) { toast(e.message, true); }
 };
 
-// The basket survives leaving the shop — the floating bar keeps carrying it.
+// The baskets survive leaving the shop — the floating bar keeps carrying them.
 window.closeShopFront = () => { state.shop = null; render(); };
 
 window.shopCartAdd = (itemId, delta) => {
@@ -2909,12 +3476,13 @@ async function loadSubscriptions() {
 }
 
 window.placeShopOrder = async () => {
-  const mine = state.basket && state.basket.store.id === state.shop.store.id ? state.basket : null;
+  const storeId = state.shop.store.id;
+  const mine = state.baskets[storeId] || null;
   const items = mine ? Object.values(mine.items).map((l) => ({ itemId: l.id, qty: l.qty })) : [];
   if (!items.length) return;
   const canDeliver = (state.shop.store.deliveryFee || 0) > 0;
   const fulfilment = canDeliver && state.shopFulfil === 'delivery' ? 'delivery' : 'pickup';
-  const body = { storeId: state.shop.store.id, items, payment: state.shopPay === 'cash' ? 'cash' : 'wallet', fulfilment };
+  const body = { storeId, items, payment: state.shopPay === 'cash' ? 'cash' : 'wallet', fulfilment };
   if (fulfilment === 'delivery') {
     const where = (state.shopDeliverTo || '').trim();
     if (!where) return toast('Where should we deliver? Add a landmark or address.', true);
@@ -2924,7 +3492,7 @@ window.placeShopOrder = async () => {
     const data = await api('/api/store-orders', { method: 'POST', body });
     if (data.user) setUser(data.user);
     state.shop = null;
-    state.basket = null;
+    delete state.baskets[storeId]; // only this shop's basket clears — the rest keep waiting
     const o = await api('/api/store-orders');
     state.shopOrders = o.orders || [];
     toast(fulfilment === 'pickup' ? 'Order sent — we\'ll tell you when it\'s packed 🏪' : 'Order sent to the shop 🏪');

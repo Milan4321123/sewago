@@ -27,6 +27,7 @@ const state = {
   confirmReject: '', // order id with the reject inline-form open
   confirmRemove: '', // listing id with the remove inline-form open
   pickupFor: '', // store order id with the pickup-code inline-form open
+  groupSplit: '', // group order id with the who-pays-what breakdown open
   // General store (kirana) inventory
   stores: [],
   showStoreForm: false,
@@ -377,7 +378,7 @@ function disconnectEvents() {
 }
 setInterval(async () => {
   if (!state.partner) return;
-  const foodActive = state.orders.some((o) => ['placed', 'preparing', 'out_for_delivery'].includes(o.status));
+  const foodActive = state.orders.some((o) => ['placed', 'preparing', 'ready', 'out_for_delivery'].includes(o.status));
   const storeActive = state.storeOrders.some((o) => ['placed', 'accepted', 'ready'].includes(o.status));
   if (!foodActive && !storeActive) return;
   await reloadOrders();
@@ -726,7 +727,7 @@ function homeTab() {
   const hour = new Date().getHours();
   const hello = hour < 12 ? 'Good morning' : hour < 18 ? 'Namaste' : 'Good evening';
   const needAction = actionableOrderCount();
-  const inFlight = state.orders.filter((o) => ['preparing', 'out_for_delivery'].includes(o.status)).length
+  const inFlight = state.orders.filter((o) => ['preparing', 'ready', 'out_for_delivery'].includes(o.status)).length
     + state.storeOrders.filter((o) => ['accepted', 'ready'].includes(o.status)).length;
   const revenueToday = state.stores.reduce((sum, s) => sum + ((s.stats || {}).revenueToday || 0), 0);
   const lowStock = state.stores.reduce(
@@ -771,10 +772,22 @@ const ORDER_STATUS_LINE = {
   cancelled: '❌ Cancelled'
 };
 
+// Pickup / eat-there orders never see a courier — the customer walks to the
+// counter with a 4-digit code, so every line points at that moment instead.
+const AHEAD_STATUS_LINE = {
+  placed: '🕐 Waiting for you to confirm',
+  preparing: '👨‍🍳 Cooking — the customer comes to the counter',
+  ready: "🛎️ Ready — waiting for the customer's code",
+  completed: '✅ Collected at the counter',
+  cancelled: '❌ Cancelled'
+};
+
 // One stage per pipeline segment — food and store orders walk the same pipe.
 function orderStage(o) {
   if (o._kind === 'food') {
-    return { placed: 'new', preparing: 'progress', out_for_delivery: 'ready' }[o.status] || 'done';
+    // Order-ahead food parks at 'ready' until the counter code is read out;
+    // delivery food sits in the same column while the courier carries it.
+    return { placed: 'new', preparing: 'progress', ready: 'ready', out_for_delivery: 'ready' }[o.status] || 'done';
   }
   return { placed: 'new', accepted: 'progress', ready: 'ready' }[o.status] || 'done';
 }
@@ -794,7 +807,18 @@ function ordersTab() {
   ];
   const buckets = { new: [], progress: [], ready: [], done: [] };
   for (const o of all) buckets[orderStage(o)].push(o);
-  for (const k of Object.keys(buckets)) buckets[k].sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  // Done is history — newest first. In the working stages, ASAP orders stay
+  // newest-first and scheduled ones queue below them in kitchen order
+  // (soonest — or most overdue — promised time first).
+  for (const k of Object.keys(buckets)) {
+    buckets[k].sort((a, b) => {
+      if (k !== 'done') {
+        if (a.scheduledFor && b.scheduledFor) return a.scheduledFor - b.scheduledFor;
+        if (a.scheduledFor || b.scheduledFor) return a.scheduledFor ? 1 : -1;
+      }
+      return (b.createdAt || 0) - (a.createdAt || 0);
+    });
+  }
   buckets.done = buckets.done.slice(0, 12);
   const t = buckets[state.pipeTab] ? state.pipeTab : 'new';
   return `
@@ -813,6 +837,7 @@ window.setPipeTab = (tab) => {
   state.pipeTab = tab;
   state.confirmReject = '';
   state.pickupFor = '';
+  state.groupSplit = '';
   render();
 };
 
@@ -821,7 +846,55 @@ window.setConfirmReject = (id) => {
   renderKeepingForms();
 };
 
+// "7:30 PM" today, "Aug 7, 7:30 PM" otherwise — kitchens think in clock time,
+// so the date only shows up when the order is for another day.
+function fmtWhen(ts) {
+  const d = new Date(ts);
+  const time = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  if (d.toDateString() === new Date().toDateString()) return time;
+  return `${d.toLocaleDateString([], { month: 'short', day: 'numeric' })}, ${time}`;
+}
+
+const MODE_BADGE = {
+  delivery: '<span class="badge gray">🛵 DELIVERY</span>',
+  pickup: '<span class="badge blue">🥡 PICKUP</span>',
+  dinein: '<span class="badge blue">🍽️ EAT HERE</span>'
+};
+
+// Chip row under the order header: how the food leaves the kitchen, when it's
+// wanted (amber once the promised time has slipped), and the group tag.
+function orderChips(o) {
+  const overdue = o.scheduledFor && o.scheduledFor < Date.now()
+    && !['completed', 'delivered', 'cancelled'].includes(o.status);
+  return `
+    <div class="order-chips">
+      ${MODE_BADGE[o.mode || 'delivery']}
+      ${o.scheduledFor ? `<span class="badge ${overdue ? 'amber' : 'gray'}">${overdue ? '⚠️ was for' : '🕐 for'} ${fmtWhen(o.scheduledFor)}</span>` : ''}
+      ${o.group ? `<span class="badge green">👥 GROUP × ${o.group.size}${o.group.pct ? ` · ${o.group.pct}% off` : ''}</span>` : ''}
+    </div>`;
+}
+
+// Tap open to see who's paying what on a group order — names and shares only,
+// the wallets themselves stay on the customer side.
+function groupSplitBlock(o) {
+  if (!o.group || !Array.isArray(o.group.perMember)) return '';
+  if (state.groupSplit !== o.id) {
+    return `<button class="btn ghost compact" style="margin-top:8px" onclick="toggleGroupSplit('${o.id}')">👥 Who's in this group…</button>`;
+  }
+  return `
+  <div class="member-split">
+    ${o.group.perMember.map((m) => `
+    <div class="row">
+      <span>${esc(m.name)}</span>
+      <span>${o.group.pct ? `<s class="muted small">${money(m.subtotal)}</s> ` : ''}<b>${money(m.paid)}</b></span>
+    </div>`).join('')}
+    <button class="btn ghost compact" style="margin:8px 0" onclick="toggleGroupSplit('')">Hide</button>
+  </div>`;
+}
+
 function foodOrderCard(o) {
+  const ahead = o.mode === 'pickup' || o.mode === 'dinein';
+  const line = (ahead ? AHEAD_STATUS_LINE : ORDER_STATUS_LINE)[o.status];
   return `
   <div class="card" ${o.status === 'placed' ? 'style="border-color:var(--accent)"' : ''}>
     <div class="row">
@@ -836,8 +909,10 @@ function foodOrderCard(o) {
         <span class="badge ${o.status === 'placed' ? 'amber' : 'gray'}">⏱ ${timeAgo(o.createdAt)}</span>
       </div>
     </div>
-    <div class="muted small" style="margin-top:8px">${ORDER_STATUS_LINE[o.status] || esc(o.status)}${
+    ${orderChips(o)}
+    <div class="muted small" style="margin-top:8px">${line || esc(o.status)}${
       o.courier ? ` · 🛵 ${esc(o.courier.name)} (${esc(o.courier.plate)})` : ''}</div>
+    ${groupSplitBlock(o)}
     ${o.status === 'placed' ? (state.confirmReject === o.id ? `
     <div class="inline-form">
       <span>Reject this order? The customer is refunded in full.</span>
@@ -846,6 +921,23 @@ function foodOrderCard(o) {
     </div>` : `
     <button class="btn" style="margin-top:10px" onclick="acceptOrder('${o.id}')">✅ Accept — start cooking</button>
     <button class="btn ghost compact" style="margin-top:8px" onclick="setConfirmReject('${o.id}')">Reject…</button>`) : ''}
+    ${ahead && o.status === 'preparing' ? `
+    <button class="btn" style="margin-top:10px" onclick="markFoodReady('${o.id}')">🛎️ Food's ready</button>` : ''}
+    ${ahead && o.status === 'ready' ? (state.pickupFor === o.id ? `
+    <div class="inline-form">
+      <span>Customer's 4-digit code (in their app)</span>
+      <input id="collect-code-${o.id}" inputmode="numeric" placeholder="1234" />
+      <button class="btn" onclick="confirmCollected('${o.id}')">Confirm</button>
+      <button class="btn ghost" onclick="setPickupFor('')">Cancel</button>
+    </div>` : `
+    <button class="btn" style="margin-top:10px" onclick="setPickupFor('${o.id}')">🤝 ${o.mode === 'dinein' ? 'Served' : 'Handed over'} — enter code</button>`) : ''}
+    ${ahead && o.status === 'ready' ? (state.confirmReject === o.id ? `
+    <div class="inline-form">
+      <span>Customer never came? They get their money back in full.</span>
+      <button class="btn danger" onclick="rejectOrder('${o.id}')">Refund</button>
+      <button class="btn ghost" onclick="setConfirmReject('')">Back</button>
+    </div>` : `
+    <button class="btn ghost compact" style="margin-top:8px" onclick="setConfirmReject('${o.id}')">Never collected — refund…</button>`) : ''}
     ${o.status === 'cancelled' ? `<div class="muted small" style="margin-top:6px">Customer refunded in full.</div>` : ''}
   </div>`;
 }
@@ -871,6 +963,38 @@ window.rejectOrder = async (id) => {
   } catch (e) {
     toast(e.message, true);
   }
+};
+
+// Order-ahead: the kitchen is done — the customer's phone flips to "ready".
+window.markFoodReady = async (id) => {
+  try {
+    await api(`/api/partner/orders/${id}/ready`, { method: 'POST' });
+    toast('Marked ready — ask the customer for their code 🛎️');
+    await reloadOrders();
+    render();
+  } catch (e) {
+    toast(e.message, true);
+  }
+};
+
+// The counter moment: right code → food changes hands and income settles.
+window.confirmCollected = async (id) => {
+  const code = (($(`#collect-code-${id}`) || {}).value || '').trim();
+  if (!code) return toast("Enter the 4-digit code from the customer's app.", true);
+  try {
+    await api(`/api/partner/orders/${id}/collected`, { method: 'POST', body: { code } });
+    state.pickupFor = '';
+    toast('Collected — income settled 💰');
+    await reloadOrders();
+    render();
+  } catch (e) {
+    toast(e.message, true);
+  }
+};
+
+window.toggleGroupSplit = (id) => {
+  state.groupSplit = state.groupSplit === id ? '' : id;
+  renderKeepingForms();
 };
 
 const STORE_NEXT_ACTION = {
@@ -1231,8 +1355,55 @@ function restaurantDetail(r) {
     ${photoField(`menu-${r.id}`, '📷 Add a dish photo')}
     <button class="btn" onclick="addMenuItem('${r.id}')">Add item</button>
     ${removeListingBlock(r, 'Remove this restaurant', 'deleteRestaurant')}
+  </div>
+  ${groupDiscountCard(r)}`;
+}
+
+// One knob, two numbers: "N people or more who order together get X% off".
+// The server validates the same ranges the placeholders show.
+function groupDiscountCard(r) {
+  const gd = r.groupDiscount;
+  return `
+  <div class="card">
+    <div style="font-weight:900">Group discount 👥</div>
+    <div class="muted small" style="margin:6px 0 10px">
+      Groups that order together save you cooking runs — offer a discount to attract them.
+    </div>
+    ${gd ? `<div style="margin-bottom:4px"><span class="badge green">👥 ${gd.pct}% off for groups of ${gd.minPeople}+</span></div>` : ''}
+    <div class="inline-form">
+      <span>Discount % · how many people must confirm to unlock it</span>
+      <input id="gd-pct-${r.id}" type="number" inputmode="numeric" min="1" max="50" placeholder="% off (1–50)" value="${gd ? gd.pct : ''}" />
+      <input id="gd-min-${r.id}" type="number" inputmode="numeric" min="2" max="50" placeholder="people (2–50)" value="${gd ? gd.minPeople : ''}" />
+      <button class="btn" onclick="setGroupDiscount('${r.id}')">${gd ? 'Update' : 'Set discount'}</button>
+      ${gd ? `<button class="btn ghost" onclick="clearGroupDiscount('${r.id}')">Remove</button>` : ''}
+    </div>
   </div>`;
 }
+
+window.setGroupDiscount = async (rid) => {
+  try {
+    await api(`/api/partner/restaurants/${rid}/group-discount`, {
+      method: 'POST',
+      body: { pct: $(`#gd-pct-${rid}`).value, minPeople: $(`#gd-min-${rid}`).value }
+    });
+    await reload();
+    toast('Group discount is live 👥');
+    render();
+  } catch (e) {
+    toast(e.message, true);
+  }
+};
+
+window.clearGroupDiscount = async (rid) => {
+  try {
+    await api(`/api/partner/restaurants/${rid}/group-discount`, { method: 'POST', body: {} });
+    await reload();
+    toast('Group discount removed.');
+    render();
+  } catch (e) {
+    toast(e.message, true);
+  }
+};
 
 window.addMenuItem = async (rid) => {
   try {

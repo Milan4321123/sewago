@@ -39,7 +39,17 @@ function refundOrder(order, { label, txnType = 'food_refund' }) {
   // only the partner's pending income unwinds.
   const wasPrepaid = order.payment !== 'cash';
   const user = db.users.find((u) => u.id === order.userId);
-  if (user && wasPrepaid) {
+  if (wasPrepaid && order.group && Array.isArray(order.group.perMember)) {
+    // A group order was paid share-by-share, so it refunds share-by-share —
+    // crediting the whole total to the host would hand them their friends' money.
+    for (const share of order.group.perMember) {
+      const member = db.users.find((u) => u.id === share.userId);
+      if (member && share.paid) {
+        member.wallet += share.paid;
+        recordTxn('user', member, { type: txnType, label, amount: share.paid, sign: 1, refId: order.id });
+      }
+    }
+  } else if (user && wasPrepaid) {
     user.wallet += order.total;
     recordTxn('user', user, { type: txnType, label, amount: order.total, sign: 1, refId: order.id });
   }
