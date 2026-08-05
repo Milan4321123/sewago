@@ -729,4 +729,180 @@ router.post('/driver/logout', authDriver, (req, res) => {
   res.json({ ok: true });
 });
 
+/* ---------------- batched courier runs (shop deliveries) ---------------- */
+
+const runs = require('../deliveryRuns');
+
+// One endpoint for "what should I be doing?": the run in progress, or the one
+// currently being offered to me.
+router.get('/driver/run', authDriver, (req, res) => {
+  const active = runs.runForCourier(req.driver.id);
+  if (active) return res.json({ run: runs.runView(active), offered: false });
+  const offered = runs.offeredRunFor(req.driver.id);
+  res.json({ run: runs.runView(offered), offered: !!offered });
+});
+
+router.post('/driver/runs/:id/accept', authDriver, (req, res) => {
+  const run = db.deliveryRuns.find((r) => r.id === req.params.id);
+  if (!run) return res.status(404).json({ error: 'That run is no longer available.' });
+  if (runs.runForCourier(req.driver.id)) {
+    return res.status(409).json({ error: 'Finish your current run first.' });
+  }
+  if (run.status !== 'offered' || !run.offer || run.offer.driverId !== req.driver.id) {
+    return res.status(409).json({ error: 'That run went to another rider.' });
+  }
+  if (run.offer.expiresAt <= Date.now()) {
+    return res.status(409).json({ error: 'That offer expired.' });
+  }
+  // Re-check the float at the moment of accepting — the rider may have taken on
+  // cash elsewhere since the offer was made.
+  if (!cashJobFitsFloat(req.driver, run.cashToCollect)) {
+    return res.status(402).json({
+      error: `This run collects Rs ${run.cashToCollect} in cash — over your float. Settle up first.`
+    });
+  }
+  run.status = 'collecting';
+  run.courierId = req.driver.id;
+  run.courier = driverPublic(req.driver);
+  run.acceptedAt = Date.now();
+  for (const orderId of run.orderIds) {
+    const order = db.storeOrders.find((o) => o.id === orderId);
+    if (order) {
+      order.courierId = req.driver.id;
+      order.courier = run.courier;
+      events.publish(`user:${order.userId}`, { topic: 'store_order' });
+      events.publish(`partner:${order.partnerId}`, { topic: 'store_orders' });
+    }
+  }
+  save();
+  res.json({ run: runs.runView(run) });
+});
+
+router.post('/driver/runs/:id/decline', authDriver, (req, res) => {
+  const run = db.deliveryRuns.find((r) => r.id === req.params.id);
+  if (!run || !run.offer || run.offer.driverId !== req.driver.id) {
+    return res.status(404).json({ error: 'Run not found.' });
+  }
+  run.offer.declined = [...new Set([...(run.offer.declined || []), req.driver.id])];
+  run.offer.driverId = null;
+  run.offer.expiresAt = 0;
+  run.status = 'forming'; // the sweep offers it to the next rider
+  save();
+  res.json({ ok: true });
+});
+
+// Complete a stop. Pickups just tick off; a dropoff is where the money for that
+// order actually settles.
+router.post('/driver/runs/:id/stops/:seq/done', authDriver, (req, res) => {
+  const run = db.deliveryRuns.find((r) => r.id === req.params.id && r.courierId === req.driver.id);
+  if (!run) return res.status(404).json({ error: 'Run not found.' });
+  if (run.status === 'completed' || run.status === 'cancelled') {
+    return res.status(400).json({ error: 'This run is finished.' });
+  }
+  const seq = Number(req.params.seq);
+  const stop = run.stops.find((s) => s.seq === seq);
+  if (!stop) return res.status(404).json({ error: 'Stop not found.' });
+  if (stop.done) return res.status(400).json({ error: 'That stop is already done.' });
+  // Stops are worked in order so the route stays sane and money settles predictably.
+  const firstOpen = run.stops.find((s) => !s.done);
+  if (firstOpen && firstOpen.seq !== seq) {
+    return res.status(400).json({ error: `Do stop ${firstOpen.seq + 1} first.` });
+  }
+
+  stop.done = true;
+  stop.doneAt = Date.now();
+
+  if (stop.type === 'pickup') {
+    for (const orderId of stop.orderIds) {
+      const order = db.storeOrders.find((o) => o.id === orderId);
+      if (order && order.status === 'ready') {
+        order.status = 'collected';
+        order.collectedAt = Date.now();
+        events.publish(`user:${order.userId}`, { topic: 'store_order' });
+        events.publish(`partner:${order.partnerId}`, { topic: 'store_orders' });
+      }
+    }
+    if (run.stops.every((s) => s.type !== 'pickup' || s.done)) run.status = 'delivering';
+  } else {
+    const order = db.storeOrders.find((o) => o.id === stop.orderId);
+    if (order && order.status !== 'delivered' && order.status !== 'cancelled') {
+      order.status = 'delivered';
+      order.deliveredAt = Date.now();
+      settleStoreOrderOnDelivery(order, req.driver);
+      events.publish(`user:${order.userId}`, { topic: 'store_order' });
+      events.publish(`partner:${order.partnerId}`, { topic: 'store_orders' });
+    }
+  }
+
+  let mustSettle = false;
+  if (run.stops.every((s) => s.done)) {
+    run.status = 'completed';
+    run.completedAt = Date.now();
+    // The rider is paid for the whole run once, on completion.
+    req.driver.earnings = (req.driver.earnings || 0) + run.payout;
+    recordTxn('driver', req.driver, {
+      type: 'run_payout',
+      label: `Delivery run: ${run.orderIds.length} orders, ${run.stops.length} stops`,
+      amount: run.payout,
+      sign: 1,
+      refId: run.id
+    });
+    recordPlatformRevenue({
+      source: 'courier_payout',
+      label: `Courier run payout — ${req.driver.name}`,
+      amount: -run.payout,
+      refId: run.id
+    });
+    mustSettle = driverOwesTooMuch(req.driver);
+    if (mustSettle) req.driver.online = false;
+  }
+  save();
+  events.publish('admin', { topic: 'orders' });
+  res.json({ run: runs.runView(run), driver: profile(req.driver), mustSettle });
+});
+
+// Money for one shop order, at the moment the customer receives it.
+function settleStoreOrderOnDelivery(order, courier) {
+  const owner = db.partners.find((p) => p.id === order.partnerId);
+  if (order.payment === 'cash') {
+    // The courier now holds the customer's cash for this order and owes it in.
+    courier.earnings = (courier.earnings || 0) - order.total;
+    recordTxn('driver', courier, {
+      type: 'cod_collected',
+      label: `Cash collected: ${order.storeName}`,
+      amount: order.total,
+      sign: -1,
+      refId: order.id
+    });
+    if (owner && !order.partnerSettled) {
+      owner.earnings = (owner.earnings || 0) + order.partnerCut;
+      recordTxn('partner', owner, {
+        type: 'store_income',
+        label: `Order delivered — income: ${order.storeName}`,
+        amount: order.partnerCut,
+        sign: 1,
+        refId: order.id
+      });
+    }
+    recordPlatformRevenue({
+      source: 'store_commission',
+      label: `Store commission (cash): ${order.storeName}`,
+      amount: order.commission,
+      refId: order.id
+    });
+  } else if (owner && !order.partnerSettled) {
+    // Prepaid: the shop's pending income becomes withdrawable now.
+    owner.pendingEarnings = (owner.pendingEarnings || 0) - order.partnerCut;
+    owner.earnings = (owner.earnings || 0) + order.partnerCut;
+    recordTxn('partner', owner, {
+      type: 'store_income',
+      label: `Order delivered — income: ${order.storeName}`,
+      amount: order.partnerCut,
+      sign: 1,
+      refId: order.id
+    });
+  }
+  order.partnerSettled = true;
+}
+
 module.exports = router;

@@ -15,6 +15,7 @@ const {
   moveStock, reorderSuggestions, storeStats, lowStockThreshold, canManageStore,
   publicItem, publicStore
 } = require('../stores');
+const search = require('../storeSearch');
 
 const { authPartner, requirePartnerKyc, galleryFrom } = partnerRoutes;
 const router = express.Router();
@@ -122,6 +123,7 @@ router.get('/partner/stores', authPartner, (req, res) => {
     .map((s) => ({
       ...publicStore(s),
       status: s.status,
+      locPinned: !!s.locPinned,
       reviewNote: s.reviewNote || '',
       stats: storeStats(s),
       helpers: (s.helpers || []).filter((h) => h.status === 'active').length
@@ -140,6 +142,18 @@ router.patch('/partner/stores/:id', authPartner, (req, res) => {
   }
   if (body.name && String(body.name).trim().length >= 2) store.name = String(body.name).trim().slice(0, 60);
   if (body.icon) store.icon = String(body.icon).slice(0, 8);
+  // A precise pin dropped from the shop's own phone beats a typed area name —
+  // this is what puts the shop on the customer's map and in "near me".
+  if (body.lat !== undefined && body.lng !== undefined) {
+    const resolved = resolveLocation({ lat: body.lat, lng: body.lng, name: body.locName || store.area || store.name });
+    if (resolved.error === 'outside') {
+      return res.status(400).json({ error: 'That location is outside the service area.' });
+    }
+    if (resolved.error) return res.status(400).json({ error: 'Could not read that location.' });
+    store.loc = { name: resolved.name, lat: resolved.lat, lng: resolved.lng };
+    store.locPinned = true;
+  }
+  search.indexStore(store); // re-cell the shop if it moved
   save();
   res.json({ store: { ...publicStore(store), status: store.status } });
 });
@@ -215,6 +229,7 @@ function addItem(store, body, actor) {
   };
   store.items.push(item);
   if (stock > 0) moveStock(store, item, { qty: stock, reason: 'initial_count', ...actor });
+  search.indexItem(store, item);
   return { item };
 }
 
@@ -275,6 +290,7 @@ router.patch('/partner/stores/:id/items/:itemId', authPartner, (req, res) => {
     item.photos = gallery.photos;
   }
   item.updatedAt = Date.now();
+  search.indexItem(store, item); // a rename or recategorise changes what it matches
   save();
   res.json({ item });
 });
@@ -287,6 +303,7 @@ router.delete('/partner/stores/:id/items/:itemId', authPartner, (req, res) => {
   // Archive rather than delete: past orders and the stock ledger still name it.
   item.archived = true;
   item.updatedAt = Date.now();
+  search.removeItem(store.id, item.id);
   save();
   res.json({ ok: true });
 });
@@ -444,20 +461,59 @@ router.post('/stores/:id/helper/items/:itemId/count', authRequired, (req, res) =
 
 /* ---------------- customer: browse ---------------- */
 
+// Where the customer is, if their phone shared it. Everything else degrades
+// gracefully to "no distance" rather than failing.
+function pointFrom(query) {
+  const lat = Number(query.lat);
+  const lng = Number(query.lng);
+  return Number.isFinite(lat) && Number.isFinite(lng) ? { lat, lng } : { lat: null, lng: null };
+}
+
+function radiusFrom(query) {
+  const r = Number(query.radiusKm);
+  return Number.isFinite(r) && r > 0 ? Math.min(25, r) : 5;
+}
+
+// "What do you need?" — search products across every shop at once. This is the
+// front door of the marketplace, so it is index-backed and paginated.
+router.get('/store-search', authRequired, (req, res) => {
+  const { lat, lng } = pointFrom(req.query);
+  const out = search.searchItems({
+    q: String(req.query.q || '').slice(0, 60),
+    lat, lng,
+    radiusKm: radiusFrom(req.query),
+    category: String(req.query.category || '').slice(0, 40),
+    sort: ['near', 'cheap', 'name'].includes(req.query.sort) ? req.query.sort : 'near',
+    inStockOnly: req.query.inStock !== 'all',
+    page: Number(req.query.page) || 1,
+    limit: Number(req.query.limit) || 20
+  });
+  res.json({ ...out, serviceFee: STORE_SERVICE_FEE });
+});
+
+router.get('/store-categories', authRequired, (req, res) => {
+  const { lat, lng } = pointFrom(req.query);
+  res.json({ categories: search.categoriesNear({ lat, lng, radiusKm: radiusFrom(req.query) }) });
+});
+
 router.get('/stores', authRequired, (req, res) => {
-  const stores = db.stores.filter(storeIsLive).map(publicStore);
-  res.json({ stores, serviceFee: STORE_SERVICE_FEE });
+  const { lat, lng } = pointFrom(req.query);
+  const rows = search.nearbyStores({ lat, lng, radiusKm: radiusFrom(req.query), limit: Number(req.query.limit) || 30 });
+  const stores = rows.map((r) => ({ ...publicStore(r.store), distanceKm: r.distanceKm }));
+  res.json({ stores, serviceFee: STORE_SERVICE_FEE, located: lat !== null });
 });
 
 router.get('/stores/:id', authRequired, (req, res) => {
   const store = storeById(req.params.id);
   if (!storeIsLive(store)) return res.status(404).json({ error: 'Shop not found.' });
+  const { lat, lng } = pointFrom(req.query);
+  const distanceKm = search.storeDistance(store, Number.isFinite(lat) ? { lat, lng } : null);
   const subs = subscribedItemIds(req.user.id, store.id);
   const items = store.items
     .filter((i) => !i.archived)
     .map((i) => publicItem(i, { subscribedIds: subs }))
     .sort((a, b) => Number(b.inStock) - Number(a.inStock) || a.name.localeCompare(b.name));
-  res.json({ store: publicStore(store), items, serviceFee: STORE_SERVICE_FEE });
+  res.json({ store: { ...publicStore(store), distanceKm }, items, serviceFee: STORE_SERVICE_FEE });
 });
 
 /* ---------------- customer: subscriptions ---------------- */

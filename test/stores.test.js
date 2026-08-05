@@ -379,3 +379,141 @@ test('a closed shop cannot be ordered from', async () => {
   assert.equal(order.status, 409);
   assert.match(order.data.error, /closed/i);
 });
+
+/* ---------------- marketplace: location, search, browse ---------------- */
+
+// Thamel and Patan are ~5 km apart — far enough to test radius filtering.
+const THAMEL = { lat: 27.7154, lng: 85.3123 };
+const PATAN = { lat: 27.6727, lng: 85.3255 };
+
+async function shopAt(name, point, items) {
+  const shop = await openShop(name);
+  await api(`/partner/stores/${shop.storeId}`, {
+    method: 'PATCH', token: shop.token, body: { lat: point.lat, lng: point.lng, locName: name }
+  });
+  for (const it of items) {
+    await api(`/partner/stores/${shop.storeId}/items`, { method: 'POST', token: shop.token, body: it });
+  }
+  return shop;
+}
+
+test('a shopkeeper pins the shop location and customers see the real distance', async () => {
+  const shop = await shopAt('Pinned Pasal', THAMEL, [{ name: 'Chini', unit: 'kg', price: 100, stock: 10 }]);
+  const { token: cust } = await registerUser('locator');
+
+  const near = await api(`/stores?lat=${THAMEL.lat}&lng=${THAMEL.lng}&radiusKm=1`, { token: cust });
+  assert.equal(near.status, 200);
+  assert.equal(near.data.located, true);
+  const mine = near.data.stores.find((s) => s.id === shop.storeId);
+  assert.ok(mine, 'a shop pinned at my location is in the nearby list');
+  assert.ok(mine.distanceKm <= 0.2, `should be right here, got ${mine.distanceKm} km`);
+
+  // From Patan the same shop is out of a 1 km radius.
+  const far = await api(`/stores?lat=${PATAN.lat}&lng=${PATAN.lng}&radiusKm=1`, { token: cust });
+  assert.ok(!far.data.stores.some((s) => s.id === shop.storeId), 'a shop 5 km away is not "nearby"');
+
+  // Widen the radius and it comes back, with an honest distance.
+  const wide = await api(`/stores?lat=${PATAN.lat}&lng=${PATAN.lng}&radiusKm=10`, { token: cust });
+  const found = wide.data.stores.find((s) => s.id === shop.storeId);
+  assert.ok(found && found.distanceKm > 3 && found.distanceKm < 8, `expected ~5 km, got ${found && found.distanceKm}`);
+});
+
+test('product search finds the same item across different shops, nearest first', async () => {
+  const nearShop = await shopAt('Near Pasal', THAMEL, [{ name: 'Surf Excel', unit: 'packet', price: 250, stock: 5, category: 'Household' }]);
+  const farShop = await shopAt('Far Pasal', PATAN, [{ name: 'Surf Excel', unit: 'packet', price: 200, stock: 5, category: 'Household' }]);
+  const { token: cust } = await registerUser('searcher');
+
+  const res = await api(`/store-search?q=surf&lat=${THAMEL.lat}&lng=${THAMEL.lng}&radiusKm=10`, { token: cust });
+  assert.equal(res.status, 200);
+  const rows = res.data.results.filter((r) => [nearShop.storeId, farShop.storeId].includes(r.storeId));
+  assert.equal(rows.length, 2, 'both shops stocking it are returned');
+  assert.equal(rows[0].storeId, nearShop.storeId, 'the closer shop comes first by default');
+  assert.ok(rows[0].distanceKm < rows[1].distanceKm);
+
+  // Sorting by price flips the order — the cheaper shop is the far one.
+  const cheap = await api(`/store-search?q=surf&lat=${THAMEL.lat}&lng=${THAMEL.lng}&radiusKm=10&sort=cheap`, { token: cust });
+  const cheapRows = cheap.data.results.filter((r) => [nearShop.storeId, farShop.storeId].includes(r.storeId));
+  assert.equal(cheapRows[0].storeId, farShop.storeId, 'cheapest first when asked');
+  assert.equal(cheapRows[0].price, 200);
+
+  // Partial words work as the customer types.
+  const partial = await api(`/store-search?q=sur&lat=${THAMEL.lat}&lng=${THAMEL.lng}&radiusKm=10`, { token: cust });
+  assert.ok(partial.data.results.some((r) => r.name === 'Surf Excel'), 'prefix search matches');
+});
+
+test('search only shows what is really on the shelf, and updates when it changes', async () => {
+  const shop = await shopAt('Stock Pasal', THAMEL, [{ name: 'Rara Noodles', unit: 'packet', price: 25, stock: 2 }]);
+  const { token: cust } = await registerUser('stockseeker');
+  const find = () => api(`/store-search?q=rara&lat=${THAMEL.lat}&lng=${THAMEL.lng}&radiusKm=2`, { token: cust });
+
+  const inv = await api(`/partner/stores/${shop.storeId}/inventory`, { token: shop.token });
+  const itemId = inv.data.items[0].id;
+
+  assert.equal((await find()).data.results.length, 1);
+
+  // Sell the last two over the counter — it must drop out of search.
+  await api(`/partner/stores/${shop.storeId}/items/${itemId}/sold`, { method: 'POST', token: shop.token, body: { qty: 2 } });
+  assert.equal((await find()).data.results.length, 0, 'sold out means it stops appearing');
+
+  // Restock and it returns, with no re-indexing needed.
+  await api(`/partner/stores/${shop.storeId}/items/${itemId}/restock`, { method: 'POST', token: shop.token, body: { qty: 6 } });
+  assert.equal((await find()).data.results.length, 1, 'restocked items come straight back');
+
+  // Renaming re-indexes: the old word stops matching, the new one starts.
+  await api(`/partner/stores/${shop.storeId}/items/${itemId}`, {
+    method: 'PATCH', token: shop.token, body: { name: 'Mayos Noodles' }
+  });
+  assert.equal((await find()).data.results.length, 0, 'the old name no longer matches');
+  const renamed = await api(`/store-search?q=mayos&lat=${THAMEL.lat}&lng=${THAMEL.lng}&radiusKm=2`, { token: cust });
+  assert.ok(renamed.data.results.some((r) => r.name === 'Mayos Noodles'), 'the new name is searchable');
+
+  // Removing it takes it out of the market entirely.
+  await api(`/partner/stores/${shop.storeId}/items/${itemId}`, { method: 'DELETE', token: shop.token });
+  const gone = await api(`/store-search?q=mayos&lat=${THAMEL.lat}&lng=${THAMEL.lng}&radiusKm=2`, { token: cust });
+  assert.equal(gone.data.results.length, 0, 'a removed item disappears from search');
+});
+
+test('browse by category, and page through results', async () => {
+  const items = [];
+  for (let i = 0; i < 12; i += 1) items.push({ name: `Snack Item ${i}`, unit: 'packet', price: 20 + i, stock: 5, category: 'Snacks' });
+  const shop = await shopAt('Category Pasal', THAMEL, items);
+  const { token: cust } = await registerUser('browser');
+
+  const cats = await api(`/store-categories?lat=${THAMEL.lat}&lng=${THAMEL.lng}&radiusKm=2`, { token: cust });
+  assert.equal(cats.status, 200);
+  const snacks = cats.data.categories.find((c) => c.name === 'Snacks');
+  assert.ok(snacks && snacks.count >= 12, 'category chips count what is in stock nearby');
+
+  const page1 = await api(`/store-search?category=Snacks&lat=${THAMEL.lat}&lng=${THAMEL.lng}&radiusKm=2&limit=5`, { token: cust });
+  assert.equal(page1.data.results.length, 5);
+  assert.equal(page1.data.hasMore, true);
+  const page2 = await api(`/store-search?category=Snacks&lat=${THAMEL.lat}&lng=${THAMEL.lng}&radiusKm=2&limit=5&page=2`, { token: cust });
+  assert.equal(page2.data.results.length, 5);
+  const overlap = page1.data.results.filter((a) => page2.data.results.some((b) => b.itemId === a.itemId));
+  assert.equal(overlap.length, 0, 'pages do not repeat items');
+  assert.ok(page1.data.results.every((r) => r.storeId === shop.storeId));
+});
+
+test('a shop awaiting review is invisible to customers until it is approved', async () => {
+  const stamp = `${Date.now()}${Math.floor(Math.random() * 1000)}`;
+  const reg = await api('/partner/register', {
+    method: 'POST',
+    body: { name: 'Hidden Pasal', email: `hid-${stamp}@test.local`, password: 'partner-secret', phone: `+9779${stamp.slice(-9)}`, regNo: `PAN-${stamp.slice(-6)}` }
+  });
+  const token = reg.data.token;
+  const otp = await api('/partner/phone/request-otp', { method: 'POST', token, body: {} });
+  await api('/partner/phone/verify', { method: 'POST', token, body: { code: otp.data.devCode } });
+  await api(`/admin/partners/${reg.data.partner.id}/kyc/approve`, { method: 'POST', token: adminToken });
+  const store = await api('/partner/stores', { method: 'POST', token, body: { name: 'Hidden Pasal', area: 'Thamel' } });
+  const storeId = store.data.store.id;
+  await api(`/partner/stores/${storeId}`, { method: 'PATCH', token, body: { lat: THAMEL.lat, lng: THAMEL.lng } });
+  await api(`/partner/stores/${storeId}/items`, { method: 'POST', token, body: { name: 'Secret Masala', unit: 'packet', price: 60, stock: 9 } });
+
+  const { token: cust } = await registerUser('nosy');
+  const before = await api(`/store-search?q=secret masala&lat=${THAMEL.lat}&lng=${THAMEL.lng}&radiusKm=2`, { token: cust });
+  assert.equal(before.data.results.length, 0, 'unreviewed shops are not in the marketplace');
+
+  await api(`/admin/stores/${storeId}/approve`, { method: 'POST', token: adminToken });
+  const after = await api(`/store-search?q=secret masala&lat=${THAMEL.lat}&lng=${THAMEL.lng}&radiusKm=2`, { token: cust });
+  assert.equal(after.data.results.length, 1, 'approval puts the shop into search immediately');
+});

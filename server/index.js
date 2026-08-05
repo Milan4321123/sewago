@@ -208,6 +208,9 @@ app.get('/api/events', (req, res) => {
 
 async function start() {
   await initDb();
+  // Build the marketplace search + geo index from the freshly loaded state, so
+  // the first customer search is fast rather than paying for a lazy rebuild.
+  require('./storeSearch').rebuild();
 
 app.use('/api/auth', require('./routes/auth').router);
 app.use('/api', require('./routes/rides'));
@@ -283,6 +286,15 @@ const dispatch = require('./dispatch');
 setInterval(() => {
   try { dispatch.sweep(); } catch (e) { logger.error('dispatch_sweep_failed', { err: e.message }); }
 }, 3000).unref();
+
+// Courier batching: groups packed shop orders into multi-stop runs and offers
+// each to the nearest suitable rider, cycling on when an offer lapses.
+const { sweepDeliveryRuns } = require('./deliveryRuns');
+setInterval(() => {
+  try {
+    if (sweepDeliveryRuns()) save();
+  } catch (e) { logger.error('delivery_sweep_failed', { err: e.message }); }
+}, 5000).unref();
 
 // Backup at boot and every 6 hours (JSON store only; no-op on Supabase).
 try { backupJsonState(); } catch (e) { console.error('Backup failed:', e.message); }

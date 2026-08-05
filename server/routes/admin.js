@@ -453,6 +453,8 @@ router.post('/admin/hotels/:id/:action(approve|reject)', authAdmin, (req, res) =
 router.post('/admin/stores/:id/:action(approve|reject)', authAdmin, (req, res) => {
   const result = reviewListing(db.stores, req.params.id, req.params.action, (req.body || {}).note);
   if (result.error) return res.status(result.code).json({ error: result.error });
+  // Approval is what puts a shop into the customer-facing search and map.
+  require('../storeSearch').indexStore(result.listing);
   logAudit({
     actor: adminActor(),
     action: `stores.${req.params.action}`,

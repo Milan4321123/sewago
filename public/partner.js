@@ -1699,6 +1699,15 @@ function inventoryView() {
         <button class="btn ghost compact" onclick="toggleShopOpen(${inv.open ? 'false' : 'true'})">${inv.open ? 'Close shop' : 'Open shop'}</button>
       </div>
 
+      ${store.locPinned ? '' : `
+      <div class="card" style="border-color:var(--accent);margin-bottom:12px">
+        <div style="font-weight:900">📍 Put your shop on the map</div>
+        <div class="muted small" style="margin:4px 0 10px">
+          Customers find shops by how close they are. Stand in your shop and tap below so nearby customers can see you.
+        </div>
+        <button class="btn" onclick="pinShopLocation()">Use my current location</button>
+      </div>`}
+
       <div class="grid2" style="margin-bottom:12px">
         <div class="card" style="padding:12px">
           <div class="muted small">Sold today</div>
@@ -1734,3 +1743,22 @@ function inventoryView() {
       <div style="height:40px"></div>
     </main>`;
 }
+
+// A shop's position is what puts it in "near me" for customers, so it is taken
+// from the shopkeeper's own phone standing in the shop rather than a typed area.
+window.pinShopLocation = () => {
+  if (!navigator.geolocation) return toast('This phone cannot share location.', true);
+  toast('Finding your shop…');
+  navigator.geolocation.getCurrentPosition(async (pos) => {
+    try {
+      await api(`/api/partner/stores/${state.activeStore}`, {
+        method: 'PATCH',
+        body: { lat: +pos.coords.latitude.toFixed(6), lng: +pos.coords.longitude.toFixed(6) }
+      });
+      await loadStores();
+      await loadInventory();
+      toast('Shop pinned — nearby customers can find you now 📍');
+      render();
+    } catch (e) { toast(e.message, true); }
+  }, () => toast('Could not get your location — allow it in your browser.', true), { enableHighAccuracy: true, timeout: 10000 });
+};

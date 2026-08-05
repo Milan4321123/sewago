@@ -546,12 +546,9 @@ window.setTab = async (tab) => {
   state.restaurant = null;
   try {
     if (tab === 'shops') {
-      const [s, o] = await Promise.all([api('/api/stores'), api('/api/store-orders')]);
-      state.shops = s.stores || [];
-      state.shopServiceFee = s.serviceFee || 0;
-      state.shopOrders = o.orders || [];
       state.shop = null;
-      await loadSubscriptions();
+      const [o] = await Promise.all([api('/api/store-orders'), refreshShops(), loadSubscriptions()]);
+      state.shopOrders = o.orders || [];
     } else if (tab === 'food') {
       const [r, o] = await Promise.all([api('/api/restaurants'), api('/api/orders')]);
       state.restaurants = r.restaurants;
@@ -2381,19 +2378,74 @@ document.addEventListener('click', (e) => {
 function shopsView() {
   if (state.shop) return shopDetailView();
   const orders = (state.shopOrders || []).filter((o) => o.status !== 'delivered' && o.status !== 'cancelled');
+  const searching = !!(state.shopQuery || state.shopCategory);
   return `
-  <div class="section-title" style="margin-top:0">Shops near you 🏪</div>
-  <div class="muted small" style="margin-bottom:12px">Your local general stores — order what they have on the shelf today.</div>
+  <div class="section-title" style="margin-top:0">What do you need? 🛒</div>
+  <div class="card">
+    <label class="field" style="margin:0"><span>Search every shop near you</span>
+      <input id="shop-q" value="${esc(state.shopQuery || '')}" placeholder="chini, wai wai, sabun…"
+        oninput="shopSearchTyped()" onkeydown="if(event.key==='Enter')runShopSearch()" />
+    </label>
+    ${state.located
+      ? `<div class="muted small" style="margin-top:8px">📍 Showing shops within ${state.shopRadius || 3} km of you</div>`
+      : `<button class="btn ghost compact" style="margin-top:8px" onclick="useMyLocationForShops()">📍 Use my location to find nearby shops</button>`}
+  </div>
+
+  ${(state.shopCategories || []).length ? `
+  <div style="display:flex;gap:6px;overflow-x:auto;padding:10px 0">
+    <button class="btn ${state.shopCategory ? 'ghost' : ''} compact" onclick="pickShopCategory('')">All</button>
+    ${state.shopCategories.map((c) => `
+      <button class="btn ${state.shopCategory === c.name ? '' : 'ghost'} compact" style="white-space:nowrap" onclick="pickShopCategory('${esc(c.name)}')">${esc(c.name)} ${c.count}</button>`).join('')}
+  </div>` : ''}
+
+  ${searching ? `
+    <div class="row" style="margin:4px 0 10px">
+      <div class="muted small">${state.shopResults ? `${state.shopResults.total ?? 'Many'} result${state.shopResults.total === 1 ? '' : 's'}` : 'Searching…'}</div>
+      <div style="display:flex;gap:6px">
+        <button class="btn ${state.shopSort !== 'cheap' ? '' : 'ghost'} compact" onclick="setShopSort('near')">Nearest</button>
+        <button class="btn ${state.shopSort === 'cheap' ? '' : 'ghost'} compact" onclick="setShopSort('cheap')">Cheapest</button>
+      </div>
+    </div>
+    ${(state.shopResults && state.shopResults.results.length)
+      ? state.shopResults.results.map(productRow).join('') +
+        (state.shopResults.hasMore ? `<button class="btn ghost" style="margin-top:8px" onclick="loadMoreShopResults()">Show more</button>` : '')
+      : `<div class="empty"><div class="big">🔍</div>Nothing matching that is in stock nearby.</div>`}
+    <div class="divider"></div>
+  ` : ''}
+
   ${orders.length ? `
     <div class="section-title">Your orders</div>
     ${orders.map(shopOrderCard).join('')}
   ` : ''}
+
+  <div class="section-title">Shops near you 🏪</div>
   ${(state.shops || []).length
     ? state.shops.map(shopCard).join('')
     : `<div class="empty"><div class="big">🏪</div>No shops nearby yet — they are being added.</div>`}
   ${(state.subscriptions || []).length ? `
     <div class="section-title">Your subscriptions 🔁</div>
     ${state.subscriptions.map(subscriptionCard).join('')}` : ''}`;
+}
+
+// One search hit: the product, which shop has it, how far, how much.
+function productRow(r) {
+  return `
+  <div class="card" onclick="openShopFront('${r.storeId}')" style="cursor:pointer">
+    <div class="row">
+      ${r.photo ? `<img src="${esc(r.photo)}" alt="" style="width:48px;height:48px;object-fit:cover;border-radius:10px" />` : ''}
+      <div class="grow">
+        <div style="font-weight:800">${esc(r.name)}</div>
+        <div class="muted small">
+          ${r.storeIcon} ${esc(r.storeName)}${r.distanceKm !== null ? ` · ${r.distanceKm} km` : ''}${r.storeOpen ? '' : ' · closed'}
+        </div>
+        ${r.lowStock ? `<div class="muted small" style="color:#fbbf24">only a few left</div>` : ''}
+      </div>
+      <div style="text-align:right">
+        <div style="font-weight:900">${money(r.price)}</div>
+        <div class="muted small">per ${esc(r.unit === 'each' ? 'pc' : r.unit)}</div>
+      </div>
+    </div>
+  </div>`;
 }
 
 function shopCard(s) {
@@ -2581,4 +2633,88 @@ window.cancelShopOrder = async (id) => {
     toast('Order cancelled and refunded.');
     render();
   } catch (e) { toast(e.message, true); }
+};
+
+/* ---------------- marketplace search ---------------- */
+
+// The customer's own position, when they've shared it. Everything degrades to a
+// distance-less list rather than failing if they haven't.
+function shopGeoParams() {
+  const p = [];
+  if (state.myLoc) {
+    p.push(`lat=${state.myLoc.lat}`, `lng=${state.myLoc.lng}`, `radiusKm=${state.shopRadius || 3}`);
+  }
+  return p.join('&');
+}
+
+window.useMyLocationForShops = () => {
+  if (!navigator.geolocation) return toast('This phone cannot share location.', true);
+  toast('Finding you…');
+  navigator.geolocation.getCurrentPosition(async (pos) => {
+    state.myLoc = { lat: +pos.coords.latitude.toFixed(6), lng: +pos.coords.longitude.toFixed(6) };
+    state.located = true;
+    await refreshShops();
+    render();
+  }, () => toast('Could not get your location — allow it in your browser.', true), { enableHighAccuracy: true, timeout: 10000 });
+};
+
+async function refreshShops() {
+  const geo = shopGeoParams();
+  const [s, c] = await Promise.all([
+    api(`/api/stores?${geo}`),
+    api(`/api/store-categories?${geo}`).catch(() => ({ categories: [] }))
+  ]);
+  state.shops = s.stores || [];
+  state.located = !!s.located;
+  state.shopServiceFee = s.serviceFee || 0;
+  state.shopCategories = c.categories || [];
+  if (state.shopQuery || state.shopCategory) await runShopSearchNow(1);
+}
+
+// Debounced so typing doesn't fire a request per keystroke.
+window.shopSearchTyped = () => {
+  const el = $('#shop-q');
+  state.shopQuery = el ? el.value : '';
+  clearTimeout(state._shopSearchTimer);
+  state._shopSearchTimer = setTimeout(() => runShopSearchNow(1).then(() => render()), 250);
+};
+
+window.runShopSearch = () => runShopSearchNow(1).then(() => render());
+
+async function runShopSearchNow(page) {
+  const q = state.shopQuery || '';
+  const cat = state.shopCategory || '';
+  if (!q && !cat) { state.shopResults = null; return; }
+  const params = [
+    `q=${encodeURIComponent(q)}`,
+    cat ? `category=${encodeURIComponent(cat)}` : '',
+    `sort=${state.shopSort || 'near'}`,
+    `page=${page}`,
+    shopGeoParams()
+  ].filter(Boolean).join('&');
+  try {
+    const data = await api(`/api/store-search?${params}`);
+    if (page > 1 && state.shopResults) {
+      data.results = [...state.shopResults.results, ...data.results];
+    }
+    state.shopResults = data;
+    state.shopPage = page;
+  } catch (e) { toast(e.message, true); }
+}
+
+window.loadMoreShopResults = async () => {
+  await runShopSearchNow((state.shopPage || 1) + 1);
+  render();
+};
+
+window.pickShopCategory = async (name) => {
+  state.shopCategory = state.shopCategory === name ? '' : name;
+  await runShopSearchNow(1);
+  render();
+};
+
+window.setShopSort = async (sort) => {
+  state.shopSort = sort;
+  await runShopSearchNow(1);
+  render();
 };

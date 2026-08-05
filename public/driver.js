@@ -12,6 +12,8 @@ const state = {
   requests: [],
   delivery: null,
   deliveries: [],
+  run: null,        // batched multi-stop shop-delivery run
+  runOffered: false, // true while it is still just an offer
   history: [],
   locationWatchId: null,
   locationBusy: false,
@@ -650,7 +652,10 @@ function uiKey() {
     d && d.licenseVerified, d && d.phoneVerified, d && d.locationFresh, state.showWithdraw, state.showPhoneEdit,
     state.job && state.job.id, state.job && state.job.status,
     state.delivery && state.delivery.id, state.delivery && state.delivery.status,
-    state.requests.map((r) => r.id), state.deliveries.map((d) => d.id), state.history.length
+    state.requests.map((r) => r.id), state.deliveries.map((d) => d.id), state.history.length,
+    // A run's progress lives in which stop is next, so that has to be in the key
+    // or the poll would never repaint the rider's screen between stops.
+    state.run && state.run.id, state.run && state.run.nextSeq, state.run && state.run.status, state.runOffered
   ]);
 }
 
@@ -803,6 +808,7 @@ function render() {
 
 function jobSlot() {
   if (state.job) return jobCard(state.job);
+  if (state.run) return state.runOffered ? runOfferCard(state.run) : runCard(state.run);
   if (state.delivery) return deliveryCard(state.delivery);
   if (!state.driver.online) {
     return `<div class="empty"><div class="big">😴</div>You're offline.<br/>Share live GPS and go online to receive ride requests.</div>`;
@@ -1012,7 +1018,15 @@ async function refresh() {
   if (hadJob && !me.job) {
     toast('That trip was cancelled by the customer.', true);
   }
-  if (me.driver.online && !me.job && !state.delivery) {
+  // Batched shop-delivery runs are bike-only and take over the screen when live.
+  if (me.driver.tier === 'bike') {
+    try {
+      const r = await api('/api/driver/run');
+      state.run = r.run;
+      state.runOffered = !!r.offered;
+    } catch (e) { state.run = null; state.runOffered = false; }
+  }
+  if (me.driver.online && !me.job && !state.delivery && !state.run) {
     const fetches = [api('/api/driver/requests')];
     if (me.driver.tier === 'bike') fetches.push(api('/api/driver/deliveries'));
     const [r, del] = await Promise.all(fetches);
@@ -1227,3 +1241,129 @@ setInterval(() => {
   }
   render();
 })();
+
+/* ==================================================================
+   Batched delivery runs — several shops, several homes, one trip
+   ==================================================================
+   The rider sees the whole plan up front (so they can judge the run
+   before accepting) and then one big NEXT STOP at a time, because
+   they are reading this at a junction with a helmet on.
+*/
+
+function runStopLine(s, isNext) {
+  const icon = s.type === 'pickup' ? '📦' : '🏠';
+  const label = s.type === 'pickup'
+    ? `Collect ${s.orders} order${s.orders > 1 ? 's' : ''}`
+    : 'Deliver';
+  return `
+  <div class="row" style="padding:8px 0;border-bottom:1px solid var(--line);${s.done ? 'opacity:.45' : ''}">
+    <div class="grow">
+      <div style="font-weight:${isNext ? '900' : '700'};${isNext ? 'color:var(--accent)' : ''}">
+        ${s.done ? '✓' : icon} ${esc(s.name)}
+      </div>
+      <div class="muted small">${label}${s.cash ? ` · collect ${money(s.cash)} cash` : ''}</div>
+    </div>
+    ${isNext ? '<span class="badge">NEXT</span>' : ''}
+  </div>`;
+}
+
+function runOfferCard(run) {
+  return `
+  <div class="section-title">Delivery run offered 🛵</div>
+  <div class="card" style="border-color:var(--accent)">
+    <div class="row">
+      <div class="grow">
+        <div style="font-weight:900;font-size:17px">${run.orders} orders · ${run.stops.length} stops</div>
+        <div class="muted small">${run.pickups} shop${run.pickups > 1 ? 's' : ''} → ${run.dropoffs} customer${run.dropoffs > 1 ? 's' : ''} · ${run.distanceKm} km</div>
+      </div>
+      <div style="text-align:right">
+        <div style="font-size:20px;font-weight:900;color:var(--accent)">${money(run.payout)}</div>
+        ${run.expiresInSec != null ? `<div class="muted small">${run.expiresInSec}s to decide</div>` : ''}
+      </div>
+    </div>
+    ${run.cashToCollect ? `<div class="muted small" style="margin-top:8px;color:#fbbf24">💵 You will collect ${money(run.cashToCollect)} in cash across this run.</div>` : ''}
+    <div class="divider"></div>
+    ${run.stops.map((s) => runStopLine(s, false)).join('')}
+    <button class="btn" style="margin-top:12px" onclick="acceptRun('${run.id}')">Accept run · ${money(run.payout)}</button>
+    <button class="btn ghost" style="margin-top:8px" onclick="declineRun('${run.id}')">Pass</button>
+  </div>`;
+}
+
+function runCard(run) {
+  const next = run.stops.find((s) => s.seq === run.nextSeq);
+  const doneCount = run.stops.filter((s) => s.done).length;
+  return `
+  <div class="section-title">Your run 🛵</div>
+  <div class="card">
+    <div class="row">
+      <div class="grow">
+        <div style="font-weight:900">${run.orders} orders · ${doneCount}/${run.stops.length} stops done</div>
+        <div class="muted small">${run.distanceKm} km · earning ${money(run.payout)}</div>
+      </div>
+      ${run.cashToCollect ? `<div style="text-align:right"><div class="muted small">cash</div><div style="font-weight:900;color:#fbbf24">${money(run.cashToCollect)}</div></div>` : ''}
+    </div>
+  </div>
+  ${next ? `
+  <div class="card" style="border-color:var(--accent)">
+    <div class="muted small">NEXT STOP ${next.seq + 1} of ${run.stops.length}</div>
+    <div style="font-size:19px;font-weight:900;margin:4px 0">
+      ${next.type === 'pickup' ? '📦' : '🏠'} ${esc(next.name)}
+    </div>
+    <div class="muted small">
+      ${next.type === 'pickup'
+        ? `Collect ${next.orders} order${next.orders > 1 ? 's' : ''} from this shop`
+        : 'Hand the order to the customer'}
+      ${next.cash ? ` · <b style="color:#fbbf24">take ${money(next.cash)} cash</b>` : ''}
+    </div>
+    ${navButton(next.loc, next.type === 'pickup' ? 'Navigate to shop' : 'Navigate to customer')}
+    <button class="btn" style="margin-top:8px" onclick="completeStop('${run.id}', ${next.seq})">
+      ${next.type === 'pickup' ? 'Collected ✓' : 'Delivered ✓'}
+    </button>
+  </div>` : ''}
+  <div class="card">
+    <div class="muted small" style="margin-bottom:4px">Full route</div>
+    ${run.stops.map((s) => runStopLine(s, s.seq === run.nextSeq)).join('')}
+  </div>`;
+}
+
+window.acceptRun = async (id) => {
+  try {
+    const data = await api(`/api/driver/runs/${id}/accept`, { method: 'POST' });
+    state.run = data.run;
+    state.runOffered = false;
+    toast('Run accepted — head to the first shop 🛵');
+    render();
+  } catch (e) {
+    toast(e.message, true);
+    await refresh();
+    render();
+  }
+};
+
+window.declineRun = async (id) => {
+  try {
+    await api(`/api/driver/runs/${id}/decline`, { method: 'POST' });
+    state.run = null;
+    state.runOffered = false;
+    toast('Passed — it goes to another rider.');
+    await refresh();
+    render();
+  } catch (e) { toast(e.message, true); }
+};
+
+window.completeStop = async (runId, seq) => {
+  try {
+    const data = await api(`/api/driver/runs/${runId}/stops/${seq}/done`, { method: 'POST' });
+    state.driver = data.driver || state.driver;
+    if (data.run && data.run.status === 'completed') {
+      state.run = null;
+      toast(data.mustSettle
+        ? 'Run complete — settle the cash you are holding to keep working 💵'
+        : `Run complete! ${money(data.run.payout)} added to your earnings 🎉`);
+      await refresh();
+    } else {
+      state.run = data.run;
+    }
+    render();
+  } catch (e) { toast(e.message, true); }
+};

@@ -182,6 +182,7 @@ function migrate(data) {
   data.storeOrders = data.storeOrders || [];
   data.stockMoves = data.stockMoves || [];
   data.itemSubscriptions = data.itemSubscriptions || [];
+  data.deliveryRuns = data.deliveryRuns || [];
   data.otpCodes = data.otpCodes || [];
   data.passwordResetTokens = data.passwordResetTokens || [];
   data.uploads = data.uploads || [];
