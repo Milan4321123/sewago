@@ -2382,6 +2382,7 @@ function helperBlock() {
         Give ${esc(state.helperInvite.name || 'your helper')} this code to join in the SewaGo app. They can add items and count stock — never change prices or see your money.
       </div>
       <div style="font-size:26px;font-weight:900;letter-spacing:4px;text-align:center">${esc(state.helperInvite.code)}</div>
+      <div class="muted small" style="text-align:center;margin-top:6px">Works for 24 hours — invite again if they miss it.</div>
       <button class="btn ghost" style="margin-top:10px" onclick="dismissHelperInvite()">Done</button>
     </div>`;
   }
