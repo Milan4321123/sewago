@@ -10,6 +10,8 @@
   "scripts": {
     "start": "node server/index.js",
     "test": "node --test \"test/*.test.js\"",
+    "dev": "DATA_STORE=json DATA_DIR=data/local NODE_ENV=development OTP_PROVIDER=sandbox EMAIL_PROVIDER=sandbox node server/index.js",
+    "dev:seed": "DATA_STORE=json DATA_DIR=data/local node scripts/seed-demo.js",
     "demo:seed": "node scripts/seed-demo.js",
     "supabase:push": "node scripts/supabase-push.js",
     "supabase:pull": "node scripts/supabase-pull.js",
