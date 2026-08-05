@@ -1471,8 +1471,19 @@ window.searchInventory = async () => {
 };
 
 window.decideStoreOrder = async (orderId, action) => {
+  const body = {};
+  if (action === 'handover') {
+    const order = state.storeOrders.find((x) => x.id === orderId);
+    if (order && order.fulfilment === 'pickup') {
+      // The customer proves it is their order by reading out the code from
+      // their app — the server rejects a handover with the wrong one.
+      const code = prompt("Customer's 4-digit pickup code (in their app):");
+      if (code === null) return;
+      body.code = code.trim();
+    }
+  }
   try {
-    await api(`/api/partner/store-orders/${orderId}/${action}`, { method: 'POST' });
+    await api(`/api/partner/store-orders/${orderId}/${action}`, { method: 'POST', body });
     const d = await api(`/api/partner/stores/${state.activeStore}/orders`);
     state.storeOrders = d.orders || [];
     await loadInventory();
@@ -1662,7 +1673,7 @@ function storeOrdersView() {
         <div class="grow">
           <div style="font-weight:800">${esc(o.customerName)}</div>
           <div class="muted small">${o.items.map((l) => `${l.qty}× ${esc(l.name)}`).join(', ')}</div>
-          <div class="muted small">${o.payment === 'cash' ? '💵 cash on handover' : '👛 paid in app'}${o.deliveryLoc ? ` · 📍 ${esc(o.deliveryLoc.name)}` : ''}</div>
+          <div class="muted small">${o.payment === 'cash' ? '💵 cash on handover' : '👛 paid in app'}${o.fulfilment === 'pickup' ? ' · 🏃 customer collects' : o.deliveryLoc ? ` · 📍 ${esc(o.deliveryLoc.name)}` : ''}</div>
         </div>
         <div style="text-align:right">
           <div style="font-weight:900">${money(o.total)}</div>

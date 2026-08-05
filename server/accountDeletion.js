@@ -66,6 +66,11 @@ function deletionBlockers(kind, entity) {
     if (currentDelivery(id)) {
       blockers.push('you have a food delivery in progress — hand it over first');
     }
+    // A rider mid-run has customers' goods and possibly their cash. Deleting the
+    // account revokes every session, so nobody could ever finish that run.
+    if (require('./deliveryRuns').runForCourier(id)) {
+      blockers.push('you have a delivery run in progress — finish its stops first');
+    }
     if ((entity.earnings || 0) > 0) {
       blockers.push(`withdraw your Rs ${entity.earnings} earnings first so you do not lose them`);
     }
@@ -89,6 +94,16 @@ function deletionBlockers(kind, entity) {
     }
     if ((entity.earnings || 0) < 0) {
       blockers.push(`settle the Rs ${-entity.earnings} you owe SewaGo before deleting your account`);
+    }
+    // Kirana shops were invisible to these checks: a shopkeeper could delete
+    // their account while customers had already paid for orders, vaporising
+    // pendingEarnings — money the customers had genuinely been debited.
+    const myStoreIds = new Set((db.stores || []).filter((s) => s.ownerId === id).map((s) => s.id));
+    if ((db.storeOrders || []).some((o) => myStoreIds.has(o.storeId) && o.status !== 'delivered' && o.status !== 'cancelled')) {
+      blockers.push('your shop has orders that are not finished — hand them over or reject them first');
+    }
+    if ((entity.pendingEarnings || 0) !== 0) {
+      blockers.push(`Rs ${entity.pendingEarnings} of shop income is still settling — wait for those orders to complete`);
     }
   }
 
@@ -143,6 +158,17 @@ function anonymize(kind, entity) {
         listing.status = 'removed';
         listing.reviewNote = 'Owner account deleted.';
       }
+    }
+    // Shops need the same treatment AND removal from the search index, or they
+    // keep appearing in "near me" and taking orders nobody can pack.
+    const search = require('./storeSearch');
+    for (const store of db.stores || []) {
+      if (store.ownerId !== entity.id || store.removedAt) continue;
+      store.status = 'removed';
+      store.removedAt = Date.now();
+      store.open = false;
+      store.reviewNote = 'Owner account deleted.';
+      search.unindexStore(store.id);
     }
   }
 

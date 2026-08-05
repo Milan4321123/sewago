@@ -1,3 +1,4 @@
+const crypto = require('crypto');
 const express = require('express');
 const { db, save, uid } = require('../db');
 const { config } = require('../config');
@@ -10,6 +11,7 @@ const { resolveLocation } = require('../geo');
 const { parseItemSpeech } = require('../voiceParse');
 const { cleanupPhoto } = require('../photoAI');
 const events = require('../events');
+const { logAudit } = require('../audit');
 const {
   UNITS, MAX_ITEMS_PER_STORE, isUnit, storeById, itemIn, storeIsLive, storeIsOpen,
   moveStock, reorderSuggestions, storeStats, lowStockThreshold, canManageStore,
@@ -187,7 +189,11 @@ router.get('/partner/stores/:id/inventory', authPartner, (req, res) => {
 
 // Add one item. Accepts the output of the voice parser directly, so the confirm
 // screen posts exactly what the shopkeeper saw.
-function addItem(store, body, actor) {
+// canPrice=false for helpers: they may add a line they found on the shelf, but
+// must never be able to rewrite the price of something the shop already sells.
+// (The restock branch below silently did exactly that, and with qty 0 moveStock
+// records nothing — so the shopkeeper had no trace of the change at all.)
+function addItem(store, body, actor, { canPrice = true } = {}) {
   const name = String(body.name || '').trim();
   const price = Math.round(Number(body.price));
   const unit = isUnit(body.unit) ? body.unit : 'each';
@@ -205,7 +211,18 @@ function addItem(store, body, actor) {
     // Saying an item you already stock is a restock, not a duplicate line —
     // this is what happens naturally during a shelf count.
     moveStock(store, dup, { qty: stock, reason: 'restock', refId: null, ...actor });
-    if (Number.isFinite(price) && price > 0) dup.price = price;
+    if (canPrice && Number.isFinite(price) && price > 0 && price !== dup.price) {
+      // A price change leaves no stock movement, so record it explicitly or it
+      // would be invisible in the shop's history.
+      logAudit({
+        actor: { role: actor.actorKind, id: actor.actorId, email: actor.actorName },
+        action: 'store.item.price_change',
+        targetType: 'store_item',
+        targetId: dup.id,
+        meta: { storeId: store.id, name: dup.name, from: dup.price, to: price }
+      });
+      dup.price = price;
+    }
     return { item: dup, restocked: true };
   }
   const subscribePrice = Number(body.subscribePrice);
@@ -433,7 +450,7 @@ router.post('/stores/:id/helper/items', authRequired, (req, res) => {
     if (!res.headersSent) res.status(403).json({ error: 'You do not help at this store.' });
     return;
   }
-  const result = addItem(store, req.body || {}, actorFrom(req));
+  const result = addItem(store, req.body || {}, actorFrom(req), { canPrice: false });
   if (result.error) return res.status(400).json({ error: result.error });
   save();
   events.publish(`partner:${store.ownerId}`, { topic: 'stores' });
@@ -590,7 +607,8 @@ router.get('/subscriptions', authRequired, (req, res) => {
 /* ---------------- customer: ordering ---------------- */
 
 router.post('/store-orders', authRequired, (req, res) => {
-  const { storeId, items, payment, deliverTo } = req.body || {};
+  const { storeId, items, payment, deliverTo, fulfilment } = req.body || {};
+  const pickup = fulfilment === 'pickup';
   const store = storeById(storeId);
   if (!storeIsLive(store)) return res.status(404).json({ error: 'Shop not found.' });
   if (!storeIsOpen(store)) return res.status(409).json({ error: `${store.name} is closed right now.` });
@@ -628,7 +646,9 @@ router.post('/store-orders', authRequired, (req, res) => {
     });
   }
 
-  const deliveryFee = store.deliveryFee || 0;
+  // Click & collect: the customer walks in, so there is nothing to deliver
+  // and nothing to charge for delivering.
+  const deliveryFee = pickup ? 0 : (store.deliveryFee || 0);
   const payMethod = payment === 'cash' ? 'cash' : 'wallet';
   const serviceFee = payMethod === 'wallet' ? STORE_SERVICE_FEE : 0;
   const total = subtotal + deliveryFee + serviceFee;
@@ -636,8 +656,10 @@ router.post('/store-orders', authRequired, (req, res) => {
     return res.status(402).json({ error: 'Not enough wallet balance. Top up, or pay cash on delivery.' });
   }
 
+  // A pickup order must never carry a delivery location: the courier sweep
+  // treats "ready + deliveryLoc" as a job, and this order is not one.
   let deliveryLoc = null;
-  if (deliverTo) {
+  if (!pickup && deliverTo) {
     const resolved = resolveLocation(deliverTo);
     if (resolved.error === 'outside') return res.status(400).json({ error: 'That delivery point is outside the service area.' });
     if (!resolved.error) deliveryLoc = { name: resolved.name, lat: resolved.lat, lng: resolved.lng };
@@ -661,6 +683,10 @@ router.post('/store-orders', authRequired, (req, res) => {
     partnerCut: subtotal + deliveryFee - commission,
     partnerSettled: false,
     payment: payMethod,
+    fulfilment: pickup ? 'pickup' : 'delivery',
+    // The customer's proof at the counter. Only they see it; the shopkeeper
+    // hears it from their mouth at handover.
+    pickupCode: pickup ? String(crypto.randomInt(1000, 10000)) : null,
     deliveryLoc,
     status: 'placed',
     createdAt: Date.now()
@@ -768,6 +794,14 @@ router.post('/store-orders/:id/cancel', authRequired, (req, res) => {
 
 /* ---------------- shopkeeper: orders ---------------- */
 
+// The pickup code is the customer's proof of identity at the counter. If the
+// shopkeeper could read it through the API, the handover check would prove
+// nothing — so every partner-facing view strips it.
+function partnerOrderView(order) {
+  const { pickupCode, ...rest } = order;
+  return rest;
+}
+
 router.get('/partner/stores/:id/orders', authPartner, (req, res) => {
   const store = manageableStore(req, res, { helpersAllowed: false });
   if (!store) return;
@@ -776,7 +810,8 @@ router.get('/partner/stores/:id/orders', authPartner, (req, res) => {
     .filter((o) => o.storeId === store.id)
     .slice(-40)
     .reverse()
-    .sort((a, b) => (active[a.status] ?? 9) - (active[b.status] ?? 9));
+    .sort((a, b) => (active[a.status] ?? 9) - (active[b.status] ?? 9))
+    .map(partnerOrderView);
   res.json({ orders });
 });
 
@@ -809,6 +844,23 @@ router.post('/partner/store-orders/:orderId/:action(accept|reject|ready|handover
     if (order.status !== 'ready' && order.status !== 'accepted') {
       return res.status(400).json({ error: 'Mark the order ready first.' });
     }
+    // If a courier is carrying this order, the shopkeeper must NOT settle it.
+    // An order stays 'ready' until the rider ticks the pickup stop, so this is
+    // exactly the tap a shopkeeper makes when handing the bag to the rider —
+    // and settling here would mark it delivered, causing the run's dropoff to
+    // skip the courier's cash debit entirely. The cash would simply vanish.
+    const activeRun = require('../deliveryRuns').runContainingOrder(order.id);
+    if (order.courierId || (activeRun && activeRun.status !== 'completed')) {
+      return res.status(409).json({
+        error: 'A courier is delivering this order — it settles at the customer’s door.'
+      });
+    }
+    if (order.fulfilment === 'pickup') {
+      const code = String((req.body || {}).code || '').trim();
+      if (!code || code !== order.pickupCode) {
+        return res.status(400).json({ error: 'Wrong pickup code — ask the customer for the 4-digit code in their app.' });
+      }
+    }
     order.status = 'delivered';
     order.deliveredAt = Date.now();
     // Handover is the moment the goods actually change hands, so this is when
@@ -840,7 +892,7 @@ router.post('/partner/store-orders/:orderId/:action(accept|reject|ready|handover
   save();
   events.publish(`user:${order.userId}`, { topic: 'store_order' });
   events.publish('admin', { topic: 'orders' });
-  res.json({ order });
+  res.json({ order: partnerOrderView(order) });
 });
 
 /* ---------------- photos ---------------- */

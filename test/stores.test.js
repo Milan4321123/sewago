@@ -304,6 +304,79 @@ test('a wallet order conserves money from customer to shopkeeper to platform', a
   assert.equal(o.partnerCut + o.commission + o.serviceFee, o.total);
 });
 
+test('click & collect: no delivery fee, and handover needs the customer\'s code', async () => {
+  const shop = await openShop();
+  const created = await api(`/partner/stores/${shop.storeId}/items`, {
+    method: 'POST', token: shop.token, body: { name: 'Sugar', unit: 'kg', price: 200, stock: 10 }
+  });
+  const itemId = created.data.item.id;
+  const { token: cust } = await registerUser('collector');
+
+  // deliverTo is sent on purpose: a pickup order must ignore it, or the
+  // courier sweep would mistake the order for a delivery job.
+  const placed = await api('/store-orders', {
+    method: 'POST', token: cust,
+    body: { storeId: shop.storeId, items: [{ itemId, qty: 2 }], payment: 'wallet', fulfilment: 'pickup', deliverTo: 'Thamel' }
+  });
+  assert.equal(placed.status, 200, JSON.stringify(placed.data));
+  const o = placed.data.order;
+  // 400 goods + 0 delivery (they collect it themselves) + 5 service = 405.
+  assert.equal(o.total, 405);
+  assert.equal(o.deliveryFee, 0);
+  assert.equal(o.deliveryLoc, null, 'a pickup order must never look like a courier job');
+  assert.match(o.pickupCode, /^\d{4}$/, 'the customer gets a 4-digit code');
+
+  // The shopkeeper must never see the code through the API, or the check at
+  // the counter proves nothing.
+  const list = await api(`/partner/stores/${shop.storeId}/orders`, { token: shop.token });
+  const seen = list.data.orders.find((x) => x.id === o.id);
+  assert.equal(seen.fulfilment, 'pickup');
+  assert.equal(seen.pickupCode, undefined, 'order list hides the code from the shopkeeper');
+
+  await api(`/partner/store-orders/${o.id}/accept`, { method: 'POST', token: shop.token });
+  const readied = await api(`/partner/store-orders/${o.id}/ready`, { method: 'POST', token: shop.token });
+  assert.equal(readied.data.order.pickupCode, undefined, 'action responses hide the code too');
+
+  const noCode = await api(`/partner/store-orders/${o.id}/handover`, { method: 'POST', token: shop.token });
+  assert.equal(noCode.status, 400, 'handover without a code is refused');
+  const wrongCode = await api(`/partner/store-orders/${o.id}/handover`, {
+    method: 'POST', token: shop.token, body: { code: '0000' } // randomInt(1000, 10000) can never produce 0000
+  });
+  assert.equal(wrongCode.status, 400, 'handover with the wrong code is refused');
+
+  const done = await api(`/partner/store-orders/${o.id}/handover`, {
+    method: 'POST', token: shop.token, body: { code: o.pickupCode }
+  });
+  assert.equal(done.status, 200, JSON.stringify(done.data));
+  assert.equal(done.data.order.status, 'delivered');
+
+  // Money: goods minus commission, and no delivery cut on a pickup order.
+  // commission = 8% of 400 = 32; shopkeeper keeps 400 - 32 = 368.
+  const me = await api('/partner/me', { token: shop.token });
+  assert.equal(me.data.partner.earnings, 368);
+  assert.equal(me.data.partner.pendingEarnings, 0);
+});
+
+test('a delivery order still charges the fee and hands over without a code', async () => {
+  const shop = await openShop();
+  const created = await api(`/partner/stores/${shop.storeId}/items`, {
+    method: 'POST', token: shop.token, body: { name: 'Salt', unit: 'packet', price: 50, stock: 5 }
+  });
+  const { token: cust } = await registerUser('homebody');
+  const placed = await api('/store-orders', {
+    method: 'POST', token: cust,
+    body: { storeId: shop.storeId, items: [{ itemId: created.data.item.id, qty: 1 }], payment: 'wallet', fulfilment: 'delivery' }
+  });
+  const o = placed.data.order;
+  assert.equal(o.deliveryFee, 30, 'delivery keeps paying the shop\'s fee');
+  assert.equal(o.pickupCode, null);
+
+  await api(`/partner/store-orders/${o.id}/accept`, { method: 'POST', token: shop.token });
+  await api(`/partner/store-orders/${o.id}/ready`, { method: 'POST', token: shop.token });
+  const done = await api(`/partner/store-orders/${o.id}/handover`, { method: 'POST', token: shop.token });
+  assert.equal(done.status, 200, 'no code demanded when there is no pickup');
+});
+
 test('a hired helper can count stock, and their work is attributed to them', async () => {
   const shop = await openShop();
   const invite = await api(`/partner/stores/${shop.storeId}/helpers`, {

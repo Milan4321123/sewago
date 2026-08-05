@@ -165,6 +165,27 @@ function cashTotal(cluster) {
   return cluster.reduce((sum, o) => sum + (o.payment === 'cash' ? o.total : 0), 0);
 }
 
+// Cash a rider is already committed to collect on their current run but has not
+// yet been debited for — the debit only lands as each drop completes, so the
+// standing balance understates what they will be holding.
+function committedRunCash(driverId) {
+  const run = runForCourier(driverId);
+  if (!run) return 0;
+  return run.stops
+    .filter((s) => s.type === 'dropoff' && !s.done)
+    .reduce((sum, s) => sum + (s.cash || 0), 0);
+}
+
+// A rider mid-ride or mid-food-delivery is not free, and vice versa — the float
+// is one rider's pocket, not one vertical's.
+function courierOtherwiseBusy(driverId) {
+  const { currentDelivery } = require('./orderLogic');
+  if (currentDelivery(driverId)) return true;
+  return (db.rides || []).some(
+    (r) => r.driverId === driverId && (r.status === 'driver_en_route' || r.status === 'in_progress')
+  );
+}
+
 /** Bike couriers who are online, free, and whose float covers this run's cash. */
 function eligibleCouriers(runCash, near) {
   const busy = new Set();
@@ -173,6 +194,7 @@ function eligibleCouriers(runCash, near) {
   }
   return (db.drivers || [])
     .filter((d) => d.tier === 'bike' && driverIsAvailable(d) && !busy.has(d.id))
+    .filter((d) => !courierOtherwiseBusy(d.id))
     // The courier will be holding every rupee of this run's cash at once.
     .filter((d) => cashJobFitsFloat(d, runCash))
     .map((d) => ({
@@ -267,6 +289,67 @@ function sweepDeliveryRuns() {
   return changed;
 }
 
+// A rider who accepts a run and then stops — goes offline, loses the phone,
+// quits — used to strand it forever: nothing ever wrote 'cancelled' to a run, so
+// its orders stayed claimed, the shop's money stayed pending, the customer's
+// stock stayed reserved and the rider stayed marked busy. These deadlines give
+// every run a way out, mirroring the food-delivery recovery.
+const RUN_PICKUP_DEADLINE_MS = envNum('RUN_PICKUP_DEADLINE_MIN', 25, 1, 600) * 60000;
+const RUN_DROPOFF_DEADLINE_MS = envNum('RUN_DROPOFF_DEADLINE_MIN', 90, 1, 1440) * 60000;
+
+function lastActivityAt(run) {
+  const done = run.stops.filter((s) => s.done && s.doneAt);
+  return done.length ? Math.max(...done.map((s) => s.doneAt)) : (run.acceptedAt || run.createdAt);
+}
+
+function recoverAbandonedRuns() {
+  const now = Date.now();
+  let changed = 0;
+  for (const run of db.deliveryRuns || []) {
+    if (run.status !== 'collecting' && run.status !== 'delivering') continue;
+    const nothingCollected = run.stops.every((s) => !s.done);
+    const idleFor = now - lastActivityAt(run);
+
+    if (nothingCollected && idleFor > RUN_PICKUP_DEADLINE_MS) {
+      // Nothing has physically moved and no money settled — hand the whole run
+      // back to the pool so another rider picks the orders up.
+      const abandonedBy = run.courierId;
+      run.status = 'cancelled';
+      run.cancelledAt = now;
+      run.cancelReason = 'courier_no_show';
+      run.abandonedBy = abandonedBy;
+      for (const orderId of run.orderIds) {
+        const order = (db.storeOrders || []).find((o) => o.id === orderId);
+        if (order && order.status === 'ready') {
+          order.courierId = null;
+          order.courier = null;
+        }
+      }
+      changed += 1;
+      continue;
+    }
+
+    if (!nothingCollected && idleFor > RUN_DROPOFF_DEADLINE_MS && !run.abandonedAt) {
+      // Goods have left the shop. Only a human can resolve where they went, so
+      // flag it for staff — but unpin the rider and release any order still
+      // undelivered, so the rest of the system is not held hostage.
+      run.abandonedAt = now;
+      run.abandonedBy = run.courierId;
+      run.status = 'cancelled';
+      run.cancelledAt = now;
+      run.cancelReason = 'courier_abandoned';
+      for (const orderId of run.orderIds) {
+        const order = (db.storeOrders || []).find((o) => o.id === orderId);
+        if (order && order.status !== 'delivered' && order.status !== 'cancelled') {
+          order.needsAttention = 'courier_abandoned';
+        }
+      }
+      changed += 1;
+    }
+  }
+  return changed;
+}
+
 function runForCourier(driverId) {
   return (db.deliveryRuns || []).find(
     (r) => r.courierId === driverId && r.status !== 'completed' && r.status !== 'cancelled'
@@ -316,7 +399,9 @@ function runView(run) {
 
 module.exports = {
   sweepDeliveryRuns,
+  recoverAbandonedRuns,
   runForCourier,
+  committedRunCash,
   offeredRunFor,
   runContainingOrder,
   runView,

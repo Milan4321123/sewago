@@ -2270,6 +2270,20 @@ function connectEvents() {
     if (msg.topic === 'order' && state.tab === 'food') {
       api('/api/orders').then((o) => { state.orders = o.orders; render(); }).catch(() => {});
     }
+    if (msg.topic === 'store_order') {
+      // The shopkeeper moved an order along. The moment one turns "ready" is
+      // the come-and-get-it signal for a pickup order, so shout it.
+      api('/api/store-orders').then((o) => {
+        const wasReady = new Set((state.shopOrders || []).filter((x) => x.status === 'ready').map((x) => x.id));
+        state.shopOrders = o.orders || [];
+        for (const ord of state.shopOrders) {
+          if (ord.status === 'ready' && !wasReady.has(ord.id) && ord.fulfilment === 'pickup') {
+            toast(`📦 ${ord.storeName} packed your order — pickup code ${ord.pickupCode}`);
+          }
+        }
+        if (state.tab === 'shops') render();
+      }).catch(() => {});
+    }
     if (msg.topic === 'wallet') {
       // A withdrawal was decided — refetch balance + ledger, then tell the user.
       Promise.all([api('/api/auth/me'), loadTxns()]).then(([me]) => {
@@ -2483,13 +2497,21 @@ function subscriptionCard(s) {
 }
 
 function shopOrderCard(o) {
-  const steps = { placed: 'Sent to the shop', accepted: 'Shopkeeper is packing', ready: 'Ready for you', delivered: 'Done', cancelled: 'Cancelled' };
+  const pickup = o.fulfilment === 'pickup';
+  const steps = {
+    placed: 'Sent to the shop',
+    accepted: 'Shopkeeper is packing',
+    ready: pickup ? 'Packed and waiting — come collect it!' : 'Ready for you',
+    collected: 'Courier is on the way',
+    delivered: pickup ? 'Collected' : 'Done',
+    cancelled: 'Cancelled'
+  };
   return `
   <div class="card">
     <div class="row">
       <div class="grow">
         <div style="font-weight:800">${o.storeIcon || '🏪'} ${esc(o.storeName)}</div>
-        <div class="muted small">${o.items.map((l) => `${l.qty}× ${esc(l.name)}`).join(', ')}</div>
+        <div class="muted small">${o.items.map((l) => `${l.qty}× ${esc(l.name)}`).join(', ')}${pickup ? ' · 🏃 pickup' : ''}</div>
         <div class="muted small" style="margin-top:4px;color:var(--accent)">${steps[o.status] || o.status}</div>
       </div>
       <div style="text-align:right">
@@ -2497,6 +2519,11 @@ function shopOrderCard(o) {
         ${o.payment === 'cash' ? '<div class="muted small">💵 pay on handover</div>' : ''}
       </div>
     </div>
+    ${pickup && o.status === 'ready' && o.pickupCode ? `
+    <div style="margin-top:10px;text-align:center;border:1px dashed var(--accent);border-radius:12px;padding:10px">
+      <div class="muted small">Show this code at the counter</div>
+      <div style="font-size:30px;font-weight:900;letter-spacing:8px">${esc(o.pickupCode)}</div>
+    </div>` : ''}
     ${o.status === 'placed' ? `<button class="btn danger compact" style="margin-top:10px" onclick="cancelShopOrder('${o.id}')">Cancel order</button>` : ''}
   </div>`;
 }
@@ -2506,7 +2533,10 @@ function shopDetailView() {
   const cart = state.shopCart || {};
   const lines = s.items.filter((i) => cart[i.id]);
   const subtotal = lines.reduce((sum, i) => sum + i.price * cart[i.id], 0);
-  const fee = s.store.deliveryFee || 0;
+  // Order from the sofa, collect at the counter: pickup skips the delivery fee.
+  const canDeliver = (s.store.deliveryFee || 0) > 0;
+  const fulfil = canDeliver && state.shopFulfil === 'delivery' ? 'delivery' : 'pickup';
+  const fee = fulfil === 'delivery' ? s.store.deliveryFee : 0;
   const service = state.shopPay === 'cash' ? 0 : (state.shopServiceFee || 0);
   const total = subtotal + fee + service;
   return `
@@ -2520,6 +2550,11 @@ function shopDetailView() {
   <div style="height:${lines.length ? 190 : 70}px"></div>
   ${lines.length ? `
   <div class="cartbar">
+    ${canDeliver ? `
+    <div class="grid2" style="margin-bottom:8px">
+      <button class="btn ${fulfil === 'pickup' ? '' : 'ghost'} compact" onclick="setShopFulfil('pickup')">🏃 I'll collect — free</button>
+      <button class="btn ${fulfil === 'delivery' ? '' : 'ghost'} compact" onclick="setShopFulfil('delivery')">🛵 Deliver · ${money(s.store.deliveryFee)}</button>
+    </div>` : ''}
     <div class="grid2" style="margin-bottom:8px">
       <button class="btn ${state.shopPay !== 'cash' ? '' : 'ghost'} compact" onclick="setShopPay('wallet')">👛 Wallet</button>
       <button class="btn ${state.shopPay === 'cash' ? '' : 'ghost'} compact" onclick="setShopPay('cash')">💵 Cash</button>
@@ -2528,6 +2563,7 @@ function shopDetailView() {
       Order ${lines.length} item${lines.length > 1 ? 's' : ''} · ${money(total)}
       <span class="small" style="font-weight:600">(${money(subtotal)} goods${fee ? ` + ${money(fee)} delivery` : ''}${service ? ` + ${money(service)} fee` : ''})</span>
     </button>
+    ${fulfil === 'pickup' ? `<div class="muted small" style="text-align:center;margin-top:6px">Pack it while you walk over — show your code, grab it, go 🏃</div>` : ''}
   </div>` : ''}`;
 }
 
@@ -2563,6 +2599,7 @@ window.openShopFront = async (id) => {
     const data = await api(`/api/stores/${id}`);
     state.shop = data;
     state.shopCart = {};
+    state.shopFulfil = 'pickup';
     state.shopServiceFee = data.serviceFee || 0;
     render();
   } catch (e) { toast(e.message, true); }
@@ -2579,6 +2616,8 @@ window.shopCartAdd = (id, delta) => {
 };
 
 window.setShopPay = (how) => { state.shopPay = how; render(); };
+
+window.setShopFulfil = (how) => { state.shopFulfil = how; render(); };
 
 window.subscribeItem = async (itemId) => {
   try {
@@ -2609,17 +2648,19 @@ window.placeShopOrder = async () => {
   const cart = state.shopCart || {};
   const items = Object.entries(cart).map(([itemId, qty]) => ({ itemId, qty }));
   if (!items.length) return;
+  const canDeliver = (state.shop.store.deliveryFee || 0) > 0;
+  const fulfilment = canDeliver && state.shopFulfil === 'delivery' ? 'delivery' : 'pickup';
   try {
     const data = await api('/api/store-orders', {
       method: 'POST',
-      body: { storeId: state.shop.store.id, items, payment: state.shopPay === 'cash' ? 'cash' : 'wallet' }
+      body: { storeId: state.shop.store.id, items, payment: state.shopPay === 'cash' ? 'cash' : 'wallet', fulfilment }
     });
     if (data.user) setUser(data.user);
     state.shop = null;
     state.shopCart = {};
     const o = await api('/api/store-orders');
     state.shopOrders = o.orders || [];
-    toast('Order sent to the shop 🏪');
+    toast(fulfilment === 'pickup' ? 'Order sent — we\'ll tell you when it\'s packed 🏪' : 'Order sent to the shop 🏪');
     render();
   } catch (e) { toast(e.message, true); }
 };

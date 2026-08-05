@@ -567,6 +567,7 @@ function deliveryView(order, driver) {
 router.get('/driver/deliveries', authDriver, (req, res) => {
   if (!driverIsAvailable(req.driver) || req.driver.tier !== 'bike') return res.json({ deliveries: [] });
   if (currentJob(req.driver.id) || currentDelivery(req.driver.id)) return res.json({ deliveries: [] });
+  if (runs.runForCourier(req.driver.id)) return res.json({ deliveries: [] });
   const deliveries = db.orders
     .filter((o) => o.fulfillment === 'live' && !o.courierId && orderWithStatus(o).status === 'preparing')
     // Regional: only restaurants this courier can realistically reach.
@@ -591,6 +592,7 @@ router.post('/driver/deliveries/:id/accept', authDriver, (req, res) => {
   }
   if (currentJob(req.driver.id)) return res.status(409).json({ error: 'Finish your current trip first.' });
   if (currentDelivery(req.driver.id)) return res.status(409).json({ error: 'Finish your current delivery first.' });
+  if (runs.runForCourier(req.driver.id)) return res.status(409).json({ error: 'Finish your delivery run first.' });
   const order = db.orders.find((o) => o.id === req.params.id && o.fulfillment === 'live');
   if (!order) return res.status(404).json({ error: 'Delivery not found.' });
   // Cash float check on the PROJECTED debt: refuse the job before the cash is in
@@ -765,6 +767,10 @@ router.post('/driver/runs/:id/accept', authDriver, (req, res) => {
   run.courierId = req.driver.id;
   run.courier = driverPublic(req.driver);
   run.acceptedAt = Date.now();
+  // Release the offer. Leaving it pointed at the accepting rider let them later
+  // "decline" a run they were already working. Keep declined/passed — the sweep
+  // reads those if the run ever returns to the pool.
+  run.offer = { ...run.offer, driverId: null, expiresAt: 0 };
   for (const orderId of run.orderIds) {
     const order = db.storeOrders.find((o) => o.id === orderId);
     if (order) {
@@ -783,6 +789,12 @@ router.post('/driver/runs/:id/decline', authDriver, (req, res) => {
   if (!run || !run.offer || run.offer.driverId !== req.driver.id) {
     return res.status(404).json({ error: 'Run not found.' });
   }
+  // Decline is for an OFFER only. Handing back a run already in progress needs a
+  // real abandon path — declining it would push a half-worked run, stops still
+  // ticked, back into the pool for someone else to finish and be paid in full for.
+  if (run.status !== 'offered' || run.courierId) {
+    return res.status(409).json({ error: 'You have already accepted this run.' });
+  }
   run.offer.declined = [...new Set([...(run.offer.declined || []), req.driver.id])];
   run.offer.driverId = null;
   run.offer.expiresAt = 0;
@@ -796,8 +808,8 @@ router.post('/driver/runs/:id/decline', authDriver, (req, res) => {
 router.post('/driver/runs/:id/stops/:seq/done', authDriver, (req, res) => {
   const run = db.deliveryRuns.find((r) => r.id === req.params.id && r.courierId === req.driver.id);
   if (!run) return res.status(404).json({ error: 'Run not found.' });
-  if (run.status === 'completed' || run.status === 'cancelled') {
-    return res.status(400).json({ error: 'This run is finished.' });
+  if (run.status !== 'collecting' && run.status !== 'delivering') {
+    return res.status(400).json({ error: 'This run is not active.' });
   }
   const seq = Number(req.params.seq);
   const stop = run.stops.find((s) => s.seq === seq);
@@ -825,10 +837,13 @@ router.post('/driver/runs/:id/stops/:seq/done', authDriver, (req, res) => {
     if (run.stops.every((s) => s.type !== 'pickup' || s.done)) run.status = 'delivering';
   } else {
     const order = db.storeOrders.find((o) => o.id === stop.orderId);
-    if (order && order.status !== 'delivered' && order.status !== 'cancelled') {
+    // Drive settlement off its OWN flag rather than the order's status. Status
+    // is written by several paths, and gating on it meant another path marking
+    // the order delivered silently skipped the courier's cash debit.
+    if (order && order.status !== 'cancelled') {
       order.status = 'delivered';
-      order.deliveredAt = Date.now();
-      settleStoreOrderOnDelivery(order, req.driver);
+      order.deliveredAt = order.deliveredAt || Date.now();
+      if (!order.moneySettledAt) settleStoreOrderOnDelivery(order, req.driver);
       events.publish(`user:${order.userId}`, { topic: 'store_order' });
       events.publish(`partner:${order.partnerId}`, { topic: 'store_orders' });
     }
@@ -884,12 +899,15 @@ function settleStoreOrderOnDelivery(order, courier) {
         refId: order.id
       });
     }
-    recordPlatformRevenue({
-      source: 'store_commission',
-      label: `Store commission (cash): ${order.storeName}`,
-      amount: order.commission,
-      refId: order.id
-    });
+    if (!order.partnerSettled) {
+      // Inside the settled guard so no future path can double-book the cut.
+      recordPlatformRevenue({
+        source: 'store_commission',
+        label: `Store commission (cash): ${order.storeName}`,
+        amount: order.commission,
+        refId: order.id
+      });
+    }
   } else if (owner && !order.partnerSettled) {
     // Prepaid: the shop's pending income becomes withdrawable now.
     owner.pendingEarnings = (owner.pendingEarnings || 0) - order.partnerCut;
@@ -903,6 +921,7 @@ function settleStoreOrderOnDelivery(order, courier) {
     });
   }
   order.partnerSettled = true;
+  order.moneySettledAt = Date.now();
 }
 
 module.exports = router;

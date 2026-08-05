@@ -22,6 +22,8 @@ const RIDE_OFFER_SECONDS = (() => {
 // Live rides carry explicit statuses, so a stored-status scan is enough.
 function driverBusy(driverId) {
   if (currentDelivery(driverId)) return true;
+  // A rider working a batched shop-delivery run is not free for a ride either.
+  if (require('./deliveryRuns').runForCourier(driverId)) return true;
   return db.rides.some(
     (r) => r.driverId === driverId && (r.status === 'driver_en_route' || r.status === 'in_progress')
   );

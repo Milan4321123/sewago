@@ -289,10 +289,12 @@ setInterval(() => {
 
 // Courier batching: groups packed shop orders into multi-stop runs and offers
 // each to the nearest suitable rider, cycling on when an offer lapses.
-const { sweepDeliveryRuns } = require('./deliveryRuns');
+const { sweepDeliveryRuns, recoverAbandonedRuns } = require('./deliveryRuns');
 setInterval(() => {
   try {
-    if (sweepDeliveryRuns()) save();
+    // Recover abandoned runs first so their orders are back in the pool before
+    // this same pass tries to batch and offer.
+    if (recoverAbandonedRuns() + sweepDeliveryRuns()) save();
   } catch (e) { logger.error('delivery_sweep_failed', { err: e.message }); }
 }, 5000).unref();
 
