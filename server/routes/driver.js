@@ -767,6 +767,17 @@ router.post('/driver/runs/:id/accept', authDriver, (req, res) => {
   if (run.offer.expiresAt <= Date.now()) {
     return res.status(409).json({ error: 'That offer expired.' });
   }
+  // The offer window is exactly when a shopkeeper may still hand an order over
+  // at the counter (the handover guard only blocks collecting/delivering runs),
+  // so re-check the cargo at the moment of acceptance. Accepting stale meant a
+  // rider could tick no-op stops and be paid the full payout for delivering
+  // nothing.
+  if (runs.pruneDeadOrders(run)) {
+    save();
+    if (run.status === 'cancelled') {
+      return res.status(409).json({ error: 'That run’s orders were already handed over or cancelled.' });
+    }
+  }
   // Re-check the float at the moment of accepting — the rider may have taken on
   // cash elsewhere since the offer was made.
   if (!cashJobFitsFloat(req.driver, run.cashToCollect)) {

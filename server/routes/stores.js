@@ -14,8 +14,8 @@ const events = require('../events');
 const { logAudit } = require('../audit');
 const {
   UNITS, MAX_ITEMS_PER_STORE, isUnit, storeById, itemIn, storeIsLive, storeIsOpen,
-  moveStock, reorderSuggestions, storeStats, lowStockThreshold, canManageStore,
-  publicItem, publicStore
+  moveStock, reorderSuggestions, storeStats, salesInsights, lowStockThreshold,
+  canManageStore, publicItem, publicStore
 } = require('../stores');
 const search = require('../storeSearch');
 const ai = require('../ai');
@@ -371,6 +371,20 @@ router.get('/partner/stores/:id/reorder', authPartner, (req, res) => {
   const store = manageableStore(req, res, { helpersAllowed: false });
   if (!store) return;
   res.json({ suggestions: reorderSuggestions(store), stats: storeStats(store) });
+});
+
+// "How is my shop doing?" — today's sales by item and by hour, plus a 7-day
+// rhythm. The client sends its own midnight as ?since= because the shop's
+// "today" is the phone's timezone, not the server's. Clamped so the endpoint
+// stays a dashboard, not a bulk-export API. Owner only — helpers count
+// shelves, they never see money.
+router.get('/partner/stores/:id/insights', authPartner, (req, res) => {
+  const store = manageableStore(req, res, { helpersAllowed: false });
+  if (!store) return;
+  const since = Number(req.query.since);
+  const floor = Date.now() - 8 * 86400000;
+  const clamped = Number.isFinite(since) ? Math.max(floor, Math.min(since, Date.now())) : undefined;
+  res.json(salesInsights(store, clamped));
 });
 
 // "Where did my stock go?" — the shopkeeper's audit trail.
@@ -1013,9 +1027,10 @@ router.post('/partner/store-orders/:orderId/:action(accept|reject|ready|handover
     // and settling here would mark it delivered, causing the run's dropoff to
     // skip the courier's cash debit entirely. The cash would simply vanish.
     // Only 'collecting'/'delivering' count: a run still forming or merely
-    // offered has no rider holding anything, and with no couriers around such
-    // a run never cancels — blocking on it would trap the order at the counter
-    // while the customer stands right there.
+    // offered has no rider holding anything — blocking on it would trap the
+    // order at the counter while the customer stands right there. The sweep
+    // (and the accept endpoint) prune handed-over orders out of waiting runs,
+    // so the run shrinks or cancels rather than sending a rider for nothing.
     const activeRun = require('../deliveryRuns').runContainingOrder(order.id);
     if (activeRun && (activeRun.status === 'collecting' || activeRun.status === 'delivering')) {
       return res.status(409).json({
