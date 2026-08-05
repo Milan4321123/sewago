@@ -340,9 +340,24 @@ function actionableOrderCount() {
 /* Real-time: refresh the order queue the instant an order lands or a courier
    moves it along. Falls back to a 20s poll while any order is actionable. */
 let eventSource = null;
-function connectEvents() {
-  if (eventSource || !state.token || typeof EventSource === 'undefined') return;
-  eventSource = new EventSource(`/api/events?role=partner&token=${encodeURIComponent(state.token)}`);
+let sseRetry = null;
+let sseConnecting = false;
+// The stream credential is a one-minute single-use ticket, not our session
+// token — query strings end up in proxy access logs. Because the ticket burns on
+// use, EventSource's own retry would loop on 401, so reconnects are ours to do.
+async function connectEvents() {
+  if (eventSource || !state.token || typeof EventSource === 'undefined' || sseConnecting) return;
+  sseConnecting = true;
+  let ticket;
+  try {
+    ticket = (await api('/api/events/ticket', { method: 'POST', body: { role: 'partner' } })).ticket;
+  } catch (err) {
+    sseConnecting = false;
+    return scheduleEventsRetry(); // the poll loop below still keeps the board current
+  }
+  sseConnecting = false;
+  if (!state.token || eventSource) return; // signed out or reconnected meanwhile
+  eventSource = new EventSource(`/api/events?role=partner&ticket=${encodeURIComponent(ticket)}`);
   eventSource.onmessage = async (e) => {
     let msg = {};
     try { msg = JSON.parse(e.data); } catch (err) { /* bare nudge */ }
@@ -371,9 +386,14 @@ function connectEvents() {
     }
     renderKeepingForms();
   };
-  eventSource.onerror = () => { /* EventSource retries on its own */ };
+  eventSource.onerror = () => { disconnectEvents(); scheduleEventsRetry(); };
+}
+function scheduleEventsRetry() {
+  if (sseRetry || !state.token) return;
+  sseRetry = setTimeout(() => { sseRetry = null; connectEvents(); }, 5000);
 }
 function disconnectEvents() {
+  if (sseRetry) { clearTimeout(sseRetry); sseRetry = null; }
   if (eventSource) { eventSource.close(); eventSource = null; }
 }
 setInterval(async () => {

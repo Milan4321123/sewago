@@ -1470,10 +1470,25 @@ async function syncDriverUI() {
 // SSE: new ride requests and trip changes arrive instantly, so an idle online
 // driver no longer polls every 2s just to wait for a request.
 let sseSource = null;
-function connectEvents() {
-  if (!state.token || typeof EventSource === 'undefined') return;
+let sseRetry = null;
+let sseConnecting = false;
+// The stream credential is a one-minute single-use ticket, not our session
+// token — query strings end up in proxy access logs. Because the ticket burns on
+// use, EventSource's own retry would loop on 401, so reconnects are ours to do.
+async function connectEvents() {
+  if (!state.token || typeof EventSource === 'undefined' || sseConnecting) return;
+  sseConnecting = true;
   disconnectEvents();
-  sseSource = new EventSource('/api/events?role=driver&token=' + encodeURIComponent(state.token));
+  let ticket;
+  try {
+    ticket = (await api('/api/events/ticket', { method: 'POST', body: { role: 'driver' } })).ticket;
+  } catch (e) {
+    sseConnecting = false;
+    return scheduleEventsRetry(); // the poll loop below still keeps the driver current
+  }
+  sseConnecting = false;
+  if (!state.token) return; // signed out while the ticket was in flight
+  sseSource = new EventSource('/api/events?role=driver&ticket=' + encodeURIComponent(ticket));
   sseSource.onmessage = (ev) => {
     let msg = {};
     try { msg = JSON.parse(ev.data); } catch (e) { /* bare nudge — still refresh */ }
@@ -1482,8 +1497,14 @@ function connectEvents() {
     if (msg.topic === 'run_offer') state.offersHiddenKey = null;
     syncDriverUI().catch(() => {});
   };
+  sseSource.onerror = () => scheduleEventsRetry();
+}
+function scheduleEventsRetry() {
+  if (sseRetry || !state.token) return;
+  sseRetry = setTimeout(() => { sseRetry = null; connectEvents(); }, 5000);
 }
 function disconnectEvents() {
+  if (sseRetry) { clearTimeout(sseRetry); sseRetry = null; }
   if (sseSource) { sseSource.close(); sseSource = null; }
 }
 

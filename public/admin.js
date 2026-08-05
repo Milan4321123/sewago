@@ -994,10 +994,25 @@ function stopLiveTimer() {
 // SSE push: rides/orders/bookings changes refresh the live view instantly. The
 // timer above stays as a safety net (and covers time-based sim-ride transitions).
 let sseSource = null;
-function connectEvents() {
-  if (!state.token || typeof EventSource === 'undefined') return;
+let sseRetry = null;
+let sseConnecting = false;
+// The stream credential is a one-minute single-use ticket, not our session
+// token — query strings end up in proxy access logs. Because the ticket burns on
+// use, EventSource's own retry would loop on 401, so reconnects are ours to do.
+async function connectEvents() {
+  if (!state.token || typeof EventSource === 'undefined' || sseConnecting) return;
+  sseConnecting = true;
   disconnectEvents();
-  sseSource = new EventSource('/api/events?role=admin&token=' + encodeURIComponent(state.token));
+  let ticket;
+  try {
+    ticket = (await api('/api/events/ticket', { method: 'POST', body: { role: 'admin' } })).ticket;
+  } catch (e) {
+    sseConnecting = false;
+    return scheduleEventsRetry(); // the refresh timer above is the safety net
+  }
+  sseConnecting = false;
+  if (!state.token) return; // signed out while the ticket was in flight
+  sseSource = new EventSource('/api/events?role=admin&ticket=' + encodeURIComponent(ticket));
   sseSource.onmessage = async () => {
     if (state.tab !== 'live' || !state.loggedIn) return;
     try {
@@ -1005,8 +1020,14 @@ function connectEvents() {
       if (state.tab === 'live') refreshLiveDom();
     } catch (e) { /* ignore */ }
   };
+  sseSource.onerror = () => scheduleEventsRetry();
+}
+function scheduleEventsRetry() {
+  if (sseRetry || !state.token) return;
+  sseRetry = setTimeout(() => { sseRetry = null; connectEvents(); }, 5000);
 }
 function disconnectEvents() {
+  if (sseRetry) { clearTimeout(sseRetry); sseRetry = null; }
   if (sseSource) { sseSource.close(); sseSource = null; }
 }
 

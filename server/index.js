@@ -11,6 +11,7 @@ const { recoverAbandonedDeliveries } = require('./orderLogic');
 const metrics = require('./metrics');
 const logger = require('./logger');
 const events = require('./events');
+const streamTickets = require('./streamTickets');
 
 validateProductionConfig();
 
@@ -186,29 +187,61 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// Real-time push channel. EventSource can't send an Authorization header, so the
-// session token comes as a query param (path-only logging keeps it out of logs).
-// A connection subscribes to the audiences that concern it and then only receives
-// "refresh" nudges — never data — so nothing sensitive rides the stream.
-app.get('/api/events', (req, res) => {
-  const token = req.query.token;
-  const role = req.query.role;
-  let audiences = null;
-  if (role === 'user') {
-    const id = sessionTokens.tokenOwner(db.tokens, token);
-    if (id) audiences = [`user:${id}`];
-  } else if (role === 'driver') {
-    const id = sessionTokens.tokenOwner(db.driverTokens, token);
-    if (id) {
-      const driver = db.drivers.find((d) => d.id === id);
-      audiences = [`driver:${id}`, 'drivers:all', driver ? `drivers:${driver.tier}` : null].filter(Boolean);
-    }
-  } else if (role === 'partner') {
-    const id = sessionTokens.tokenOwner(db.partnerTokens, token);
-    if (id) audiences = [`partner:${id}`];
-  } else if (role === 'admin') {
-    if (sessionTokens.tokenOwner(db.adminTokens, token) === 'admin') audiences = ['admin'];
+// Real-time push channel. A connection subscribes to the audiences that concern
+// it and then only receives "refresh" nudges — never data — so nothing sensitive
+// rides the stream itself.
+//
+// EventSource cannot send an Authorization header, so the credential has to
+// travel in the URL. It is a one-minute single-use ticket rather than the 60-day
+// session token, because every proxy in front of this app logs query strings and
+// we do not control how long those logs live. Clients call POST /api/events/ticket
+// with their normal Authorization header first.
+const TOKEN_MAPS_BY_ROLE = {
+  user: () => db.tokens,
+  driver: () => db.driverTokens,
+  partner: () => db.partnerTokens,
+  admin: () => db.adminTokens
+};
+
+function bearerOwner(req, role) {
+  const map = TOKEN_MAPS_BY_ROLE[role];
+  if (!map) return null;
+  const header = req.headers.authorization || '';
+  if (!header.startsWith('Bearer ')) return null;
+  return sessionTokens.tokenOwner(map(), header.slice(7));
+}
+
+function audiencesFor(role, ownerId) {
+  if (role === 'user') return [`user:${ownerId}`];
+  if (role === 'driver') {
+    const driver = db.drivers.find((d) => d.id === ownerId);
+    return [`driver:${ownerId}`, 'drivers:all', driver ? `drivers:${driver.tier}` : null].filter(Boolean);
   }
+  if (role === 'partner') return [`partner:${ownerId}`];
+  if (role === 'admin') return ownerId === 'admin' ? ['admin'] : null;
+  return null;
+}
+
+app.post('/api/events/ticket', (req, res) => {
+  const role = String((req.body || {}).role || req.query.role || '');
+  const ownerId = bearerOwner(req, role);
+  if (!ownerId) return res.status(401).json({ error: 'Unauthorized.' });
+  res.json(streamTickets.issue(role, ownerId));
+});
+
+app.get('/api/events', (req, res) => {
+  const role = req.query.role;
+  let ownerId = null;
+  if (req.query.ticket) {
+    const redeemed = streamTickets.redeem(String(req.query.ticket), role);
+    ownerId = redeemed ? redeemed.ownerId : null;
+  } else if (!config.isProduction && req.query.token) {
+    // Dev/test convenience only. In production a session token in a query string
+    // is exactly what the ticket exists to prevent, so it is not accepted there.
+    const map = TOKEN_MAPS_BY_ROLE[role];
+    ownerId = map ? sessionTokens.tokenOwner(map(), req.query.token) : null;
+  }
+  const audiences = ownerId ? audiencesFor(role, ownerId) : null;
   if (!audiences) return res.status(401).json({ error: 'Unauthorized.' });
   events.subscribe(req, res, audiences);
 });
