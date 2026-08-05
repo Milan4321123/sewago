@@ -15,10 +15,10 @@ services:
         value: production
       - key: TRUST_PROXY
         value: "true"
-      # Per-row Supabase store for real traffic.
-      # The app auto-imports the existing blob on first boot; blob is kept for rollback.
+      # Set to supabase_rows once docs/supabase-schema.sql has been applied
+      # (the app auto-imports the blob on first boot; blob is kept for rollback).
       - key: DATA_STORE
-        value: supabase_rows
+        value: supabase
       - key: SUPABASE_URL
         sync: false
       - key: SUPABASE_SERVICE_ROLE_KEY
@@ -31,10 +31,11 @@ services:
         sync: false
       - key: ADMIN_PASSWORD
         sync: false
+      # Per-driver KYC code, issued out-of-band. NEVER set
+      # ALLOW_DEMO_VERIFICATION_IN_PRODUCTION here — it would let anyone
+      # self-verify as a driver with the shared demo code.
       - key: DRIVER_LICENSE_DEMO_CODE
         sync: false
-      - key: ALLOW_DEMO_VERIFICATION_IN_PRODUCTION
-        value: "true"
       - key: OTP_PROVIDER
         value: twilio
       - key: TWILIO_ACCOUNT_SID
@@ -61,6 +62,7 @@ services:
         sync: false
       - key: ESEWA_MODE
         value: live
-      # Remove this override once Twilio + email + gateway keys are real.
-      - key: ALLOW_SANDBOX_PROVIDERS_IN_PRODUCTION
-        value: "true"
+      # NOTE: ALLOW_SANDBOX_PROVIDERS_IN_PRODUCTION is intentionally NOT set.
+      # Production must fail closed — it will refuse to boot until real Twilio,
+      # email, and payment-gateway keys are configured above. Never add the flag
+      # to take real money: it would let the PIN-1234 sandbox mint free balance.

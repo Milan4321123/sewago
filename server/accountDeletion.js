@@ -69,6 +69,9 @@ function deletionBlockers(kind, entity) {
     if ((entity.earnings || 0) > 0) {
       blockers.push(`withdraw your Rs ${entity.earnings} earnings first so you do not lose them`);
     }
+    if ((entity.earnings || 0) < 0) {
+      blockers.push(`settle the Rs ${-entity.earnings} commission you owe SewaGo before deleting your account`);
+    }
   }
 
   if (kind === 'partner') {
@@ -83,6 +86,9 @@ function deletionBlockers(kind, entity) {
     }
     if ((entity.earnings || 0) > 0) {
       blockers.push(`withdraw your Rs ${entity.earnings} earnings first so you do not lose them`);
+    }
+    if ((entity.earnings || 0) < 0) {
+      blockers.push(`settle the Rs ${-entity.earnings} you owe SewaGo before deleting your account`);
     }
   }
 
@@ -115,6 +121,7 @@ function anonymize(kind, entity) {
   if (kind === 'driver') {
     entity.online = false;
     entity.earnings = 0;
+    entity.pendingEarnings = 0;
     delete entity.lat;
     delete entity.lng;
     delete entity.locationAt;
@@ -125,6 +132,7 @@ function anonymize(kind, entity) {
   }
   if (kind === 'partner') {
     entity.earnings = 0;
+    entity.pendingEarnings = 0;
     if (entity.businessKyc) {
       entity.businessKyc = { legalName: '', regNo: '', documentRef: '', submittedAt: null, reviewedAt: null, note: '' };
     }

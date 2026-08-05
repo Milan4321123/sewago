@@ -15,6 +15,15 @@ function envInt(name, fallback) {
 const RIDE_SERVICE_FEE = envInt('RIDE_SERVICE_FEE', 5);
 const FOOD_SERVICE_FEE = envInt('FOOD_SERVICE_FEE', 15);
 
+// General-store (kirana) orders. Grocery margins are thin — a shopkeeper works
+// on roughly 10-15% gross — so the platform cut is deliberately much smaller
+// than food delivery's 15%, or listing here would cost them money.
+const STORE_COMMISSION_PCT = (() => {
+  const n = Number(process.env.STORE_COMMISSION_PCT);
+  return Number.isFinite(n) && n >= 0 && n <= 30 ? n : 8;
+})();
+const STORE_SERVICE_FEE = envInt('STORE_SERVICE_FEE', 5);
+
 // Charged when a wallet ride is cancelled after a real driver already accepted;
 // half compensates that driver for the wasted trip. Simulated and cash rides
 // are exempt (no real driver lost time / nothing was collected).
@@ -73,6 +82,8 @@ function cancelFeeSplit() {
 module.exports = {
   RIDE_SERVICE_FEE,
   FOOD_SERVICE_FEE,
+  STORE_COMMISSION_PCT,
+  STORE_SERVICE_FEE,
   RIDE_CANCEL_FEE,
   SURGE_CAP,
   FOOD_DELIVERY_FREE_KM,

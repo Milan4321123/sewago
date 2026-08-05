@@ -74,6 +74,8 @@ async function loadCore() {
     api('/api/admin/payments')
   ]);
   state.stats = o.stats;
+  state.revenueTrend = o.revenueTrend || [];
+  state.reconciliation = o.reconciliation || null;
   state.queue = q;
   state.partners = p.partners;
   state.payments = pay;
@@ -262,8 +264,14 @@ function mountLiveMap(data) {
   L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', { maxZoom: 19 }).addTo(liveMap);
   liveLayer = L.layerGroup().addTo(liveMap);
   const pts = plotLive(data);
-  if (pts.length) liveMap.fitBounds(L.latLngBounds(pts).pad(0.3), { maxZoom: 15 });
-  else liveMap.setView(KATHMANDU, 12);
+  // The container was just inserted, so Leaflet may have measured it at 0x0 —
+  // recompute the size on the next frame or fitBounds picks a world-level zoom.
+  setTimeout(() => {
+    if (!liveMap) return;
+    liveMap.invalidateSize();
+    if (pts.length) liveMap.fitBounds(L.latLngBounds(pts).pad(0.3), { maxZoom: 15 });
+    else liveMap.setView(KATHMANDU, 12);
+  }, 50);
 }
 
 function updateLiveMap(data) {
@@ -304,6 +312,55 @@ function statTile(label, value) {
   return `<div class="kpi"><div class="v">${value}</div><div class="l">${label}</div></div>`;
 }
 
+// The books check themselves: the append-only ledger vs the same revenue
+// recomputed from booking rows. Any drift means a money path wrote one and not
+// the other, so it is shown loudly rather than quietly corrupting the numbers.
+function reconciliationRow() {
+  const r = state.reconciliation;
+  if (!r) return '';
+  if (!r.drift) {
+    return `<div class="card" style="border:1px solid rgba(34,197,94,0.4)">
+      <div class="list-row" style="border:none;padding:0">
+        <div>✅ <b>Books reconcile</b><div class="muted small">Ledger matches revenue recomputed from bookings.</div></div>
+        <div class="rt"><b style="color:var(--accent)">${money(r.ledgerTotal)}</b></div>
+      </div>
+    </div>`;
+  }
+  return `<div class="card" style="border:1px solid #b91c1c;background:rgba(185,28,28,0.12)">
+    <div style="font-weight:900;color:#fca5a5">⚠️ Books do not reconcile — drift ${money(r.drift)}</div>
+    <div class="muted small" style="margin-top:4px">
+      Ledger says <b style="color:var(--text)">${money(r.ledgerTotal)}</b>, recomputing from bookings says
+      <b style="color:var(--text)">${money(r.derivedTotal)}</b>. A money path is writing one but not the other — investigate before trusting these figures.
+    </div>
+  </div>`;
+}
+
+// 14-day revenue bars (inline SVG, ledger-driven). Hover a bar for the day's
+// exact numbers; the dots row underneath shows completed rides.
+function trendChart() {
+  const t = state.revenueTrend || [];
+  if (!t.length) return '';
+  const W = 560, H = 120, pad = 4;
+  const bw = (W - pad * 2) / t.length;
+  const max = Math.max(1, ...t.map((d) => d.revenue));
+  const bars = t.map((d, i) => {
+    const h = Math.max(d.revenue > 0 ? 3 : 0, Math.round((d.revenue / max) * (H - 24)));
+    const x = pad + i * bw;
+    const label = `${d.day}: Rs ${d.revenue.toLocaleString()} · ${d.rides} ride${d.rides === 1 ? '' : 's'}`;
+    return `<g><title>${label}</title>
+      <rect x="${(x + bw * 0.15).toFixed(1)}" y="${H - 16 - h}" width="${(bw * 0.7).toFixed(1)}" height="${h}" rx="2" fill="var(--accent)" opacity="${d.revenue ? 0.9 : 0.25}"></rect>
+      ${d.rides ? `<circle cx="${(x + bw / 2).toFixed(1)}" cy="${H - 7}" r="2.5" fill="var(--muted)"></circle>` : ''}
+    </g>`;
+  }).join('');
+  const total = t.reduce((s, d) => s + d.revenue, 0);
+  return `
+  <div class="section-title">Last 14 days · ${money(total)} revenue 📈</div>
+  <div class="card" style="overflow-x:auto">
+    <svg viewBox="0 0 ${W} ${H}" style="width:100%;max-height:140px;display:block">${bars}</svg>
+    <div class="muted small" style="display:flex;justify-content:space-between"><span>${t[0].day}</span><span>today</span></div>
+  </div>`;
+}
+
 function overviewView() {
   const s = state.stats;
   if (!s) return `<div class="empty"><div class="big">📊</div>Loading…</div>`;
@@ -322,6 +379,10 @@ function overviewView() {
     ${statTile('Hotels live', s.hotelsLive)}
   </div>
 
+  ${trendChart()}
+
+  ${reconciliationRow()}
+
   <div class="section-title">Revenue breakdown 💰</div>
   <div class="card">
     <div class="list-row"><div>🚗 Ride commission (20%)</div><div class="rt"><b>${money(s.rideCommission)}</b></div></div>
@@ -332,9 +393,146 @@ function overviewView() {
     <div class="list-row"><div>🧾 Service fees</div><div class="rt"><b>${money(s.serviceFees || 0)}</b></div></div>
     <div class="list-row"><div>⏱️ Late-cancel fees</div><div class="rt"><b>${money(s.cancelFees || 0)}</b></div></div>
     <div class="list-row"><div>⭐ Featured listings</div><div class="rt"><b>${money(s.promotionFees || 0)}</b></div></div>
+    ${s.courierPayouts ? `<div class="list-row"><div>🛵 Courier payouts <span class="muted small">(cost)</span></div><div class="rt"><b style="color:#f87171">${money(s.courierPayouts)}</b></div></div>` : ''}
     <div class="list-row"><div><b>Total</b></div><div class="rt"><b style="color:var(--accent)">${money(s.revenue)}</b></div></div>
   </div>`;
 }
+
+/* ---------------- people (customers + drivers) ---------------- */
+
+async function loadPeople(q) {
+  state.people = await api('/api/admin/people?q=' + encodeURIComponent(q || ''));
+  state.loggedIn = true;
+}
+
+function userRow(u) {
+  return `
+  <div class="card" style="margin-top:10px">
+    <div class="list-row" style="border:none;padding:0">
+      <div>
+        <b>${esc(u.name)}</b> ${u.suspended ? '<span class="tab-badge" style="background:#b91c1c">SUSPENDED</span>' : ''}
+        <div class="muted small">📧 ${esc(u.email)} · 📞 ${esc(u.phone)} ${u.phoneVerified ? '✓' : '⚠️'}</div>
+      </div>
+      <div class="rt"><b>${money(u.wallet)}</b><div class="muted small">wallet</div></div>
+    </div>
+    <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
+      <button class="btn ghost compact" onclick="adjustWallet('${u.id}', 1)">➕ Credit</button>
+      <button class="btn ghost compact" onclick="adjustWallet('${u.id}', -1)">➖ Debit</button>
+      ${u.suspended
+        ? `<button class="btn ghost compact" onclick="suspendPerson('users','${u.id}','unsuspend')">✓ Reinstate</button>`
+        : `<button class="btn ghost compact danger" onclick="suspendPerson('users','${u.id}','suspend')">⛔ Suspend</button>`}
+    </div>
+  </div>`;
+}
+
+function driverRow(d) {
+  const ver = d.verificationStatus;
+  return `
+  <div class="card" style="margin-top:10px">
+    <div class="list-row" style="border:none;padding:0">
+      <div>
+        <b>${esc(d.name)}</b>
+        <span class="muted small">· ${esc(d.tier)} · ${esc(d.vehicle || '—')} · ${esc(d.plate || '—')}</span>
+        ${d.suspended ? '<span class="tab-badge" style="background:#b91c1c">SUSPENDED</span>' : ''}
+        <div class="muted small">
+          ${d.online ? '🟢 online' : '⚪ offline'}${d.online && !d.locationFresh ? ' (GPS stale)' : ''}
+          · ⭐ ${d.rating || '—'} · ${d.tripsCompleted} trips
+          · license: <b style="color:${ver === 'verified' ? 'var(--accent)' : ver === 'rejected' ? '#f87171' : '#fbbf24'}">${esc(ver.toUpperCase())}</b>
+        </div>
+      </div>
+      <div class="rt">
+        ${d.commissionOwed > 0
+          ? `<b style="color:#f87171">–${money(d.commissionOwed)}</b><div class="muted small">owes SewaGo</div>`
+          : `<b>${money(d.earnings)}</b><div class="muted small">earnings</div>`}
+      </div>
+    </div>
+    <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
+      ${d.commissionOwed > 0 ? `<button class="btn compact" onclick="settleDriverCash('${d.id}', ${d.commissionOwed})">💵 Record cash settlement</button>` : ''}
+      ${ver !== 'verified' ? `<button class="btn ghost compact" onclick="decideDriverVerification('${d.id}','approve')">✓ Approve license</button>` : ''}
+      ${ver !== 'rejected' ? `<button class="btn ghost compact danger" onclick="decideDriverVerification('${d.id}','reject')">✕ Reject license</button>` : ''}
+      ${d.suspended
+        ? `<button class="btn ghost compact" onclick="suspendPerson('drivers','${d.id}','unsuspend')">✓ Reinstate</button>`
+        : `<button class="btn ghost compact danger" onclick="suspendPerson('drivers','${d.id}','suspend')">⛔ Suspend</button>`}
+    </div>
+  </div>`;
+}
+
+function peopleView() {
+  const p = state.people;
+  return `
+  <div class="section-title" style="margin-top:0">People 👥</div>
+  <div class="card">
+    <label class="field" style="margin:0"><span>Search customers & drivers (name, email, phone, plate)</span>
+      <input id="people-q" value="${esc(state.peopleQuery || '')}" placeholder="e.g. 98… or aarav"
+        onkeydown="if(event.key==='Enter')searchPeople()" />
+    </label>
+    <button class="btn compact" style="margin-top:10px" onclick="searchPeople()">Search</button>
+  </div>
+  ${!p ? `<div class="empty"><div class="big">👥</div>Loading…</div>` : `
+    <div class="section-title">Customers (${p.users.length}${state.peopleQuery ? ' matching' : ' newest'})</div>
+    ${p.users.length ? p.users.map(userRow).join('') : `<div class="empty">No customers found.</div>`}
+    <div class="section-title">Drivers (${p.drivers.length}${state.peopleQuery ? ' matching' : ' newest'})</div>
+    ${p.drivers.length ? p.drivers.map(driverRow).join('') : `<div class="empty">No drivers found.</div>`}
+  `}`;
+}
+
+window.searchPeople = async () => {
+  state.peopleQuery = ($('#people-q') || { value: '' }).value.trim();
+  try {
+    await loadPeople(state.peopleQuery);
+    renderMain();
+  } catch (e) { toast(e.message, true); }
+};
+
+window.suspendPerson = async (kind, id, action) => {
+  let note = '';
+  if (action === 'suspend') {
+    note = prompt('Reason for suspension (kept on the audit trail):') || '';
+    if (!note.trim()) return toast('Suspension needs a reason.', true);
+  }
+  try {
+    await api(`/api/admin/${kind}/${id}/${action}`, { method: 'POST', body: { note } });
+    toast(action === 'suspend' ? 'Account suspended ⛔' : 'Account reinstated ✓');
+    await loadPeople(state.peopleQuery || '');
+    renderMain();
+  } catch (e) { toast(e.message, true); }
+};
+
+window.settleDriverCash = async (id, owed) => {
+  const raw = prompt(`Cash collected from the driver (they owe ${money(owed)}). Enter amount, or leave blank to settle the full ${money(owed)}:`);
+  if (raw === null) return;
+  const body = raw.trim() ? { amount: Math.round(Number(raw)) } : {};
+  try {
+    const res = await api(`/api/admin/drivers/${id}/settle-cash`, { method: 'POST', body });
+    toast(`Recorded ${money(res.settled)} cash settlement ✓`);
+    await loadPeople(state.peopleQuery || '');
+    renderMain();
+  } catch (e) { toast(e.message, true); }
+};
+
+window.decideDriverVerification = async (id, action) => {
+  const note = action === 'reject' ? (prompt('Rejection note for the driver:') || '') : '';
+  if (action === 'reject' && !note.trim()) return toast('Rejection needs a note.', true);
+  try {
+    await api(`/api/admin/drivers/${id}/verification/${action}`, { method: 'POST', body: { note } });
+    toast(action === 'approve' ? 'Driver license approved ✓' : 'Driver license rejected.');
+    await loadPeople(state.peopleQuery || '');
+    renderMain();
+  } catch (e) { toast(e.message, true); }
+};
+
+window.adjustWallet = async (userId, sign) => {
+  const raw = prompt(sign > 0 ? 'Credit amount (Rs):' : 'Debit amount (Rs):');
+  if (raw === null) return;
+  const amount = Math.round(Number(raw)) * sign;
+  const reason = prompt('Reason (min 5 chars — goes on the audit trail and the customer\'s receipt):') || '';
+  try {
+    await api('/api/admin/wallet-adjust', { method: 'POST', body: { userId, amount, reason } });
+    toast('Wallet adjusted — the customer sees it as a receipt line ✓');
+    await loadPeople(state.peopleQuery || '');
+    renderMain();
+  } catch (e) { toast(e.message, true); }
+};
 
 /* ---------------- reviews ---------------- */
 
@@ -490,7 +688,8 @@ const TABS = [
   ['overview', 'Overview'],
   ['reviews', 'Reviews'],
   ['payments', 'Payments'],
-  ['partners', 'Partners']
+  ['partners', 'Partners'],
+  ['people', 'People']
 ];
 
 function tabBadge(tab) {
@@ -515,6 +714,7 @@ function mainContent() {
     case 'reviews': return reviewsView();
     case 'payments': return paymentsView();
     case 'partners': return partnersView();
+    case 'people': return peopleView();
     default: return liveView();
   }
 }
@@ -593,6 +793,7 @@ window.setTab = async (tab) => {
   renderMain();
   try {
     if (tab === 'live') await loadLive();
+    else if (tab === 'people') await loadPeople(state.peopleQuery || '');
     else await loadCore();
     if (state.tab === tab) renderMain();
   } catch (e) { toast(e.message, true); }

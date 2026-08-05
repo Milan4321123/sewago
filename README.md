@@ -26,7 +26,7 @@ npm run demo:seed
 
 This creates demo customers, online drivers, partner-owned restaurant/hotel listings, ride history, active food orders, stay bookings, open tasks and in-progress task work. It only replaces records whose IDs start with `demo-`, so your own local test data stays intact.
 
-- **Customer app:** http://localhost:4000 — create an account (Rs 5,000 demo wallet credit included)
+- **Customer app:** http://localhost:4000 — create an account (Rs 5,000 demo wallet credit included in development; production defaults to no signup credit — see `WELCOME_BONUS`)
   - demo login after `npm run demo:seed`: `aarav.demo@sewago.app` / `customer123`
 - **Driver app:** http://localhost:4000/driver — log in with a demo driver (password `driver123`):
   - 🏍️ `ramesh@sewago.app` (Bike) · 🚗 `sita@sewago.app` (Car) · 🚐 `dipesh@sewago.app` (XL)

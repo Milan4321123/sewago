@@ -6,6 +6,8 @@ const { config, validateProductionConfig } = require('./config');
 const { db, save, initDb, flushSaves, backupJsonState, saveHealth } = require('./db');
 const sessionTokens = require('./sessionTokens');
 const { sweepExpired } = sessionTokens;
+const { settleDueBookings } = require('./settlement');
+const { recoverAbandonedDeliveries } = require('./orderLogic');
 const metrics = require('./metrics');
 const logger = require('./logger');
 const events = require('./events');
@@ -138,7 +140,9 @@ app.use(
 app.get('/api/app-info', (req, res) => {
   res.json({
     androidApkUrl: config.androidApkUrl,
-    iosAppStoreUrl: config.iosAppStoreUrl
+    iosAppStoreUrl: config.iosAppStoreUrl,
+    // Clients hide demo credentials / seed-account hints outside development.
+    demo: !config.isProduction
   });
 });
 
@@ -213,6 +217,7 @@ app.use('/api', require('./routes/driver'));
 app.use('/api', require('./routes/partner'));
 app.use('/api', require('./routes/admin'));
 app.use('/api', require('./routes/tasks'));
+app.use('/api', require('./routes/stores'));
 app.use('/api', require('./routes/payments'));
 if (!config.isProduction) app.use('/api/demo', require('./routes/demo'));
 
@@ -304,6 +309,11 @@ setInterval(() => {
       dirty += 1;
     }
   }
+  // Move stay-booking income from pending to withdrawable once check-in passes.
+  dirty += settleDueBookings();
+  // Re-offer deliveries a courier accepted but never collected, and flag ones
+  // where the food was picked up and never delivered.
+  dirty += recoverAbandonedDeliveries();
   if (dirty) save();
 }, 60 * 60 * 1000).unref();
 

@@ -1,7 +1,7 @@
 const express = require('express');
 const { db, save, uid } = require('../db');
 const { authRequired, publicUser } = require('./auth');
-const { recordTxn, recordPlatformRevenue } = require('../payments');
+const { recordTxn, recordPlatformRevenue, debitWallet } = require('../payments');
 
 const router = express.Router();
 
@@ -76,7 +76,7 @@ router.post('/tasks', authRequired, (req, res) => {
     workerName: null,
     createdAt: Date.now()
   };
-  req.user.wallet -= amount; // held in escrow until confirmed
+  debitWallet(req.user, amount); // held in escrow until confirmed
   recordTxn('user', req.user, {
     type: 'task_hold',
     label: `Task budget held: ${task.title}`,

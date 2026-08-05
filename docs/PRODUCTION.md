@@ -88,23 +88,29 @@ transactions for true multi-instance concurrency.
 
 ## Payments
 
-`PAYMENT_PROVIDER=sandbox` is the only implemented provider right now.
-Setting another provider returns `501 Not Implemented` so the app does not
-pretend to take real money.
+Khalti (KPG-2 hosted checkout) and eSewa (signed ePay v2 form) are fully
+implemented in [server/gateways/](../server/gateways/): intents are created
+server-side, and **every credit is verified server-to-server** (Khalti lookup /
+eSewa status-check) before a rupee lands in a wallet — redirects alone are
+never trusted, credits are idempotent, and mismatched amounts are rejected.
 
-Before taking real payments:
+A method goes live automatically once its keys are present:
 
-1. Create real merchant accounts for eSewa/Khalti/Stripe.
-2. Implement provider intent creation in `POST /api/payments/topup/initiate`.
-3. Implement provider verification/webhook handling before crediting wallets.
-4. Store provider reference IDs on each payment.
-5. Verify webhook signatures or lookup responses server-side.
-6. Reconcile successful gateway payments against ledger transactions.
-7. Decide whether withdrawals are automated disbursements or admin-reviewed manual payouts.
+```bash
+KHALTI_SECRET_KEY=<live-secret>    KHALTI_MODE=live
+ESEWA_PRODUCT_CODE=<merchant-code> ESEWA_SECRET=<hmac-secret> ESEWA_MODE=live
+```
 
-The wallet ledger, order/booking earnings, driver cash-commission debt, and
-withdrawal queue are already separated enough to keep when provider verification
-is added.
+Without keys, development falls back to the PIN-1234 sandbox and production
+hides the method. Remaining ops decisions: whether withdrawals become automated
+disbursements or stay admin-reviewed, and periodic reconciliation of gateway
+statements against the ledger.
+
+Two production guards worth knowing about:
+
+- The demo free-money route (`POST /api/auth/wallet/topup`) has been removed.
+- The Rs 5,000 signup bonus is **development-only**; production defaults to 0.
+  Set `WELCOME_BONUS` explicitly to run a real, budgeted signup promotion.
 
 ## Phone OTP, Password Reset, KYC
 
@@ -153,10 +159,10 @@ ADMIN_EMAIL=ops@example.com
 ADMIN_PASSWORD=<strong-secret>
 DRIVER_LICENSE_DEMO_CODE=<replace-with-real-flow-or-secret>
 PUBLIC_APP_URL=https://your-domain.example
-DATA_STORE=supabase
+DATA_STORE=supabase_rows
 SUPABASE_URL=<your-supabase-url>
 SUPABASE_SERVICE_ROLE_KEY=<server-only-service-role-key>
-PAYMENT_PROVIDER=<real-provider-after-adapter>
+KHALTI_SECRET_KEY=<live-secret>           # and/or ESEWA_PRODUCT_CODE + ESEWA_SECRET
 OTP_PROVIDER=twilio
 TWILIO_ACCOUNT_SID=<twilio-account-sid>
 TWILIO_AUTH_TOKEN=<twilio-auth-token>

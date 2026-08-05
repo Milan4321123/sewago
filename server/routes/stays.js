@@ -1,7 +1,8 @@
 const express = require('express');
 const { db, save, uid } = require('../db');
+const { config } = require('../config');
 const { authRequired, publicUser } = require('./auth');
-const { recordTxn, recordPlatformRevenue } = require('../payments');
+const { recordTxn, recordPlatformRevenue, debitWallet } = require('../payments');
 const { applyRating, addReview, reviewsFor } = require('../orderLogic');
 const events = require('../events');
 
@@ -34,6 +35,12 @@ function isLive(listing) {
   return !listing.status || listing.status === 'approved';
 }
 
+// Seeded hotels have no partner owner behind them. In production a real guest
+// must never be able to book (and pay for) a room no real hotel will honour.
+function bookable(hotel) {
+  return isLive(hotel) && (config.allowSimFulfillment || !!hotel.ownerId);
+}
+
 router.get('/cities', authRequired, (req, res) => {
   res.json({ cities: [...new Set(db.hotels.filter(isLive).map((h) => h.city))].sort() });
 });
@@ -44,7 +51,7 @@ router.get('/hotels', authRequired, (req, res) => {
   if (datesGiven && checkIn >= checkOut) {
     return res.status(400).json({ error: 'Check-out must be after check-in.' });
   }
-  let hotels = db.hotels.filter((h) => isLive(h) && h.rooms.length > 0);
+  let hotels = db.hotels.filter((h) => bookable(h) && h.rooms.length > 0);
   if (city && city !== 'All') hotels = hotels.filter((h) => h.city === city);
   const featured = (h) => (h.promotedUntil > Date.now() ? 1 : 0);
   const result = hotels
@@ -61,7 +68,7 @@ router.get('/hotels', authRequired, (req, res) => {
 
 router.post('/bookings', authRequired, (req, res) => {
   const { hotelId, roomId, checkIn, checkOut } = req.body || {};
-  const hotel = db.hotels.find((h) => h.id === hotelId && isLive(h));
+  const hotel = db.hotels.find((h) => h.id === hotelId && bookable(h));
   const room = hotel && hotel.rooms.find((r) => r.id === roomId);
   if (!hotel || !room) return res.status(404).json({ error: 'Room not found.' });
   if (!isDate(checkIn) || !isDate(checkOut)) return res.status(400).json({ error: 'Valid dates are required.' });
@@ -95,7 +102,7 @@ router.post('/bookings', authRequired, (req, res) => {
     status: 'active',
     createdAt: Date.now()
   };
-  req.user.wallet -= total;
+  debitWallet(req.user, total);
   recordTxn('user', req.user, {
     type: 'stay',
     label: `Stay: ${hotel.name} (${nights} night${nights > 1 ? 's' : ''})`,
@@ -109,10 +116,14 @@ router.post('/bookings', authRequired, (req, res) => {
   if (owner) {
     booking.partnerId = owner.id;
     booking.partnerCut = Math.round(total * 0.9);
-    owner.earnings = (owner.earnings || 0) + booking.partnerCut;
+    booking.settled = false;
+    // Credit PENDING, not withdrawable earnings: a booking is fully refundable
+    // until check-in, so its income must not be cashable until then. Settled by
+    // the date-based sweep once check-in passes (see settleDueBookings).
+    owner.pendingEarnings = (owner.pendingEarnings || 0) + booking.partnerCut;
     recordTxn('partner', owner, {
-      type: 'booking_income',
-      label: `Booking income: ${hotel.name} (${nights} night${nights > 1 ? 's' : ''})`,
+      type: 'booking_income_pending',
+      label: `Booking (pending check-in): ${hotel.name} (${nights} night${nights > 1 ? 's' : ''})`,
       amount: booking.partnerCut,
       sign: 1,
       refId: booking.id
@@ -199,7 +210,9 @@ router.post('/bookings/:id/cancel', authRequired, (req, res) => {
   if (booking.partnerCut && booking.partnerId) {
     const owner = db.partners.find((p) => p.id === booking.partnerId);
     if (owner) {
-      owner.earnings = (owner.earnings || 0) - booking.partnerCut;
+      // Cancellation is only allowed before check-in, so the income is always
+      // still PENDING (never settled/withdrawable) — reverse it from there.
+      owner.pendingEarnings = (owner.pendingEarnings || 0) - booking.partnerCut;
       recordTxn('partner', owner, {
         type: 'booking_reversal',
         label: `Booking cancelled: ${booking.hotelName}`,

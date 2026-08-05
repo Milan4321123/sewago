@@ -737,16 +737,22 @@ function render() {
         <button class="btn ghost" style="margin-top:12px" onclick="updateGps()" ${state.locationBusy ? 'disabled' : ''}>
           ${state.locationBusy ? 'Reading GPS…' : 'Update live GPS'}
         </button>
-        <button class="btn ${d.online ? 'danger' : ''}" style="margin-top:8px" onclick="toggleOnline()" ${!d.licenseVerified || !d.phoneVerified ? 'disabled' : ''}>
+        <button class="btn ${d.online ? 'danger' : ''}" style="margin-top:8px" onclick="toggleOnline()" ${!d.licenseVerified || !d.phoneVerified || d.mustSettle ? 'disabled' : ''}>
           ${d.online ? 'Go offline' : 'Go online'}
         </button>
+        ${d.mustSettle ? `
+        <div class="card" style="margin-top:10px;border:1px solid #b91c1c;background:rgba(185,28,28,0.12)">
+          <div style="font-weight:900;color:#fca5a5">⚠️ Settle to keep driving</div>
+          <div class="muted small" style="margin-top:4px">You owe <b style="color:var(--text)">${money(d.commissionOwed)}</b> in cash-trip commission — over the limit. Pay it at any SewaGo point and you're back online instantly.</div>
+        </div>` : (d.commissionOwed > 0 ? `
+        <div class="muted small" style="margin-top:8px;color:#fbbf24">💵 Cash commission owed: <b>${money(d.commissionOwed)}</b> — settle at a SewaGo point before it hits the limit.</div>` : '')}
       </div>
       ${kycCard(d)}
       <div class="card">
         <div class="row">
           <div>
-            <div class="muted small">Earnings balance <span title="You keep 80% of each fare">(80% of fares)</span></div>
-            <div style="font-size:24px;font-weight:900">${money(d.earnings)}</div>
+            <div class="muted small">${d.commissionOwed > 0 ? 'Commission owed' : 'Earnings balance'} <span title="You keep 80% of each fare">(80% of fares)</span></div>
+            <div style="font-size:24px;font-weight:900;color:${d.commissionOwed > 0 ? '#fca5a5' : 'inherit'}">${d.commissionOwed > 0 ? '–' + money(d.commissionOwed) : money(d.earnings)}</div>
           </div>
           <div style="text-align:right">
             <div class="muted small">Trips</div>
@@ -818,6 +824,7 @@ function deliveriesSection() {
         </div>
         <div style="text-align:right">
           <div class="small" style="color:var(--accent);font-weight:800">you earn ${money(d.payout)}</div>
+          ${d.collectCash ? `<div class="small" style="color:#fbbf24;font-weight:800">💵 collect ${money(d.collectCash)}</div>` : ''}
         </div>
       </div>
       <button class="btn" style="margin-top:12px" onclick="acceptDelivery('${d.id}')">Accept delivery</button>
@@ -834,8 +841,12 @@ function deliveryCard(d) {
         <div><b>${d.restaurantIcon || '🍽️'} ${esc(d.restaurantName)} → ${esc(d.dropoffName)}</b></div>
         <div class="muted small">${esc(d.customerName)} · ${d.items} item${d.items > 1 ? 's' : ''}${d.routeKm != null ? ` · ${d.routeKm} km` : ''}</div>
       </div>
-      <div class="small" style="color:var(--accent);font-weight:800">you earn ${money(d.payout)}</div>
+      <div style="text-align:right">
+        <div class="small" style="color:var(--accent);font-weight:800">you earn ${money(d.payout)}</div>
+        ${d.collectCash ? `<div class="small" style="color:#fbbf24;font-weight:800">💵 collect ${money(d.collectCash)}</div>` : ''}
+      </div>
     </div>
+    ${d.collectCash ? `<div class="muted small" style="margin-top:8px">💵 Cash on delivery — collect <b style="color:var(--text)">${money(d.collectCash)}</b> at the door. You keep ${money(d.payout)}; the rest is owed to SewaGo and settled at any SewaGo point.</div>` : ''}
     ${atRestaurant
       ? `<div class="muted small" style="margin-top:8px">👨‍🍳 The kitchen is preparing the order — head to the restaurant.</div>
          ${navButton(d.restaurantLoc, 'Navigate to restaurant')}
@@ -876,7 +887,9 @@ window.completeDelivery = async (id) => {
     const data = await api(`/api/driver/deliveries/${id}/deliver`, { method: 'POST' });
     state.delivery = null;
     state.driver = data.driver;
-    toast(`Delivered! ${money(data.payout)} added to your earnings 💸`);
+    toast(data.collectCash
+      ? `Delivered! You keep ${money(data.payout)} of the ${money(data.collectCash)} collected — the rest is owed to SewaGo 💵`
+      : `Delivered! ${money(data.payout)} added to your earnings 💸`);
     await refresh();
     render();
   } catch (e) {

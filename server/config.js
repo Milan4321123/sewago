@@ -31,7 +31,39 @@ const config = {
   iosAppStoreUrl: process.env.IOS_APP_STORE_URL || '',
   allowJsonDbInProduction: process.env.ALLOW_JSON_DB_IN_PRODUCTION === 'true',
   allowSandboxProvidersInProduction: process.env.ALLOW_SANDBOX_PROVIDERS_IN_PRODUCTION === 'true',
-  allowDemoVerificationInProduction: process.env.ALLOW_DEMO_VERIFICATION_IN_PRODUCTION === 'true'
+  allowDemoVerificationInProduction: process.env.ALLOW_DEMO_VERIFICATION_IN_PRODUCTION === 'true',
+  // Simulated fulfillment (timer-driven fake driver / auto-"delivered" seed
+  // restaurants) lets the demo work with zero real supply. It charges a real
+  // wallet for a ride/order nobody fulfils, so it defaults OFF in production —
+  // a real customer is never billed for an undelivered service.
+  allowSimFulfillment: process.env.ALLOW_SIM_FULFILLMENT === 'true' ||
+    (!isProduction && process.env.ALLOW_SIM_FULFILLMENT !== 'false'),
+  // Cooling period before freshly topped-up wallet money can be withdrawn.
+  // Stops a top-up→instant-withdraw cash-out (card chargeback / laundering
+  // vector). Defaults to 12h in production, 0 in dev so demos/tests flow.
+  withdrawHoldMs: (() => {
+    const h = Number(process.env.WITHDRAW_HOLD_HOURS);
+    if (Number.isFinite(h) && h >= 0) return Math.round(h * 3600 * 1000);
+    return isProduction ? 12 * 3600 * 1000 : 0;
+  })(),
+  // On cash trips the rider pays the driver in full, so SewaGo's commission is
+  // owed by the driver (their earnings go negative). This caps how much a driver
+  // may owe before they must settle: once past it they cannot go online or take
+  // more cash trips, so the commission is actually collected instead of growing
+  // into uncollectable phantom revenue. Rs 2000 default.
+  cashCreditLimit: (() => {
+    const n = Number(process.env.CASH_CREDIT_LIMIT);
+    return Number.isFinite(n) && n >= 0 ? Math.round(n) : 2000;
+  })(),
+  // Largest cash-on-delivery order we will accept. Kept at or below the cash
+  // credit limit so a single COD order can always fit inside a courier's float
+  // (otherwise no courier could ever legitimately carry it).
+  codMaxOrderTotal: (() => {
+    const n = Number(process.env.COD_MAX_ORDER_TOTAL);
+    const limit = Number(process.env.CASH_CREDIT_LIMIT);
+    const cap = Number.isFinite(limit) && limit >= 0 ? Math.round(limit) : 2000;
+    return Number.isFinite(n) && n > 0 ? Math.min(Math.round(n), cap) : cap;
+  })()
 };
 
 function validateProductionConfig() {

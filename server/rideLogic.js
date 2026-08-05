@@ -1,5 +1,28 @@
 const { db, save } = require('./db');
+const { config } = require('./config');
 const { haversineKm } = require('./places');
+
+// A driver who owes more cash commission than the credit limit is over their
+// float and must settle before taking on more cash exposure.
+function driverOwesTooMuch(driver) {
+  return !!driver && (driver.earnings || 0) < -config.cashCreditLimit;
+}
+
+// How much more cash a driver may be handed before hitting the credit limit.
+// A POSITIVE earnings balance deliberately does not buy extra float: it is money
+// SewaGo owes the driver, and they can withdraw it between accepting a cash job
+// and completing it — so only existing debt reduces the headroom.
+function cashHeadroom(driver) {
+  const debt = Math.min(0, (driver && driver.earnings) || 0);
+  return Math.max(0, config.cashCreditLimit + debt);
+}
+
+// Would taking this cash job push the driver past their float? Checks the
+// PROJECTED balance, not the current one — the whole point of a credit limit is
+// to refuse the job before the cash is in their hand.
+function cashJobFitsFloat(driver, netOwed) {
+  return !driverOwesTooMuch(driver) && netOwed <= cashHeadroom(driver);
+}
 
 // Demo timings (seconds) for simulated rides so a trip visibly progresses.
 const MATCH_SECONDS = 6;
@@ -49,6 +72,7 @@ function driverLocation(driver, allowBase = true) {
 
 function driverIsAvailable(driver, tier = null) {
   return !!driver &&
+    !driver.suspended &&
     (!tier || driver.tier === tier) &&
     !!driver.online &&
     driverIsVerified(driver) &&
@@ -201,6 +225,9 @@ module.exports = {
   driverLocation,
   driverIsAvailable,
   driverNearPickup,
+  driverOwesTooMuch,
+  cashHeadroom,
+  cashJobFitsFloat,
   MATCH_RADIUS_KM,
   SPEEDS,
   ROAD_FACTOR,

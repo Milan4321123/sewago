@@ -236,9 +236,14 @@ function addOrder({ id, user, restaurant, itemIds, status, ageSeconds }) {
   if (owner) {
     order.partnerId = owner.id;
     order.partnerCut = Math.round(subtotal * 0.85);
-    owner.earnings = (owner.earnings || 0) + order.partnerCut;
+    // Match the live model: delivered income is settled (withdrawable earnings);
+    // anything still in flight sits in pendingEarnings until the courier delivers.
+    const settled = status === 'delivered';
+    order.partnerSettled = settled;
+    if (settled) owner.earnings = (owner.earnings || 0) + order.partnerCut;
+    else owner.pendingEarnings = (owner.pendingEarnings || 0) + order.partnerCut;
     recordTxn('partner', owner, {
-      type: 'order_income',
+      type: settled ? 'order_income' : 'order_income_pending',
       label: `Demo order income: ${restaurant.name}`,
       amount: order.partnerCut,
       sign: 1,
@@ -274,9 +279,15 @@ function addBooking({ id, user, hotel, room, checkIn, checkOut, status = 'active
   if (owner) {
     booking.partnerId = owner.id;
     booking.partnerCut = Math.round(total * 0.9);
-    owner.earnings = (owner.earnings || 0) + booking.partnerCut;
+    // Active bookings whose check-in is still ahead are refundable, so their
+    // income is pending; anything else (past check-in / non-active) is settled.
+    const today = new Date().toISOString().slice(0, 10);
+    const settled = !(status === 'active' && checkIn > today);
+    booking.settled = settled;
+    if (settled) owner.earnings = (owner.earnings || 0) + booking.partnerCut;
+    else owner.pendingEarnings = (owner.pendingEarnings || 0) + booking.partnerCut;
     recordTxn('partner', owner, {
-      type: 'booking_income',
+      type: settled ? 'booking_income' : 'booking_income_pending',
       label: `Demo booking income: ${hotel.name}`,
       amount: booking.partnerCut,
       sign: 1,

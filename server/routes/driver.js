@@ -13,8 +13,17 @@ const {
   driverHasFreshLocation,
   driverLocation,
   driverIsAvailable,
-  driverNearPickup
+  driverNearPickup,
+  driverOwesTooMuch,
+  cashHeadroom,
+  cashJobFitsFloat
 } = require('../rideLogic');
+
+// Net cash a courier ends up owing SewaGo after a COD delivery: they collect the
+// whole total at the door and keep their delivery payout.
+function codDebtFor(order) {
+  return order.payment === 'cash' ? order.total - courierPayoutFor(order) : 0;
+}
 const { PLACES, haversineKm } = require('../places');
 const { recordTxn, recordPlatformRevenue, createWithdrawal } = require('../payments');
 const { deleteAccount } = require('../accountDeletion');
@@ -83,6 +92,10 @@ function profile(d) {
     currentLat: Number.isFinite(d.currentLat) ? d.currentLat : null,
     currentLng: Number.isFinite(d.currentLng) ? d.currentLng : null,
     earnings: d.earnings || 0,
+    // Cash-trip commission the driver owes SewaGo (0 unless earnings is negative),
+    // and whether they've hit the settle-before-driving limit.
+    commissionOwed: Math.max(0, -(d.earnings || 0)),
+    mustSettle: driverOwesTooMuch(d),
     tripsCompleted: d.tripsCompleted || 0
   };
 }
@@ -93,6 +106,9 @@ function authDriver(req, res, next) {
   const driverId = sessionTokens.tokenOwner(db.driverTokens, token);
   const driver = driverId && db.drivers.find((d) => d.id === driverId);
   if (!driver) return res.status(401).json({ error: 'Please log in again.' });
+  if (driver.suspended) {
+    return res.status(403).json({ error: 'Your driver account is suspended — contact SewaGo support.' });
+  }
   req.driver = driver;
   next();
 }
@@ -117,6 +133,9 @@ router.post('/driver/login', (req, res) => {
   const driver = db.drivers.find((d) => (d.email || '').toLowerCase() === String(email || '').toLowerCase());
   if (!driver || !verifyPassword(String(password || ''), driver.password)) {
     return res.status(401).json({ error: 'Wrong email or password.' });
+  }
+  if (driver.suspended) {
+    return res.status(403).json({ error: 'Your driver account is suspended — contact SewaGo support.' });
   }
   const token = issueToken(driver.id);
   save();
@@ -351,6 +370,9 @@ router.post('/driver/online', authDriver, (req, res) => {
   if (wantsOnline && !driverHasFreshLocation(req.driver)) {
     return res.status(400).json({ error: 'Share your live GPS location before going online.' });
   }
+  if (wantsOnline && driverOwesTooMuch(req.driver)) {
+    return res.status(402).json({ error: `You owe Rs ${-req.driver.earnings} in cash-trip commission. Settle it at a SewaGo point to go back online.` });
+  }
   req.driver.online = wantsOnline;
   save();
   res.json({ driver: profile(req.driver) });
@@ -461,9 +483,12 @@ router.post('/driver/rides/:id/complete', authDriver, (req, res) => {
   ride.completedAt = Date.now();
   ride.payout = payoutFor(ride);
   const commission = ride.fare - ride.payout;
+  let mustSettle = false;
   if (ride.payment === 'cash') {
-    // Driver keeps the full cash fare; SewaGo's 20% commission is deducted
-    // from their balance (it can go negative until settled by more trips).
+    // Driver keeps the full cash fare; SewaGo's 20% commission is deducted from
+    // their balance. It may go negative, but once it passes the cash-credit
+    // limit the driver is taken offline and must settle before driving again —
+    // so the commission is actually collected, not left as phantom revenue.
     req.driver.earnings = (req.driver.earnings || 0) - commission;
     recordTxn('driver', req.driver, {
       type: 'cash_commission',
@@ -472,6 +497,10 @@ router.post('/driver/rides/:id/complete', authDriver, (req, res) => {
       sign: -1,
       refId: ride.id
     });
+    if (driverOwesTooMuch(req.driver)) {
+      req.driver.online = false; // can't take more trips until settled
+      mustSettle = true;
+    }
   } else {
     req.driver.earnings = (req.driver.earnings || 0) + ride.payout;
     recordTxn('driver', req.driver, {
@@ -497,7 +526,9 @@ router.post('/driver/rides/:id/complete', authDriver, (req, res) => {
     payout: ride.payout,
     cash: ride.payment === 'cash',
     fare: ride.fare,
-    commission
+    commission,
+    mustSettle,
+    owed: mustSettle ? -req.driver.earnings : 0
   });
 });
 
@@ -525,6 +556,8 @@ function deliveryView(order, driver) {
     items: o.items.reduce((sum, line) => sum + line.qty, 0),
     routeKm,
     payout: courierPayoutFor(o),
+    // COD: how much cash the courier must collect at the door (0 if prepaid).
+    collectCash: o.payment === 'cash' ? o.total : 0,
     status: o.status,
     etaToPickupMin: driver && o.restaurantLoc ? etaToPickupMin(driver, o.restaurantLoc, 'bike') : null,
     secondsAgo: Math.round((Date.now() - (o.acceptedAt || o.createdAt)) / 1000)
@@ -541,6 +574,9 @@ router.get('/driver/deliveries', authDriver, (req, res) => {
       const restaurant = db.restaurants.find((r) => r.id === o.restaurantId);
       return !restaurant || !restaurant.loc || driverNearPickup(req.driver, restaurant.loc);
     })
+    // Don't offer cash orders bigger than this courier's remaining float —
+    // otherwise they ride to the pickup only to be refused at accept.
+    .filter((o) => o.payment !== 'cash' || cashJobFitsFloat(req.driver, codDebtFor(o)))
     .map((o) => deliveryView(o, req.driver))
     // Nearest restaurant first; long-waiting orders get nudged up (same rule
     // as ride requests).
@@ -557,6 +593,14 @@ router.post('/driver/deliveries/:id/accept', authDriver, (req, res) => {
   if (currentDelivery(req.driver.id)) return res.status(409).json({ error: 'Finish your current delivery first.' });
   const order = db.orders.find((o) => o.id === req.params.id && o.fulfillment === 'live');
   if (!order) return res.status(404).json({ error: 'Delivery not found.' });
+  // Cash float check on the PROJECTED debt: refuse the job before the cash is in
+  // the courier's hand, not after. A snapshot check would let a courier at the
+  // edge of their limit accept an order of any size.
+  if (order.payment === 'cash' && !cashJobFitsFloat(req.driver, codDebtFor(order))) {
+    return res.status(402).json({
+      error: `This Rs ${order.total} cash order is over your Rs ${cashHeadroom(req.driver)} cash float. Settle up at a SewaGo point first.`
+    });
+  }
   if (order.courierId || orderWithStatus(order).status !== 'preparing') {
     return res.status(409).json({ error: 'This delivery was already taken or is no longer available.' });
   }
@@ -599,6 +643,23 @@ router.post('/driver/deliveries/:id/deliver', authDriver, (req, res) => {
     sign: 1,
     refId: order.id
   });
+  // Order is delivered — settle the restaurant's pending income into their
+  // withdrawable earnings. It can no longer be refunded, so it's truly theirs.
+  if (order.partnerCut && order.partnerId && !order.partnerSettled) {
+    const owner = db.partners.find((p) => p.id === order.partnerId);
+    if (owner) {
+      owner.pendingEarnings = (owner.pendingEarnings || 0) - order.partnerCut;
+      owner.earnings = (owner.earnings || 0) + order.partnerCut;
+      recordTxn('partner', owner, {
+        type: 'order_income',
+        label: `Order delivered — income: ${order.restaurantName}`,
+        amount: order.partnerCut,
+        sign: 1,
+        refId: order.id
+      });
+    }
+    order.partnerSettled = true;
+  }
   // The courier's cut comes out of the delivery fee the platform collected.
   recordPlatformRevenue({
     source: 'courier_payout',
@@ -606,11 +667,52 @@ router.post('/driver/deliveries/:id/deliver', authDriver, (req, res) => {
     amount: -order.courierPayout,
     refId: order.id
   });
+  // Cash on delivery: the courier just took the customer's cash at the door, so
+  // they hold the whole order total. They keep their payout (credited above) and
+  // owe SewaGo the rest — recorded as a debt on their balance and collected via
+  // the same cash-settlement flow as cash rides. The platform's cut is only
+  // booked as revenue now, because this is when the money actually moved.
+  let mustSettle = false;
+  if (order.payment === 'cash') {
+    req.driver.earnings = (req.driver.earnings || 0) - order.total;
+    recordTxn('driver', req.driver, {
+      type: 'cod_collected',
+      label: `Cash collected on delivery: ${order.restaurantName}`,
+      amount: order.total,
+      sign: -1,
+      refId: order.id
+    });
+    if (order.partnerCut) {
+      recordPlatformRevenue({
+        source: 'food_commission',
+        label: `Food commission + delivery (COD): ${order.restaurantName}`,
+        amount: order.total - order.partnerCut - (order.serviceFee || 0),
+        refId: order.id
+      });
+    }
+    if (order.serviceFee > 0) {
+      recordPlatformRevenue({
+        source: 'service_fee',
+        label: `Order service fee (COD): ${order.restaurantName}`,
+        amount: order.serviceFee,
+        refId: order.id
+      });
+    }
+    if (driverOwesTooMuch(req.driver)) {
+      req.driver.online = false; // must settle the collected cash before more work
+      mustSettle = true;
+    }
+  }
   save();
   events.publish(`user:${order.userId}`, { topic: 'order' });
   if (order.partnerId) events.publish(`partner:${order.partnerId}`, { topic: 'orders' });
   events.publish('admin', { topic: 'orders' });
-  res.json({ driver: profile(req.driver), payout: order.courierPayout });
+  res.json({
+    driver: profile(req.driver),
+    payout: order.courierPayout,
+    collectCash: order.payment === 'cash' ? order.total : 0,
+    mustSettle
+  });
 });
 
 router.post('/driver/withdraw', authDriver, (req, res) => {

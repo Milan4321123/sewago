@@ -17,7 +17,17 @@ const state = {
   showWithdraw: false,
   showPhoneEdit: false, // re-open the OTP form to change a verified phone
   photos: {}, // slot -> uploaded /uploads/ URL pending form submission
-  photoBusy: '' // slot currently uploading (disables its button)
+  photoBusy: '', // slot currently uploading (disables its button)
+  // General store (kirana) inventory
+  stores: [],
+  showStoreForm: false,
+  activeStore: null, // store id -> opens the full-screen inventory manager
+  inventory: null, // { items, stats, units, open, status }
+  invSearch: '',
+  invTab: 'stock', // stock | reorder | orders
+  reorder: null,
+  storeOrders: [],
+  voice: { listening: false, heard: '', draft: null, queue: [], error: '' }
 };
 
 // Remembers which KYC decision the partner has already dismissed, so the
@@ -245,6 +255,8 @@ async function reload() {
   state.transactions = me.transactions || [];
   state.promoteWeekPrice = me.promoteWeekPrice || 500;
   await reloadOrders();
+  // A shopkeeper with no shop still needs the (empty) section to appear.
+  await loadStores().catch(() => { state.stores = []; });
 }
 
 async function reloadOrders() {
@@ -419,7 +431,9 @@ function completePartnerAuth(data) {
   localStorage.setItem('sewago_partner_token', data.token);
   toast(`Welcome, ${data.partner.name}! 🤝`);
   connectEvents();
-  reloadOrders().then(() => render()).catch(() => {});
+  // The login payload carries restaurants and hotels but not shops, so fetch
+  // those before the first paint shows an empty "add your shop" prompt.
+  Promise.all([reloadOrders(), loadStores()]).then(() => render()).catch(() => {});
   render();
 }
 
@@ -597,6 +611,12 @@ function render() {
     app.innerHTML = authView();
     return;
   }
+  // The inventory manager takes over the whole screen — a shopkeeper working
+  // the shelves should not be scrolling past restaurant and hotel forms.
+  if (state.activeStore) {
+    app.innerHTML = inventoryView();
+    return;
+  }
   const ready = partnerReady();
   app.innerHTML = `
     <header class="topbar">
@@ -611,6 +631,8 @@ function render() {
       ${kycCard()}
       ${ordersSection()}
       ${earningsCard()}
+
+      ${storesSection()}
 
       <div class="section-title">Your restaurants 🍜</div>
       ${state.restaurants.length ? state.restaurants.map(restaurantCard).join('')
@@ -778,13 +800,17 @@ function earningsCard() {
   <div class="card">
     <div class="row">
       <div>
-        <div class="muted small">Earnings balance</div>
+        <div class="muted small">Available to withdraw</div>
         <div style="font-size:24px;font-weight:900">${money(p.earnings || 0)}</div>
       </div>
       <span style="font-size:28px">💰</span>
     </div>
+    ${(p.pendingEarnings || 0) > 0 ? `
     <div class="muted small" style="margin-top:6px">
-      You receive <b style="color:var(--text)">85%</b> of food subtotals and <b style="color:var(--text)">90%</b> of bookings, credited instantly (reversed on cancellations).
+      ⏳ <b style="color:var(--text)">${money(p.pendingEarnings)}</b> pending — clears when orders are delivered and stays reach check-in.
+    </div>` : ''}
+    <div class="muted small" style="margin-top:6px">
+      You receive <b style="color:var(--text)">85%</b> of food subtotals and <b style="color:var(--text)">90%</b> of bookings. Income clears to withdrawable once the order is delivered or the stay begins.
     </div>
     ${partnerReady() ? `
     <button class="btn ${state.showWithdraw ? '' : 'ghost'}" aria-pressed="${!!state.showWithdraw}" style="margin-top:12px" onclick="toggleWithdraw()">🏦 Withdraw earnings</button>`
@@ -1217,3 +1243,494 @@ window.deleteHotel = async (hid) => {
   }
   render();
 })();
+
+/* ==================================================================
+   General store (kirana) — inventory manager
+   ==================================================================
+   The shopkeeper's daily loop: speak an item onto the shelf, tap Sold
+   when someone buys, glance at what's running out. Everything here is
+   built for one thumb on a cheap phone in a busy shop.
+*/
+
+const STORE_ICONS = ['🏪', '🛒', '🥫', '🧺', '🏬', '🍚'];
+
+async function loadStores() {
+  const data = await api('/api/partner/stores');
+  state.stores = data.stores || [];
+}
+
+async function loadInventory() {
+  if (!state.activeStore) return;
+  const q = state.invSearch ? `?q=${encodeURIComponent(state.invSearch)}` : '';
+  state.inventory = await api(`/api/partner/stores/${state.activeStore}/inventory${q}`);
+}
+
+window.openStore = async (id) => {
+  state.activeStore = id;
+  state.invTab = 'stock';
+  state.invSearch = '';
+  try {
+    await loadInventory();
+    render();
+  } catch (e) { toast(e.message, true); }
+};
+
+window.closeStore = () => {
+  state.activeStore = null;
+  state.inventory = null;
+  state.voice = { listening: false, heard: '', draft: null, queue: [], error: '' };
+  render();
+};
+
+window.setInvTab = async (tab) => {
+  state.invTab = tab;
+  render();
+  try {
+    if (tab === 'reorder') state.reorder = await api(`/api/partner/stores/${state.activeStore}/reorder`);
+    if (tab === 'orders') {
+      const d = await api(`/api/partner/stores/${state.activeStore}/orders`);
+      state.storeOrders = d.orders || [];
+    }
+    render();
+  } catch (e) { toast(e.message, true); }
+};
+
+window.toggleStoreForm = () => { state.showStoreForm = !state.showStoreForm; render(); };
+
+window.createStore = async () => {
+  const name = ($('#store-name') || {}).value || '';
+  const area = ($('#store-area') || {}).value || '';
+  const deliveryFee = ($('#store-fee') || {}).value || 0;
+  try {
+    await api('/api/partner/stores', { method: 'POST', body: { name, area, deliveryFee, icon: state.storeIcon || '🏪' } });
+    state.showStoreForm = false;
+    await loadStores();
+    toast('Shop submitted for review 🏪');
+    render();
+  } catch (e) { toast(e.message, true); }
+};
+
+window.pickStoreIcon = (icon) => { state.storeIcon = icon; render(); };
+
+window.toggleShopOpen = async (open) => {
+  try {
+    await api(`/api/partner/stores/${state.activeStore}`, { method: 'PATCH', body: { open } });
+    await loadInventory();
+    toast(open ? 'Shop is open — customers can order 🟢' : 'Shop closed — no new orders');
+    render();
+  } catch (e) { toast(e.message, true); }
+};
+
+/* ---------------- voice entry ---------------- */
+
+// Browser speech recognition. Nepali first, since that is what a shopkeeper
+// speaks; if the device has no Nepali model it still returns something usable
+// and the confirm step catches the difference.
+function speechSupported() {
+  return !!(window.SpeechRecognition || window.webkitSpeechRecognition);
+}
+
+window.startVoice = () => {
+  if (!speechSupported()) {
+    state.voice.error = 'This phone cannot listen — type the item instead.';
+    return render();
+  }
+  const Rec = window.SpeechRecognition || window.webkitSpeechRecognition;
+  const rec = new Rec();
+  rec.lang = state.voiceLang || 'ne-NP';
+  rec.interimResults = true;
+  rec.continuous = false;
+  state.voice = { ...state.voice, listening: true, heard: '', error: '' };
+  render();
+
+  rec.onresult = (ev) => {
+    let text = '';
+    for (let i = 0; i < ev.results.length; i += 1) text += ev.results[i][0].transcript;
+    state.voice.heard = text;
+    const line = $('#voice-heard');
+    if (line) line.textContent = text;
+    if (ev.results[ev.results.length - 1].isFinal) submitVoiceText(text);
+  };
+  rec.onerror = (ev) => {
+    state.voice.listening = false;
+    state.voice.error = ev.error === 'not-allowed'
+      ? 'Microphone blocked — allow it in your browser, or type the item.'
+      : 'Could not hear that. Try again, or type the item.';
+    render();
+  };
+  rec.onend = () => { state.voice.listening = false; render(); };
+  try { rec.start(); } catch (e) { state.voice.listening = false; render(); }
+  state.voiceRec = rec;
+};
+
+window.stopVoice = () => {
+  if (state.voiceRec) { try { state.voiceRec.stop(); } catch (e) { /* already stopped */ } }
+  state.voice.listening = false;
+  render();
+};
+
+window.toggleVoiceLang = () => {
+  state.voiceLang = (state.voiceLang || 'ne-NP') === 'ne-NP' ? 'en-IN' : 'ne-NP';
+  toast(state.voiceLang === 'ne-NP' ? 'Listening in Nepali' : 'Listening in English');
+  render();
+};
+
+// The parse always goes to a confirm card — a mis-hear must cost one tap, never
+// a wrong stock number saved silently.
+async function submitVoiceText(text) {
+  try {
+    const data = await api('/api/stores/voice/parse', { method: 'POST', body: { text } });
+    state.voice.draft = data.item;
+    state.voice.listening = false;
+    render();
+  } catch (e) { toast(e.message, true); }
+}
+
+window.typeVoiceLine = () => {
+  const el = $('#voice-typed');
+  if (el && el.value.trim()) submitVoiceText(el.value.trim());
+};
+
+window.editDraft = (field, value) => {
+  if (!state.voice.draft) return;
+  state.voice.draft[field] = field === 'name' || field === 'unit' ? value : Number(value);
+  state.voice.draft.needsReview = (state.voice.draft.needsReview || []).filter((f) => f !== field);
+};
+
+window.saveDraft = async () => {
+  const d = state.voice.draft;
+  if (!d) return;
+  const body = {
+    name: ($('#d-name') || {}).value || d.name,
+    qty: Number(($('#d-qty') || {}).value ?? d.qty ?? 0),
+    unit: ($('#d-unit') || {}).value || d.unit,
+    price: Number(($('#d-price') || {}).value ?? d.price ?? 0),
+    subscribePrice: Number(($('#d-sub') || {}).value || 0) || undefined
+  };
+  try {
+    const res = await api(`/api/partner/stores/${state.activeStore}/items`, { method: 'POST', body });
+    state.voice.draft = null;
+    state.voice.heard = '';
+    await loadInventory();
+    toast(res.restocked ? `${body.name} restocked ✓` : `${body.name} added ✓`);
+    render();
+  } catch (e) { toast(e.message, true); }
+};
+
+window.discardDraft = () => { state.voice.draft = null; state.voice.heard = ''; render(); };
+
+/* ---------------- stock actions ---------------- */
+
+window.markSold = async (itemId, qty) => {
+  try {
+    await api(`/api/partner/stores/${state.activeStore}/items/${itemId}/sold`, { method: 'POST', body: { qty: qty || 1 } });
+    await loadInventory();
+    render();
+  } catch (e) { toast(e.message, true); }
+};
+
+window.restockItem = async (itemId) => {
+  const raw = prompt('How many did you receive? (use a negative number to correct a miscount)');
+  if (raw === null) return;
+  const qty = Number(raw);
+  if (!qty) return;
+  try {
+    await api(`/api/partner/stores/${state.activeStore}/items/${itemId}/restock`, { method: 'POST', body: { qty } });
+    await loadInventory();
+    toast('Stock updated ✓');
+    render();
+  } catch (e) { toast(e.message, true); }
+};
+
+window.editItemPrice = async (itemId, current) => {
+  const raw = prompt('New price (Rs):', current);
+  if (raw === null) return;
+  try {
+    await api(`/api/partner/stores/${state.activeStore}/items/${itemId}`, { method: 'PATCH', body: { price: Number(raw) } });
+    await loadInventory();
+    render();
+  } catch (e) { toast(e.message, true); }
+};
+
+window.setSubscribePrice = async (itemId, current, price) => {
+  const raw = prompt(`Subscriber price (must be under Rs ${price}). Leave blank to remove:`, current || '');
+  if (raw === null) return;
+  try {
+    await api(`/api/partner/stores/${state.activeStore}/items/${itemId}`, {
+      method: 'PATCH', body: { subscribePrice: raw.trim() ? Number(raw) : 0 }
+    });
+    await loadInventory();
+    toast(raw.trim() ? 'Subscriber price set — regulars pay less ✓' : 'Subscriber price removed');
+    render();
+  } catch (e) { toast(e.message, true); }
+};
+
+window.searchInventory = async () => {
+  state.invSearch = ($('#inv-search') || {}).value || '';
+  try { await loadInventory(); render(); } catch (e) { toast(e.message, true); }
+};
+
+window.decideStoreOrder = async (orderId, action) => {
+  try {
+    await api(`/api/partner/store-orders/${orderId}/${action}`, { method: 'POST' });
+    const d = await api(`/api/partner/stores/${state.activeStore}/orders`);
+    state.storeOrders = d.orders || [];
+    await loadInventory();
+    toast({ accept: 'Order accepted 👍', reject: 'Order rejected — customer refunded', ready: 'Marked ready', handover: 'Handed over — income settled 💰' }[action]);
+    render();
+  } catch (e) { toast(e.message, true); }
+};
+
+window.inviteHelper = async () => {
+  const name = prompt('Helper name (so you know whose count is whose):') || '';
+  try {
+    const res = await api(`/api/partner/stores/${state.activeStore}/helpers`, { method: 'POST', body: { name } });
+    alert(`Give ${name || 'your helper'} this code to join in the SewaGo app:\n\n${res.invite.code}\n\nThey can add items and count stock — never change prices or see your money.`);
+  } catch (e) { toast(e.message, true); }
+};
+
+/* ---------------- views ---------------- */
+
+function storesSection() {
+  const ready = partnerReady();
+  return `
+  <div class="section-title">Your shops 🏪</div>
+  <div class="muted small" style="margin-bottom:10px">
+    A general store: add your stock by speaking, tap <b style="color:var(--text)">Sold</b> as you sell, and customers nearby can order from you.
+  </div>
+  ${state.stores.length ? state.stores.map(storeCard).join('')
+    : `<div class="empty"><div class="big">🏪</div>No shop yet — add yours below.</div>`}
+  ${ready ? (state.showStoreForm ? storeForm() : `<button class="btn ghost" onclick="toggleStoreForm()">+ Add your shop</button>`)
+    : `<div class="muted small" style="margin-bottom:12px">Verify your phone and finish business KYC before adding a shop.</div>`}`;
+}
+
+function storeCard(s) {
+  const st = s.stats || {};
+  const badge = s.status === 'approved'
+    ? `<span class="badge">${s.open ? '🟢 OPEN' : '⚫ CLOSED'}</span>`
+    : `<span class="badge amber">${s.status === 'pending' ? 'IN REVIEW' : 'REJECTED'}</span>`;
+  return `
+  <div class="card">
+    <div class="row">
+      <div>
+        <div style="font-weight:900">${s.icon} ${esc(s.name)}</div>
+        <div class="muted small">${esc(s.area || '')} · ${st.items || 0} items${st.lowStock ? ` · ⚠️ ${st.lowStock} running low` : ''}</div>
+      </div>
+      ${badge}
+    </div>
+    ${s.status === 'rejected' && s.reviewNote ? `<div class="muted small" style="color:#fca5a5;margin-top:6px">${esc(s.reviewNote)}</div>` : ''}
+    ${s.status === 'approved' ? `
+    <div class="grid2" style="margin-top:10px">
+      <div><div class="muted small">Stock value</div><div style="font-weight:900">${money(st.stockValue || 0)}</div></div>
+      <div><div class="muted small">Sold today</div><div style="font-weight:900">${st.soldToday || 0}</div></div>
+    </div>` : ''}
+    <button class="btn" style="margin-top:12px" onclick="openStore('${s.id}')">Open inventory</button>
+  </div>`;
+}
+
+function storeForm() {
+  const icon = state.storeIcon || '🏪';
+  return `
+  <div class="card">
+    <label class="field"><span>Shop name</span><input id="store-name" placeholder="e.g. Ram Kirana Pasal" /></label>
+    <label class="field"><span>Area</span><input id="store-area" placeholder="e.g. Thamel, New Baneshwor" /></label>
+    <label class="field"><span>Delivery charge (Rs, 0 if customers collect)</span><input id="store-fee" type="number" value="0" min="0" max="200" /></label>
+    <div class="muted small" style="margin-bottom:6px">Shop icon</div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px">
+      ${STORE_ICONS.map((i) => `<button class="btn ghost compact" style="${i === icon ? 'border-color:var(--accent)' : ''}" onclick="pickStoreIcon('${i}')">${i}</button>`).join('')}
+    </div>
+    <button class="btn" onclick="createStore()">Submit for review</button>
+    <button class="btn ghost" style="margin-top:8px" onclick="toggleStoreForm()">Cancel</button>
+  </div>`;
+}
+
+function voiceCard() {
+  const v = state.voice;
+  if (v.draft) return draftCard(v.draft);
+  const lang = (state.voiceLang || 'ne-NP') === 'ne-NP' ? 'नेपाली' : 'English';
+  return `
+  <div class="card">
+    <div class="row">
+      <div style="font-weight:900">Add stock by speaking 🎤</div>
+      <button class="btn ghost compact" onclick="toggleVoiceLang()">${lang}</button>
+    </div>
+    <div class="muted small" style="margin:6px 0 12px">
+      Say the item, how many, and the price — “<b style="color:var(--text)">दुई किलो चिनी सय रुपैयाँ</b>” or “<b style="color:var(--text)">5 packet wai wai 20 rupees</b>”.
+    </div>
+    ${v.listening
+      ? `<button class="btn danger" onclick="stopVoice()">● Listening… tap to stop</button>
+         <div class="muted small" id="voice-heard" style="margin-top:8px;min-height:20px">${esc(v.heard || '')}</div>`
+      : `<button class="btn" onclick="startVoice()">🎤 Hold a moment and speak</button>`}
+    ${v.error ? `<div class="muted small" style="color:#fca5a5;margin-top:8px">${esc(v.error)}</div>` : ''}
+    <div class="divider"></div>
+    <label class="field" style="margin:0"><span>…or type it</span>
+      <input id="voice-typed" placeholder="2 kg sugar 100" onkeydown="if(event.key==='Enter')typeVoiceLine()" />
+    </label>
+    <button class="btn ghost compact" style="margin-top:8px" onclick="typeVoiceLine()">Add typed line</button>
+  </div>`;
+}
+
+// Everything the parser was unsure about is highlighted, so the shopkeeper's
+// eye goes straight to what needs fixing.
+function draftCard(d) {
+  const units = (state.inventory && state.inventory.units) || {};
+  const warn = (f) => (d.needsReview || []).includes(f) ? 'border-color:#fbbf24' : '';
+  return `
+  <div class="card" style="border-color:var(--accent)">
+    <div style="font-weight:900;margin-bottom:4px">Check this before saving</div>
+    ${d.raw ? `<div class="muted small" style="margin-bottom:10px">Heard: “${esc(d.raw)}”</div>` : ''}
+    <label class="field"><span>Item</span><input id="d-name" value="${esc(d.name || '')}" style="${warn('name')}" /></label>
+    <div class="grid2">
+      <label class="field"><span>Quantity</span><input id="d-qty" type="number" step="0.5" value="${d.qty ?? ''}" style="${warn('qty')}" /></label>
+      <label class="field"><span>Unit</span>
+        <select id="d-unit" style="${warn('unit')}">
+          ${Object.entries(units).map(([k, u]) => `<option value="${k}" ${k === d.unit ? 'selected' : ''}>${u.label}</option>`).join('')}
+        </select>
+      </label>
+    </div>
+    <div class="grid2">
+      <label class="field"><span>Price (Rs)</span><input id="d-price" type="number" value="${d.price ?? ''}" style="${warn('price')}" /></label>
+      <label class="field"><span>Subscriber price</span><input id="d-sub" type="number" placeholder="optional" /></label>
+    </div>
+    <button class="btn" onclick="saveDraft()">Save to inventory</button>
+    <button class="btn ghost" style="margin-top:8px" onclick="discardDraft()">Discard</button>
+  </div>`;
+}
+
+function itemRow(i) {
+  const out = i.stock <= 0;
+  return `
+  <div class="card" style="${out ? 'border-color:#7f1d1d' : i.low ? 'border-color:#a16207' : ''}">
+    <div class="row">
+      <div class="grow">
+        <div style="font-weight:800">${esc(i.name)}</div>
+        <div class="muted small">
+          ${money(i.price)} / ${esc(i.unitLabel)}${i.subscribePrice ? ` · 🔁 ${money(i.subscribePrice)} for subscribers` : ''}
+        </div>
+      </div>
+      <div style="text-align:right">
+        <div style="font-size:20px;font-weight:900;color:${out ? '#f87171' : i.low ? '#fbbf24' : 'var(--text)'}">${i.stock}</div>
+        <div class="muted small">${esc(i.unitLabel)} left</div>
+      </div>
+    </div>
+    ${out ? `<div class="muted small" style="color:#fca5a5;margin-top:6px">Out of stock — customers cannot order it</div>`
+      : i.low ? `<div class="muted small" style="color:#fbbf24;margin-top:6px">Running low — reorder soon</div>` : ''}
+    <div style="display:flex;gap:6px;margin-top:10px;flex-wrap:wrap">
+      <button class="btn compact" onclick="markSold('${i.id}', 1)" ${out ? 'disabled' : ''}>Sold 1</button>
+      <button class="btn ghost compact" onclick="restockItem('${i.id}')">+ Stock</button>
+      <button class="btn ghost compact" onclick="editItemPrice('${i.id}', ${i.price})">Price</button>
+      <button class="btn ghost compact" onclick="setSubscribePrice('${i.id}', ${i.subscribePrice || 0}, ${i.price})">🔁</button>
+    </div>
+  </div>`;
+}
+
+function reorderView() {
+  const r = state.reorder;
+  if (!r) return `<div class="empty">Loading…</div>`;
+  if (!r.suggestions.length) {
+    return `<div class="empty"><div class="big">✅</div>Nothing is running low. Your shelves are in good shape.</div>`;
+  }
+  return `
+  <div class="muted small" style="margin-bottom:10px">Ranked by how soon you run out, using how fast each item actually sells.</div>
+  ${r.suggestions.map((s) => `
+  <div class="card">
+    <div class="row">
+      <div class="grow">
+        <div style="font-weight:800">${esc(s.name)}</div>
+        <div class="muted small">
+          ${s.stock} left · sells ${s.perDay}/day${s.daysLeft !== null ? ` · about ${s.daysLeft} days` : ''}
+        </div>
+      </div>
+      <div style="text-align:right">
+        <div style="font-weight:900;color:var(--accent)">buy ${s.suggestedQty}</div>
+        ${s.outOfStock ? `<div class="muted small" style="color:#f87171">out now</div>` : ''}
+      </div>
+    </div>
+  </div>`).join('')}`;
+}
+
+function storeOrdersView() {
+  if (!state.storeOrders.length) {
+    return `<div class="empty"><div class="big">🧾</div>No customer orders yet.</div>`;
+  }
+  const nextAction = { placed: ['accept', 'Accept'], accepted: ['ready', 'Mark ready'], ready: ['handover', 'Handed over'] };
+  return state.storeOrders.map((o) => {
+    const next = nextAction[o.status];
+    return `
+    <div class="card">
+      <div class="row">
+        <div class="grow">
+          <div style="font-weight:800">${esc(o.customerName)}</div>
+          <div class="muted small">${o.items.map((l) => `${l.qty}× ${esc(l.name)}`).join(', ')}</div>
+          <div class="muted small">${o.payment === 'cash' ? '💵 cash on handover' : '👛 paid in app'}${o.deliveryLoc ? ` · 📍 ${esc(o.deliveryLoc.name)}` : ''}</div>
+        </div>
+        <div style="text-align:right">
+          <div style="font-weight:900">${money(o.total)}</div>
+          <div class="muted small">you get ${money(o.partnerCut)}</div>
+        </div>
+      </div>
+      <div style="display:flex;gap:6px;margin-top:10px;flex-wrap:wrap">
+        ${next ? `<button class="btn compact" onclick="decideStoreOrder('${o.id}','${next[0]}')">${next[1]}</button>` : ''}
+        ${o.status === 'placed' || o.status === 'accepted'
+          ? `<button class="btn ghost compact danger" onclick="decideStoreOrder('${o.id}','reject')">Can't fulfil</button>` : ''}
+        ${o.status === 'delivered' ? `<span class="badge">✓ DONE</span>` : ''}
+        ${o.status === 'cancelled' ? `<span class="badge gray">CANCELLED</span>` : ''}
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function inventoryView() {
+  const inv = state.inventory;
+  const store = state.stores.find((s) => s.id === state.activeStore) || {};
+  if (!inv) return `<div class="empty">Loading…</div>`;
+  const st = inv.stats || {};
+  return `
+    <header class="topbar">
+      <button class="btn ghost compact" onclick="closeStore()">← Shops</button>
+      <span class="badge ${inv.open ? '' : 'gray'}">${inv.open ? '🟢 OPEN' : '⚫ CLOSED'}</span>
+    </header>
+    <main>
+      <div class="row" style="margin-bottom:12px">
+        <div>
+          <div style="font-size:18px;font-weight:900">${store.icon || '🏪'} ${esc(store.name || 'Your shop')}</div>
+          <div class="muted small">${st.items || 0} items · ${money(st.stockValue || 0)} on the shelves</div>
+        </div>
+        <button class="btn ghost compact" onclick="toggleShopOpen(${inv.open ? 'false' : 'true'})">${inv.open ? 'Close shop' : 'Open shop'}</button>
+      </div>
+
+      <div class="grid2" style="margin-bottom:12px">
+        <div class="card" style="padding:12px">
+          <div class="muted small">Sold today</div>
+          <div style="font-size:22px;font-weight:900">${st.soldToday || 0}</div>
+          <div class="muted small">${money(st.revenueToday || 0)}</div>
+        </div>
+        <div class="card" style="padding:12px">
+          <div class="muted small">Needs attention</div>
+          <div style="font-size:22px;font-weight:900;color:${(st.lowStock || st.outOfStock) ? '#fbbf24' : 'var(--text)'}">${(st.lowStock || 0) + (st.outOfStock || 0)}</div>
+          <div class="muted small">${st.outOfStock || 0} out · ${st.lowStock || 0} low</div>
+        </div>
+      </div>
+
+      <div class="grid2" style="margin-bottom:12px">
+        <button class="btn ${state.invTab === 'stock' ? '' : 'ghost'} compact" onclick="setInvTab('stock')">Stock</button>
+        <button class="btn ${state.invTab === 'reorder' ? '' : 'ghost'} compact" onclick="setInvTab('reorder')">To buy${state.reorder && state.reorder.suggestions.length ? ` (${state.reorder.suggestions.length})` : ''}</button>
+      </div>
+      <button class="btn ${state.invTab === 'orders' ? '' : 'ghost'} compact" style="width:100%;margin-bottom:14px" onclick="setInvTab('orders')">Customer orders</button>
+
+      ${state.invTab === 'stock' ? `
+        ${voiceCard()}
+        <label class="field" style="margin-top:12px"><span>Find an item</span>
+          <input id="inv-search" value="${esc(state.invSearch)}" placeholder="Search your shelves" oninput="searchInventory()" />
+        </label>
+        ${inv.items.length ? inv.items.map(itemRow).join('')
+          : `<div class="empty"><div class="big">📦</div>${state.invSearch ? 'Nothing matches that.' : 'No items yet — speak your first one above.'}</div>`}
+        <div class="divider"></div>
+        <button class="btn ghost" onclick="inviteHelper()">👥 Invite a helper to count stock</button>
+        <div class="muted small" style="margin-top:6px">They can add items and count shelves — never change prices or see your money.</div>
+      ` : ''}
+      ${state.invTab === 'reorder' ? reorderView() : ''}
+      ${state.invTab === 'orders' ? storeOrdersView() : ''}
+      <div style="height:40px"></div>
+    </main>`;
+}

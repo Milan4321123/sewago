@@ -177,6 +177,11 @@ function migrate(data) {
   data.withdrawals = data.withdrawals || [];
   data.transactions = data.transactions || [];
   data.platformLedger = data.platformLedger || [];
+  // Kirana / general-store vertical.
+  data.stores = data.stores || [];
+  data.storeOrders = data.storeOrders || [];
+  data.stockMoves = data.stockMoves || [];
+  data.itemSubscriptions = data.itemSubscriptions || [];
   data.otpCodes = data.otpCodes || [];
   data.passwordResetTokens = data.passwordResetTokens || [];
   data.uploads = data.uploads || [];
@@ -292,6 +297,46 @@ function migrate(data) {
       ride.dropoffLoc = { lat: q.lat, lng: q.lng };
     }
   }
+
+  // Schema v2: partner income moved from crediting withdrawable `earnings` at
+  // placement to a `pendingEarnings` bucket that only settles to earnings at
+  // delivery / check-in. Legacy records already credited `earnings`, so a
+  // one-time, version-gated backfill moves still-refundable in-flight income
+  // into pending (and flags final records settled) — otherwise the new
+  // settlement sweep / deliver handler would credit the same cut a SECOND time.
+  // Gated on schemaVersion because migrate() runs on every load and the move is
+  // not idempotent.
+  if (!data.schemaVersion || data.schemaVersion < 2) {
+    const today = new Date().toISOString().slice(0, 10);
+    for (const p of data.partners) {
+      if (p.pendingEarnings === undefined) p.pendingEarnings = 0;
+    }
+    const moveToPending = (owner, cut) => {
+      if (!owner) return;
+      owner.earnings = (owner.earnings || 0) - cut;
+      owner.pendingEarnings = (owner.pendingEarnings || 0) + cut;
+    };
+    for (const o of data.orders) {
+      if (!o.partnerCut || !o.partnerId) continue;
+      if (o.status === 'delivered' || o.status === 'cancelled') {
+        o.partnerSettled = true; // final: cut already correct in earnings / already reversed
+      } else {
+        moveToPending(data.partners.find((x) => x.id === o.partnerId), o.partnerCut);
+        o.partnerSettled = false; // route future settle/refund through pending
+      }
+    }
+    for (const b of data.bookings) {
+      if (!b.partnerCut || !b.partnerId) continue;
+      if (b.status !== 'active' || b.checkIn <= today) {
+        b.settled = true; // cancelled (already reversed) or already checked in (final)
+      } else {
+        moveToPending(data.partners.find((x) => x.id === b.partnerId), b.partnerCut);
+        b.settled = false;
+      }
+    }
+    data.schemaVersion = 2;
+  }
+
   return data;
 }
 
@@ -397,12 +442,19 @@ function persist() {
   return saveSupabaseState(snapshot());
 }
 
+// Adaptive pacing: serializing the state blocks the event loop, so as the data
+// grows the flush backs off — spending at most ~10% of wall time saving, with
+// the loss window still capped at 5s. At demo size this stays the 1s default.
+function flushDelayMs() {
+  return Math.min(5000, Math.max(SAVE_INTERVAL_MS, Math.round(lastFlushMs * 10)));
+}
+
 function scheduleFlush() {
   if (flushTimer) return;
   flushTimer = setTimeout(() => {
     flushTimer = null;
     flushNow().catch((err) => console.error('State save failed (will retry):', err.message || err));
-  }, SAVE_INTERVAL_MS);
+  }, flushDelayMs());
   if (flushTimer.unref) flushTimer.unref();
 }
 

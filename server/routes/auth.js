@@ -55,6 +55,9 @@ function authRequired(req, res, next) {
   const userId = sessionTokens.tokenOwner(db.tokens, token);
   const user = userId && db.users.find((u) => u.id === userId);
   if (!user) return res.status(401).json({ error: 'Please log in again.' });
+  if (user.suspended) {
+    return res.status(403).json({ error: 'Your account is suspended — contact SewaGo support.' });
+  }
   req.user = user;
   next();
 }
@@ -146,6 +149,9 @@ router.post('/login', (req, res) => {
   const user = db.users.find((u) => u.email.toLowerCase() === String(email || '').toLowerCase());
   if (!user || !verifyPassword(String(password || ''), user.password)) {
     return res.status(401).json({ error: 'Wrong email or password.' });
+  }
+  if (user.suspended) {
+    return res.status(403).json({ error: 'Your account is suspended — contact SewaGo support.' });
   }
   const token = issueToken(user.id);
   save();

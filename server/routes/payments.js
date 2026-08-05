@@ -17,18 +17,23 @@ const router = express.Router();
 
 const INTENT_TTL_MS = 15 * 60 * 1000;
 
-// Sandbox simulation is allowed everywhere except production (unless the
-// pilot override is on). Real gateways are used whenever their keys are set.
-function sandboxAllowed() {
-  return !config.isProduction || config.allowSandboxProvidersInProduction;
+// The real processor for a method, or null if its keys aren't configured.
+function realGatewayFor(method) {
+  if (method === 'khalti' && khalti.enabled()) return 'khalti';
+  if (method === 'esewa' && esewa.enabled()) return 'esewa';
+  return null; // 'card' has no processor module — never real.
 }
 
 // Which processor actually handles a given top-up method right now.
-// Falls back to the PIN sandbox in dev so the demo always works.
+// SECURITY: in production we NEVER fall back to the PIN sandbox — that would
+// credit real, withdrawable wallet balance for no money in. So a method without
+// configured gateway keys is simply unavailable in production (the override
+// flag cannot re-enable free money). The sandbox exists only for local/dev demos.
 function gatewayFor(method) {
-  if (method === 'khalti' && khalti.enabled()) return 'khalti';
-  if (method === 'esewa' && esewa.enabled()) return 'esewa';
-  return sandboxAllowed() ? 'sandbox' : null;
+  const real = realGatewayFor(method);
+  if (real) return real;
+  if (config.isProduction) return null;
+  return 'sandbox';
 }
 
 function appBaseUrl(req) {
@@ -45,6 +50,15 @@ function creditTopup(payment, { gatewayRef = null } = {}) {
   payment.paidAt = Date.now();
   if (gatewayRef) payment.gatewayRef = gatewayRef;
   user.wallet += payment.amount;
+  // Put the freshly added money under a withdrawal hold so it can't be topped
+  // up and instantly cashed back out. Held amounts stack while the window is
+  // still open; spending naturally draws the wallet down and the hold expires.
+  if (config.withdrawHoldMs > 0) {
+    const now = Date.now();
+    const stillHeld = (user.heldUntil || 0) > now ? (user.heldBalance || 0) : 0;
+    user.heldBalance = stillHeld + payment.amount;
+    user.heldUntil = now + config.withdrawHoldMs;
+  }
   recordTxn('user', user, {
     type: 'topup',
     label: `Wallet top-up via ${TOPUP_METHODS[payment.method] || payment.method}`,
@@ -209,6 +223,11 @@ router.post('/payments/topup/confirm', authRequired, (req, res) => {
   if (payment.gateway !== 'sandbox') {
     return res.status(400).json({ error: 'This payment is handled by the gateway — complete it on the payment page.' });
   }
+  // Defense in depth: the sandbox never credits real balance in production, even
+  // if a stale sandbox intent somehow exists.
+  if (config.isProduction) {
+    return res.status(403).json({ error: 'Sandbox payments are disabled in production.' });
+  }
   if (payment.status !== 'pending') return res.status(400).json({ error: 'This payment was already processed.' });
   if (Date.now() - payment.createdAt > INTENT_TTL_MS) {
     failPayment(payment, 'expired');
@@ -230,11 +249,16 @@ router.post('/payments/withdraw', authRequired, (req, res) => {
 });
 
 router.get('/payments/transactions', authRequired, (req, res) => {
-  const transactions = db.transactions
-    .filter((t) => t.ownerKind === 'user' && t.ownerId === req.user.id)
-    .slice(-30)
-    .reverse();
+  // Newest-first, capped at 30 — walk backwards and stop early instead of
+  // filtering the whole (append-only, ever-growing) ledger per request.
+  const transactions = [];
+  for (let i = db.transactions.length - 1; i >= 0 && transactions.length < 30; i--) {
+    const t = db.transactions[i];
+    if (t.ownerKind === 'user' && t.ownerId === req.user.id) transactions.push(t);
+  }
   res.json({ transactions });
 });
 
 module.exports = router;
+// Exported for tests: proves the production gateway lockdown without a full boot.
+module.exports.gatewayFor = gatewayFor;

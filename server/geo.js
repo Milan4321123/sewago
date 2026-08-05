@@ -9,40 +9,21 @@ const { config } = require('./config');
 const { PLACES } = require('./places');
 
 const NOMINATIM_BASE = process.env.NOMINATIM_BASE || 'https://nominatim.openstreetmap.org';
-// Road routing (driver navigation + route lines on maps): OSRM speaks a
-// simple open API. The public demo server is fine for a pilot; point
-// OSRM_BASE at a paid host (Mapbox/OpenRouteService proxy or self-hosted
-// OSRM) for production volume.
-const OSRM_BASE = process.env.OSRM_BASE || 'https://router.project-osrm.org';
 const USER_AGENT = `SewaGo/0.1 (${config.publicAppUrl || 'https://sewago.example'})`;
 
 // Kathmandu valley bounding box — search is biased hard to it so "New Road"
 // resolves to Kathmandu's, not some other city's.
 const VALLEY = { west: 85.15, south: 27.55, east: 85.55, north: 27.82 };
 
-function insideServiceArea(lat, lng) {
-  // SERVICE_AREA=global (the dev default) accepts coordinates anywhere, so the
-  // whole ride/delivery flow can be tested with real GPS outside Nepal.
-  if (config.serviceArea !== 'kathmandu') return true;
-  return lat >= VALLEY.south && lat <= VALLEY.north && lng >= VALLEY.west && lng <= VALLEY.east;
-}
+// SERVICE_AREA=kathmandu (production default) restricts rides to the valley;
+// SERVICE_AREA=global (development default) lets the team test with real GPS
+// from anywhere in the world without faking coordinates.
+const SERVICE_AREA = process.env.SERVICE_AREA || (config.isProduction ? 'kathmandu' : 'global');
+const OPEN_AREA = SERVICE_AREA !== 'kathmandu';
 
-// A location is either real GPS/geocoded coords ({lat,lng,name}) or free text
-// that the built-in gazetteer resolves. Real coords must be inside the valley.
-// Shared by ride endpoints and food-delivery addresses.
-function resolveLocation(input) {
-  if (input && typeof input === 'object' && Number.isFinite(Number(input.lat)) && Number.isFinite(Number(input.lng))) {
-    const lat = Math.round(Number(input.lat) * 1e6) / 1e6;
-    const lng = Math.round(Number(input.lng) * 1e6) / 1e6;
-    if (!insideServiceArea(lat, lng)) return { error: 'outside' };
-    const name = String(input.name || '').trim().slice(0, 80) || 'Pinned location';
-    return { name, lat, lng, known: true };
-  }
-  if (typeof input === 'string' && input.trim()) {
-    const { coordsFor } = require('./places');
-    return coordsFor(input);
-  }
-  return { error: 'missing' };
+function insideServiceArea(lat, lng) {
+  if (OPEN_AREA) return Math.abs(lat) <= 90 && Math.abs(lng) <= 180;
+  return lat >= VALLEY.south && lat <= VALLEY.north && lng >= VALLEY.west && lng <= VALLEY.east;
 }
 
 // --- tiny cache + politeness queue ------------------------------------------
@@ -139,15 +120,13 @@ async function searchPlaces(query) {
     q,
     format: 'jsonv2',
     addressdetails: '1',
-    limit: '8'
+    limit: '8',
+    viewbox: `${VALLEY.west},${VALLEY.north},${VALLEY.east},${VALLEY.south}`,
+    // Strict valley bounds in production; open-world (valley-biased) in dev so
+    // the team can test with their real local addresses.
+    bounded: OPEN_AREA ? '0' : '1'
   });
-  // Kathmandu mode pins search to the valley; global mode searches the world
-  // so testers outside Nepal can find their own streets.
-  if (config.serviceArea === 'kathmandu') {
-    params.set('countrycodes', 'np');
-    params.set('viewbox', `${VALLEY.west},${VALLEY.north},${VALLEY.east},${VALLEY.south}`);
-    params.set('bounded', '1');
-  }
+  if (!OPEN_AREA) params.set('countrycodes', 'np');
   const rows = await politeFetch(`${NOMINATIM_BASE}/search?${params}`);
   // POIs/roads before administrative boundaries; ties broken by OSM importance.
   const osm = (Array.isArray(rows) ? rows : [])
@@ -204,32 +183,49 @@ async function reverseGeocode(lat, lng) {
   return result;
 }
 
-// Driving route between two points: the polyline to draw plus distance/time.
-// Cached at ~11m origin granularity so a navigating driver re-requesting
-// every ~25s doesn't hammer the router, and identical trips share an entry.
+// A ride endpoint is either real GPS/geocoded coords ({lat,lng,name}) or legacy
+// free text resolved by the built-in gazetteer. Real coords must be inside the
+// Kathmandu-valley service area.
+function resolveLocation(input) {
+  if (input && typeof input === 'object' && Number.isFinite(Number(input.lat)) && Number.isFinite(Number(input.lng))) {
+    const lat = Math.round(Number(input.lat) * 1e6) / 1e6;
+    const lng = Math.round(Number(input.lng) * 1e6) / 1e6;
+    if (!insideServiceArea(lat, lng)) return { error: 'outside' };
+    const name = String(input.name || '').trim().slice(0, 80) || 'Pinned location';
+    return { name, lat, lng, known: true }; // real GPS/geocoded coords are exact
+  }
+  if (typeof input === 'string' && input.trim()) {
+    const { coordsFor } = require('./places'); // lazy: avoids cycle at load time
+    return coordsFor(input);
+  }
+  return { error: 'missing' };
+}
+
+// Driving directions via OSRM (free demo server; env-swappable for a paid host).
+// Returns { points: [[lat,lng],...], distanceKm, durationMin } — the shape the
+// customer and driver map clients draw directly.
+const OSRM_BASE = process.env.OSRM_BASE || 'https://router.project-osrm.org';
+
 async function routeBetween(from, to) {
-  const key = `rt:${from.lat.toFixed(4)},${from.lng.toFixed(4)};${to.lat.toFixed(4)},${to.lng.toFixed(4)}`;
+  const key = `rt:${from.lat.toFixed(4)},${from.lng.toFixed(4)}:${to.lat.toFixed(4)},${to.lng.toFixed(4)}`;
   const cached = cacheGet(key);
   if (cached) return cached;
 
-  const url = `${OSRM_BASE}/route/v1/driving/${from.lng},${from.lat};${to.lng},${to.lat}` +
-    '?overview=full&geometries=geojson&alternatives=false&steps=false';
-  const data = await politeFetch(url);
-  const route = data && data.code === 'Ok' && Array.isArray(data.routes) && data.routes[0];
-  if (!route || !route.geometry || !Array.isArray(route.geometry.coordinates)) {
-    throw new Error('No route found');
+  const url = `${OSRM_BASE}/route/v1/driving/${from.lng},${from.lat};${to.lng},${to.lat}?overview=full&geometries=geojson&alternatives=false&steps=false`;
+  const res = await fetch(url, { headers: { 'User-Agent': USER_AGENT } });
+  if (!res.ok) throw new Error(`Router responded ${res.status}`);
+  const data = await res.json();
+  const r = data && Array.isArray(data.routes) && data.routes[0];
+  if (!r || !r.geometry || !Array.isArray(r.geometry.coordinates)) {
+    throw new Error('Router returned no route');
   }
-  const result = {
-    // GeoJSON is [lng,lat]; Leaflet wants [lat,lng].
-    points: route.geometry.coordinates.map(([lng, lat]) => [
-      Math.round(lat * 1e5) / 1e5,
-      Math.round(lng * 1e5) / 1e5
-    ]),
-    distanceKm: Math.round(route.distance / 100) / 10,
-    durationMin: Math.max(1, Math.round(route.duration / 60))
+  const route = {
+    points: r.geometry.coordinates.map(([lng, lat]) => [lat, lng]),
+    distanceKm: Math.round((r.distance / 1000) * 10) / 10,
+    durationMin: Math.max(1, Math.round(r.duration / 60))
   };
-  cacheSet(key, result);
-  return result;
+  cacheSet(key, route);
+  return route;
 }
 
 module.exports = { searchPlaces, reverseGeocode, insideServiceArea, resolveLocation, routeBetween, VALLEY };

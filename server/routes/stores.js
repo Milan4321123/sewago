@@ -1,0 +1,811 @@
+const express = require('express');
+const { db, save, uid } = require('../db');
+const { config } = require('../config');
+const { authRequired, publicUser } = require('./auth');
+const partnerRoutes = require('./partner');
+const { recordTxn, recordPlatformRevenue, debitWallet } = require('../payments');
+const { STORE_COMMISSION_PCT, STORE_SERVICE_FEE } = require('../fees');
+const { coordsFor } = require('../places');
+const { resolveLocation } = require('../geo');
+const { parseItemSpeech } = require('../voiceParse');
+const { cleanupPhoto } = require('../photoAI');
+const events = require('../events');
+const {
+  UNITS, MAX_ITEMS_PER_STORE, isUnit, storeById, itemIn, storeIsLive, storeIsOpen,
+  moveStock, reorderSuggestions, storeStats, lowStockThreshold, canManageStore,
+  publicItem, publicStore
+} = require('../stores');
+
+const { authPartner, requirePartnerKyc, galleryFrom } = partnerRoutes;
+const router = express.Router();
+
+const MAX_ORDER_LINES = 40; // a grocery basket is longer than a food order
+
+/* ---------------- shared helpers ---------------- */
+
+// Resolve a store the caller is allowed to manage, as owner or as a hired helper.
+function manageableStore(req, res, { helpersAllowed = true } = {}) {
+  const store = storeById(req.params.id);
+  if (!store || store.removedAt) {
+    res.status(404).json({ error: 'Store not found.' });
+    return null;
+  }
+  const who = canManageStore(store, {
+    partnerId: req.partner ? req.partner.id : null,
+    userId: req.user ? req.user.id : null
+  });
+  if (!who || (who.role === 'helper' && !helpersAllowed)) {
+    res.status(403).json({ error: 'You do not manage this store.' });
+    return null;
+  }
+  req.storeRole = who.role;
+  return store;
+}
+
+function actorFrom(req) {
+  if (req.storeRole === 'helper' && req.user) {
+    return { actorKind: 'helper', actorId: req.user.id, actorName: req.user.name };
+  }
+  return { actorKind: 'partner', actorId: req.partner ? req.partner.id : null, actorName: req.partner ? req.partner.name : '' };
+}
+
+function subscribedItemIds(userId, storeId) {
+  return new Set(
+    db.itemSubscriptions
+      .filter((s) => s.userId === userId && s.storeId === storeId && s.status === 'active')
+      .map((s) => s.itemId)
+  );
+}
+
+function ownerOf(store) {
+  return db.partners.find((p) => p.id === store.ownerId);
+}
+
+/* ---------------- voice ---------------- */
+
+// Shared by the shopkeeper and helper flows: speech text in, item fields out.
+// Never writes anything — the client always confirms before saving.
+router.post('/stores/voice/parse', (req, res, next) => {
+  // Either a partner or a customer (helper) may be speaking.
+  if (req.headers.authorization) return next();
+  res.status(401).json({ error: 'Please log in again.' });
+}, (req, res) => {
+  const { text, lines } = req.body || {};
+  if (Array.isArray(lines)) {
+    return res.json({ items: lines.slice(0, 50).map((l) => parseItemSpeech(l)) });
+  }
+  if (typeof text !== 'string' || !text.trim()) {
+    return res.status(400).json({ error: 'Say the item name, quantity and price.' });
+  }
+  res.json({ item: parseItemSpeech(text) });
+});
+
+/* ---------------- shopkeeper: the store itself ---------------- */
+
+router.post('/partner/stores', authPartner, (req, res) => {
+  if (!requirePartnerKyc(req, res)) return;
+  const { name, area, icon, deliveryFee } = req.body || {};
+  if (!name || String(name).trim().length < 2) {
+    return res.status(400).json({ error: 'Your shop needs a name.' });
+  }
+  if (db.stores.some((s) => s.ownerId === req.partner.id && !s.removedAt && s.name.toLowerCase() === String(name).trim().toLowerCase())) {
+    return res.status(409).json({ error: 'You already have a shop with that name.' });
+  }
+  const gallery = galleryFrom(req.partner, req.body || {});
+  const spot = coordsFor(String(area || '').trim() || name);
+  const store = {
+    id: uid(),
+    ownerId: req.partner.id,
+    name: String(name).trim().slice(0, 60),
+    area: String(area || '').trim().slice(0, 60),
+    loc: { name: spot.name, lat: spot.lat, lng: spot.lng },
+    icon: String(icon || '🏪').slice(0, 8),
+    photo: gallery.photo,
+    photos: gallery.photos,
+    deliveryFee: Math.min(200, Math.max(0, Math.round(Number(deliveryFee) || 0))),
+    open: true,
+    items: [],
+    helpers: [],
+    status: 'pending', // staff review, same as every other listing
+    reviewNote: '',
+    submittedAt: Date.now()
+  };
+  db.stores.push(store);
+  save();
+  events.publish('admin', { topic: 'queue' });
+  res.json({ store });
+});
+
+router.get('/partner/stores', authPartner, (req, res) => {
+  const stores = db.stores
+    .filter((s) => s.ownerId === req.partner.id && !s.removedAt)
+    .map((s) => ({
+      ...publicStore(s),
+      status: s.status,
+      reviewNote: s.reviewNote || '',
+      stats: storeStats(s),
+      helpers: (s.helpers || []).filter((h) => h.status === 'active').length
+    }));
+  res.json({ stores });
+});
+
+// Open/closed and the delivery fee are the two things a shopkeeper changes daily.
+router.patch('/partner/stores/:id', authPartner, (req, res) => {
+  const store = manageableStore(req, res, { helpersAllowed: false });
+  if (!store) return;
+  const body = req.body || {};
+  if (body.open !== undefined) store.open = !!body.open;
+  if (body.deliveryFee !== undefined) {
+    store.deliveryFee = Math.min(200, Math.max(0, Math.round(Number(body.deliveryFee) || 0)));
+  }
+  if (body.name && String(body.name).trim().length >= 2) store.name = String(body.name).trim().slice(0, 60);
+  if (body.icon) store.icon = String(body.icon).slice(0, 8);
+  save();
+  res.json({ store: { ...publicStore(store), status: store.status } });
+});
+
+/* ---------------- shopkeeper: inventory ---------------- */
+
+router.get('/partner/stores/:id/inventory', authPartner, (req, res) => {
+  const store = manageableStore(req, res, { helpersAllowed: false });
+  if (!store) return;
+  const q = String(req.query.q || '').trim().toLowerCase();
+  const items = store.items
+    .filter((i) => !i.archived)
+    .filter((i) => !q || i.name.toLowerCase().includes(q) || (i.category || '').toLowerCase().includes(q))
+    .map((i) => ({
+      id: i.id,
+      name: i.name,
+      unit: i.unit,
+      unitLabel: (UNITS[i.unit] || UNITS.each).label,
+      price: i.price,
+      subscribePrice: i.subscribePrice || null,
+      stock: i.stock,
+      lowStockAt: lowStockThreshold(i),
+      low: (Number(i.stock) || 0) <= lowStockThreshold(i),
+      category: i.category || '',
+      photo: i.photo || '',
+      soldTotal: i.soldTotal || 0
+    }))
+    .sort((a, b) => Number(b.low) - Number(a.low) || a.name.localeCompare(b.name));
+  res.json({ items, stats: storeStats(store), units: UNITS, open: store.open !== false, status: store.status });
+});
+
+// Add one item. Accepts the output of the voice parser directly, so the confirm
+// screen posts exactly what the shopkeeper saw.
+function addItem(store, body, actor) {
+  const name = String(body.name || '').trim();
+  const price = Math.round(Number(body.price));
+  const unit = isUnit(body.unit) ? body.unit : 'each';
+  const stock = Number(body.stock ?? body.qty ?? 0);
+  if (name.length < 1 || name.length > 60) return { error: 'Item needs a name.' };
+  if (!Number.isFinite(price) || price < 1 || price > 100000) {
+    return { error: 'Price must be between Rs 1 and Rs 100,000.' };
+  }
+  if (!Number.isFinite(stock) || stock < 0 || stock > 100000) return { error: 'Enter a valid quantity.' };
+  if (store.items.filter((i) => !i.archived).length >= MAX_ITEMS_PER_STORE) {
+    return { error: `A shop can hold ${MAX_ITEMS_PER_STORE} items.` };
+  }
+  const dup = store.items.find((i) => !i.archived && i.name.toLowerCase() === name.toLowerCase() && i.unit === unit);
+  if (dup) {
+    // Saying an item you already stock is a restock, not a duplicate line —
+    // this is what happens naturally during a shelf count.
+    moveStock(store, dup, { qty: stock, reason: 'restock', refId: null, ...actor });
+    if (Number.isFinite(price) && price > 0) dup.price = price;
+    return { item: dup, restocked: true };
+  }
+  const subscribePrice = Number(body.subscribePrice);
+  const item = {
+    id: uid(),
+    name,
+    unit,
+    price,
+    subscribePrice: Number.isFinite(subscribePrice) && subscribePrice > 0 && subscribePrice < price
+      ? Math.round(subscribePrice)
+      : null,
+    stock: 0,
+    lowStockAt: Number.isFinite(Number(body.lowStockAt)) ? Number(body.lowStockAt) : null,
+    category: String(body.category || '').trim().slice(0, 40),
+    photo: '',
+    photos: [],
+    salesDaily: {},
+    soldTotal: 0,
+    createdAt: Date.now(),
+    updatedAt: Date.now()
+  };
+  store.items.push(item);
+  if (stock > 0) moveStock(store, item, { qty: stock, reason: 'initial_count', ...actor });
+  return { item };
+}
+
+router.post('/partner/stores/:id/items', authPartner, (req, res) => {
+  const store = manageableStore(req, res, { helpersAllowed: false });
+  if (!store) return;
+  const result = addItem(store, req.body || {}, actorFrom(req));
+  if (result.error) return res.status(400).json({ error: result.error });
+  save();
+  res.json({ item: result.item, restocked: !!result.restocked });
+});
+
+// A voice shelf-count produces many lines at once. Partial success is the point:
+// eight good rows should not be lost because the ninth was mis-heard.
+router.post('/partner/stores/:id/items/bulk', authPartner, (req, res) => {
+  const store = manageableStore(req, res, { helpersAllowed: false });
+  if (!store) return;
+  const rows = Array.isArray((req.body || {}).items) ? (req.body || {}).items.slice(0, 100) : [];
+  if (!rows.length) return res.status(400).json({ error: 'Nothing to add.' });
+  const actor = actorFrom(req);
+  const added = [];
+  const failed = [];
+  for (const row of rows) {
+    const result = addItem(store, row, actor);
+    if (result.error) failed.push({ name: row.name || '', error: result.error });
+    else added.push({ id: result.item.id, name: result.item.name, restocked: !!result.restocked });
+  }
+  save();
+  res.json({ added, failed, stats: storeStats(store) });
+});
+
+router.patch('/partner/stores/:id/items/:itemId', authPartner, (req, res) => {
+  const store = manageableStore(req, res, { helpersAllowed: false });
+  if (!store) return;
+  const item = itemIn(store, req.params.itemId);
+  if (!item || item.archived) return res.status(404).json({ error: 'Item not found.' });
+  const body = req.body || {};
+  if (body.name && String(body.name).trim()) item.name = String(body.name).trim().slice(0, 60);
+  if (body.price !== undefined) {
+    const p = Math.round(Number(body.price));
+    if (!Number.isFinite(p) || p < 1 || p > 100000) return res.status(400).json({ error: 'Price must be between Rs 1 and Rs 100,000.' });
+    item.price = p;
+  }
+  if (body.subscribePrice !== undefined) {
+    const sp = Math.round(Number(body.subscribePrice));
+    // A subscriber price above the shelf price would be a worse deal, not an offer.
+    item.subscribePrice = Number.isFinite(sp) && sp > 0 && sp < item.price ? sp : null;
+  }
+  if (body.unit !== undefined && isUnit(body.unit)) item.unit = body.unit;
+  if (body.category !== undefined) item.category = String(body.category).trim().slice(0, 40);
+  if (body.lowStockAt !== undefined) {
+    const t = Number(body.lowStockAt);
+    item.lowStockAt = Number.isFinite(t) && t >= 0 ? t : null;
+  }
+  if (body.photo !== undefined || body.photos !== undefined) {
+    const gallery = galleryFrom(req.partner, body);
+    item.photo = gallery.photo;
+    item.photos = gallery.photos;
+  }
+  item.updatedAt = Date.now();
+  save();
+  res.json({ item });
+});
+
+router.delete('/partner/stores/:id/items/:itemId', authPartner, (req, res) => {
+  const store = manageableStore(req, res, { helpersAllowed: false });
+  if (!store) return;
+  const item = itemIn(store, req.params.itemId);
+  if (!item) return res.status(404).json({ error: 'Item not found.' });
+  // Archive rather than delete: past orders and the stock ledger still name it.
+  item.archived = true;
+  item.updatedAt = Date.now();
+  save();
+  res.json({ ok: true });
+});
+
+// The single most-used button in the shop: someone bought something over the
+// counter. One tap, stock down, sale recorded for the reorder maths.
+router.post('/partner/stores/:id/items/:itemId/sold', authPartner, (req, res) => {
+  const store = manageableStore(req, res, { helpersAllowed: false });
+  if (!store) return;
+  const item = itemIn(store, req.params.itemId);
+  if (!item || item.archived) return res.status(404).json({ error: 'Item not found.' });
+  const qty = Number((req.body || {}).qty);
+  const sell = Number.isFinite(qty) && qty > 0 ? qty : 1;
+  if ((Number(item.stock) || 0) < sell) {
+    return res.status(400).json({ error: `Only ${item.stock} ${(UNITS[item.unit] || UNITS.each).label} left — correct the count first.` });
+  }
+  moveStock(store, item, { qty: -sell, reason: 'sale_counter', ...actorFrom(req) });
+  save();
+  res.json({ item: { id: item.id, stock: item.stock }, stats: storeStats(store) });
+});
+
+router.post('/partner/stores/:id/items/:itemId/restock', authPartner, (req, res) => {
+  const store = manageableStore(req, res, { helpersAllowed: false });
+  if (!store) return;
+  const item = itemIn(store, req.params.itemId);
+  if (!item || item.archived) return res.status(404).json({ error: 'Item not found.' });
+  const qty = Number((req.body || {}).qty);
+  if (!Number.isFinite(qty) || qty === 0 || Math.abs(qty) > 100000) {
+    return res.status(400).json({ error: 'Enter how many you received.' });
+  }
+  moveStock(store, item, { qty, reason: qty > 0 ? 'restock' : 'correction', ...actorFrom(req) });
+  save();
+  res.json({ item: { id: item.id, stock: item.stock }, stats: storeStats(store) });
+});
+
+router.get('/partner/stores/:id/reorder', authPartner, (req, res) => {
+  const store = manageableStore(req, res, { helpersAllowed: false });
+  if (!store) return;
+  res.json({ suggestions: reorderSuggestions(store), stats: storeStats(store) });
+});
+
+// "Where did my stock go?" — the shopkeeper's audit trail.
+router.get('/partner/stores/:id/moves', authPartner, (req, res) => {
+  const store = manageableStore(req, res, { helpersAllowed: false });
+  if (!store) return;
+  const moves = db.stockMoves
+    .filter((m) => m.storeId === store.id)
+    .slice(-60)
+    .reverse();
+  res.json({ moves });
+});
+
+/* ---------------- shopkeeper: helpers ---------------- */
+
+router.post('/partner/stores/:id/helpers', authPartner, (req, res) => {
+  const store = manageableStore(req, res, { helpersAllowed: false });
+  if (!store) return;
+  store.helpers = store.helpers || [];
+  if (store.helpers.filter((h) => h.status === 'active' || h.status === 'invited').length >= 5) {
+    return res.status(400).json({ error: 'A shop can have up to 5 helpers.' });
+  }
+  const invite = {
+    code: String(Math.floor(100000 + Math.random() * 900000)),
+    status: 'invited',
+    userId: null,
+    name: String((req.body || {}).name || '').trim().slice(0, 40),
+    createdAt: Date.now()
+  };
+  store.helpers.push(invite);
+  save();
+  res.json({ invite: { code: invite.code, name: invite.name } });
+});
+
+router.get('/partner/stores/:id/helpers', authPartner, (req, res) => {
+  const store = manageableStore(req, res, { helpersAllowed: false });
+  if (!store) return;
+  res.json({
+    helpers: (store.helpers || []).map((h) => ({
+      code: h.status === 'invited' ? h.code : null,
+      name: h.name || '',
+      status: h.status,
+      userId: h.userId,
+      joinedAt: h.joinedAt || null
+    }))
+  });
+});
+
+router.delete('/partner/stores/:id/helpers/:code', authPartner, (req, res) => {
+  const store = manageableStore(req, res, { helpersAllowed: false });
+  if (!store) return;
+  const helper = (store.helpers || []).find((h) => h.code === req.params.code);
+  if (!helper) return res.status(404).json({ error: 'Helper not found.' });
+  helper.status = 'revoked';
+  helper.revokedAt = Date.now();
+  save();
+  res.json({ ok: true });
+});
+
+// A helper joins with the code the shopkeeper read out to them, using their own
+// customer account — so their counting work is attributed to them by name.
+router.post('/stores/helper/join', authRequired, (req, res) => {
+  const code = String((req.body || {}).code || '').trim();
+  if (!/^\d{6}$/.test(code)) return res.status(400).json({ error: 'Enter the 6-digit code from the shopkeeper.' });
+  const store = db.stores.find((s) => !s.removedAt && (s.helpers || []).some((h) => h.code === code && h.status === 'invited'));
+  if (!store) return res.status(404).json({ error: 'That code is not valid any more.' });
+  const helper = store.helpers.find((h) => h.code === code);
+  helper.status = 'active';
+  helper.userId = req.user.id;
+  helper.name = helper.name || req.user.name;
+  helper.joinedAt = Date.now();
+  save();
+  events.publish(`partner:${store.ownerId}`, { topic: 'stores' });
+  res.json({ store: publicStore(store) });
+});
+
+router.get('/stores/helper/assignments', authRequired, (req, res) => {
+  const stores = db.stores
+    .filter((s) => !s.removedAt && (s.helpers || []).some((h) => h.userId === req.user.id && h.status === 'active'))
+    .map((s) => ({ ...publicStore(s), itemsToCount: s.items.filter((i) => !i.archived).length }));
+  res.json({ stores });
+});
+
+// Helpers may add items and correct counts — never prices, never deletions.
+router.post('/stores/:id/helper/items', authRequired, (req, res) => {
+  const store = manageableStore(req, res);
+  if (!store || req.storeRole !== 'helper') {
+    if (!res.headersSent) res.status(403).json({ error: 'You do not help at this store.' });
+    return;
+  }
+  const result = addItem(store, req.body || {}, actorFrom(req));
+  if (result.error) return res.status(400).json({ error: result.error });
+  save();
+  events.publish(`partner:${store.ownerId}`, { topic: 'stores' });
+  res.json({ item: { id: result.item.id, name: result.item.name, stock: result.item.stock }, restocked: !!result.restocked });
+});
+
+router.post('/stores/:id/helper/items/:itemId/count', authRequired, (req, res) => {
+  const store = manageableStore(req, res);
+  if (!store || req.storeRole !== 'helper') {
+    if (!res.headersSent) res.status(403).json({ error: 'You do not help at this store.' });
+    return;
+  }
+  const item = itemIn(store, req.params.itemId);
+  if (!item || item.archived) return res.status(404).json({ error: 'Item not found.' });
+  const counted = Number((req.body || {}).stock);
+  if (!Number.isFinite(counted) || counted < 0 || counted > 100000) {
+    return res.status(400).json({ error: 'Enter the number you counted on the shelf.' });
+  }
+  const delta = counted - (Number(item.stock) || 0);
+  if (delta !== 0) moveStock(store, item, { qty: delta, reason: 'stock_take', ...actorFrom(req) });
+  save();
+  events.publish(`partner:${store.ownerId}`, { topic: 'stores' });
+  res.json({ item: { id: item.id, stock: item.stock } });
+});
+
+/* ---------------- customer: browse ---------------- */
+
+router.get('/stores', authRequired, (req, res) => {
+  const stores = db.stores.filter(storeIsLive).map(publicStore);
+  res.json({ stores, serviceFee: STORE_SERVICE_FEE });
+});
+
+router.get('/stores/:id', authRequired, (req, res) => {
+  const store = storeById(req.params.id);
+  if (!storeIsLive(store)) return res.status(404).json({ error: 'Shop not found.' });
+  const subs = subscribedItemIds(req.user.id, store.id);
+  const items = store.items
+    .filter((i) => !i.archived)
+    .map((i) => publicItem(i, { subscribedIds: subs }))
+    .sort((a, b) => Number(b.inStock) - Number(a.inStock) || a.name.localeCompare(b.name));
+  res.json({ store: publicStore(store), items, serviceFee: STORE_SERVICE_FEE });
+});
+
+/* ---------------- customer: subscriptions ---------------- */
+
+// Subscribing is a standing interest in an item, and it unlocks the shopkeeper's
+// subscriber price. Discount is applied server-side at order time, never trusted
+// from the client.
+router.post('/stores/:id/items/:itemId/subscribe', authRequired, (req, res) => {
+  const store = storeById(req.params.id);
+  if (!storeIsLive(store)) return res.status(404).json({ error: 'Shop not found.' });
+  const item = itemIn(store, req.params.itemId);
+  if (!item || item.archived) return res.status(404).json({ error: 'Item not found.' });
+  if (!item.subscribePrice) {
+    return res.status(400).json({ error: 'This item does not have a subscriber price yet.' });
+  }
+  const existing = db.itemSubscriptions.find(
+    (s) => s.userId === req.user.id && s.itemId === item.id && s.status === 'active'
+  );
+  if (existing) return res.json({ subscription: existing });
+  const everyDays = Math.min(90, Math.max(1, Math.round(Number((req.body || {}).everyDays) || 7)));
+  const subscription = {
+    id: uid(),
+    userId: req.user.id,
+    storeId: store.id,
+    storeName: store.name,
+    itemId: item.id,
+    itemName: item.name,
+    everyDays,
+    price: item.subscribePrice,
+    listPrice: item.price,
+    status: 'active',
+    createdAt: Date.now(),
+    nextDueAt: Date.now() + everyDays * 86400000
+  };
+  db.itemSubscriptions.push(subscription);
+  save();
+  res.json({ subscription });
+});
+
+router.delete('/stores/:id/items/:itemId/subscribe', authRequired, (req, res) => {
+  const sub = db.itemSubscriptions.find(
+    (s) => s.userId === req.user.id && s.itemId === req.params.itemId && s.status === 'active'
+  );
+  if (!sub) return res.status(404).json({ error: 'You are not subscribed to this item.' });
+  sub.status = 'cancelled';
+  sub.cancelledAt = Date.now();
+  save();
+  res.json({ ok: true });
+});
+
+router.get('/subscriptions', authRequired, (req, res) => {
+  const subs = db.itemSubscriptions
+    .filter((s) => s.userId === req.user.id && s.status === 'active')
+    .map((s) => {
+      const store = storeById(s.storeId);
+      const item = store && itemIn(store, s.itemId);
+      return {
+        id: s.id,
+        storeId: s.storeId,
+        storeName: s.storeName,
+        itemId: s.itemId,
+        itemName: s.itemName,
+        everyDays: s.everyDays,
+        // Always read the CURRENT prices — a stale locked price would mislead.
+        price: item && item.subscribePrice ? item.subscribePrice : s.price,
+        listPrice: item ? item.price : s.listPrice,
+        available: !!(item && !item.archived && (Number(item.stock) || 0) > 0 && storeIsOpen(store)),
+        dueSoon: Date.now() >= (s.nextDueAt || 0) - 86400000
+      };
+    });
+  res.json({ subscriptions: subs });
+});
+
+/* ---------------- customer: ordering ---------------- */
+
+router.post('/store-orders', authRequired, (req, res) => {
+  const { storeId, items, payment, deliverTo } = req.body || {};
+  const store = storeById(storeId);
+  if (!storeIsLive(store)) return res.status(404).json({ error: 'Shop not found.' });
+  if (!storeIsOpen(store)) return res.status(409).json({ error: `${store.name} is closed right now.` });
+  if (!Array.isArray(items) || !items.length) return res.status(400).json({ error: 'Your basket is empty.' });
+  if (items.length > MAX_ORDER_LINES) {
+    return res.status(400).json({ error: `An order can contain at most ${MAX_ORDER_LINES} different items.` });
+  }
+
+  // Aggregate duplicates so the per-line checks actually bind.
+  const wanted = new Map();
+  for (const line of items) {
+    const qty = Number(line && line.qty);
+    if (!line || !line.itemId || !Number.isFinite(qty) || qty <= 0 || qty > 1000) {
+      return res.status(400).json({ error: 'Invalid item in your basket.' });
+    }
+    wanted.set(line.itemId, (wanted.get(line.itemId) || 0) + qty);
+  }
+
+  const subs = subscribedItemIds(req.user.id, store.id);
+  const lines = [];
+  let subtotal = 0;
+  for (const [itemId, qty] of wanted) {
+    const item = itemIn(store, itemId);
+    if (!item || item.archived) return res.status(404).json({ error: 'An item in your basket is no longer sold here.' });
+    if ((Number(item.stock) || 0) < qty) {
+      return res.status(409).json({ error: `${item.name}: only ${item.stock} ${(UNITS[item.unit] || UNITS.each).label} left.` });
+    }
+    // Subscriber price is decided here, from the server's own record.
+    const subscribed = subs.has(item.id) && !!item.subscribePrice;
+    const unitPrice = subscribed ? item.subscribePrice : item.price;
+    subtotal += unitPrice * qty;
+    lines.push({
+      itemId: item.id, name: item.name, unit: item.unit, qty,
+      price: unitPrice, listPrice: item.price, subscribed
+    });
+  }
+
+  const deliveryFee = store.deliveryFee || 0;
+  const payMethod = payment === 'cash' ? 'cash' : 'wallet';
+  const serviceFee = payMethod === 'wallet' ? STORE_SERVICE_FEE : 0;
+  const total = subtotal + deliveryFee + serviceFee;
+  if (payMethod === 'wallet' && req.user.wallet < total) {
+    return res.status(402).json({ error: 'Not enough wallet balance. Top up, or pay cash on delivery.' });
+  }
+
+  let deliveryLoc = null;
+  if (deliverTo) {
+    const resolved = resolveLocation(deliverTo);
+    if (resolved.error === 'outside') return res.status(400).json({ error: 'That delivery point is outside the service area.' });
+    if (!resolved.error) deliveryLoc = { name: resolved.name, lat: resolved.lat, lng: resolved.lng };
+  }
+
+  const commission = Math.round(subtotal * (STORE_COMMISSION_PCT / 100));
+  const order = {
+    id: uid(),
+    userId: req.user.id,
+    customerName: req.user.name,
+    storeId: store.id,
+    storeName: store.name,
+    storeIcon: store.icon,
+    partnerId: store.ownerId,
+    items: lines,
+    subtotal,
+    deliveryFee,
+    serviceFee,
+    total,
+    commission,
+    partnerCut: subtotal + deliveryFee - commission,
+    partnerSettled: false,
+    payment: payMethod,
+    deliveryLoc,
+    status: 'placed',
+    createdAt: Date.now()
+  };
+
+  // Reserve the stock now so two customers cannot buy the last bag of rice.
+  const actor = { actorKind: 'system', actorId: null, actorName: 'Customer order' };
+  for (const line of lines) {
+    moveStock(store, itemIn(store, line.itemId), { qty: -line.qty, reason: 'order', refId: order.id, ...actor });
+  }
+
+  if (payMethod === 'wallet') {
+    debitWallet(req.user, total);
+    recordTxn('user', req.user, {
+      type: 'store_order', label: `Shop order: ${store.name}`, amount: total, sign: -1, refId: order.id
+    });
+    const owner = ownerOf(store);
+    if (owner) {
+      // Held as pending until handover, so a refunded order can never be cashed out.
+      owner.pendingEarnings = (owner.pendingEarnings || 0) + order.partnerCut;
+      recordTxn('partner', owner, {
+        type: 'store_income_pending', label: `Order placed (pending handover): ${store.name}`,
+        amount: order.partnerCut, sign: 1, refId: order.id
+      });
+    }
+    recordPlatformRevenue({
+      source: 'store_commission', label: `Store commission: ${store.name}`, amount: commission, refId: order.id
+    });
+    if (serviceFee > 0) {
+      recordPlatformRevenue({
+        source: 'service_fee', label: `Shop order service fee: ${store.name}`, amount: serviceFee, refId: order.id
+      });
+    }
+  }
+
+  db.storeOrders.push(order);
+  save();
+  events.publish(`partner:${store.ownerId}`, { topic: 'store_orders' });
+  events.publish('admin', { topic: 'orders' });
+  res.json({ order, user: publicUser(req.user) });
+});
+
+router.get('/store-orders', authRequired, (req, res) => {
+  const orders = [];
+  for (let i = db.storeOrders.length - 1; i >= 0 && orders.length < 20; i -= 1) {
+    if (db.storeOrders[i].userId === req.user.id) orders.push(db.storeOrders[i]);
+  }
+  res.json({ orders });
+});
+
+// Cancelling puts the goods back on the shelf and unwinds every money movement.
+function unwindStoreOrder(order, { label }) {
+  const store = storeById(order.storeId);
+  if (store) {
+    for (const line of order.items) {
+      const item = itemIn(store, line.itemId);
+      if (item) {
+        moveStock(store, item, {
+          qty: line.qty, reason: 'order_cancel', refId: order.id,
+          actorKind: 'system', actorId: null, actorName: 'Order cancelled'
+        });
+      }
+    }
+  }
+  if (order.payment !== 'cash') {
+    const user = db.users.find((u) => u.id === order.userId);
+    if (user) {
+      user.wallet += order.total;
+      recordTxn('user', user, { type: 'store_refund', label, amount: order.total, sign: 1, refId: order.id });
+    }
+    const owner = db.partners.find((p) => p.id === order.partnerId);
+    if (owner) {
+      owner.pendingEarnings = (owner.pendingEarnings || 0) - order.partnerCut;
+      recordTxn('partner', owner, {
+        type: 'store_reversal', label: `Order cancelled: ${order.storeName}`,
+        amount: order.partnerCut, sign: -1, refId: order.id
+      });
+    }
+    recordPlatformRevenue({
+      source: 'store_commission', label: `Order cancelled — commission reversed: ${order.storeName}`,
+      amount: -order.commission, refId: order.id
+    });
+    if (order.serviceFee > 0) {
+      recordPlatformRevenue({
+        source: 'service_fee', label: `Order cancelled — service fee reversed: ${order.storeName}`,
+        amount: -order.serviceFee, refId: order.id
+      });
+    }
+  }
+}
+
+router.post('/store-orders/:id/cancel', authRequired, (req, res) => {
+  const order = db.storeOrders.find((o) => o.id === req.params.id && o.userId === req.user.id);
+  if (!order) return res.status(404).json({ error: 'Order not found.' });
+  if (order.status !== 'placed') {
+    return res.status(400).json({ error: 'The shop has already started packing — call them to cancel.' });
+  }
+  order.status = 'cancelled';
+  order.cancelledAt = Date.now();
+  unwindStoreOrder(order, { label: `Shop order cancelled — refund: ${order.storeName}` });
+  save();
+  events.publish(`partner:${order.partnerId}`, { topic: 'store_orders' });
+  res.json({ order, user: publicUser(req.user) });
+});
+
+/* ---------------- shopkeeper: orders ---------------- */
+
+router.get('/partner/stores/:id/orders', authPartner, (req, res) => {
+  const store = manageableStore(req, res, { helpersAllowed: false });
+  if (!store) return;
+  const active = { placed: 0, accepted: 1, ready: 2 };
+  const orders = db.storeOrders
+    .filter((o) => o.storeId === store.id)
+    .slice(-40)
+    .reverse()
+    .sort((a, b) => (active[a.status] ?? 9) - (active[b.status] ?? 9));
+  res.json({ orders });
+});
+
+router.post('/partner/store-orders/:orderId/:action(accept|reject|ready|handover)', authPartner, (req, res) => {
+  const order = db.storeOrders.find((o) => o.id === req.params.orderId);
+  if (!order) return res.status(404).json({ error: 'Order not found.' });
+  const store = storeById(order.storeId);
+  if (!store || store.ownerId !== req.partner.id) {
+    return res.status(403).json({ error: 'You do not manage this store.' });
+  }
+  const action = req.params.action;
+
+  if (action === 'reject') {
+    if (order.status !== 'placed' && order.status !== 'accepted') {
+      return res.status(400).json({ error: 'This order can no longer be rejected.' });
+    }
+    order.status = 'cancelled';
+    order.cancelledAt = Date.now();
+    order.cancelReason = 'shop_rejected';
+    unwindStoreOrder(order, { label: `Shop could not fulfil the order — refund: ${order.storeName}` });
+  } else if (action === 'accept') {
+    if (order.status !== 'placed') return res.status(400).json({ error: 'This order was already handled.' });
+    order.status = 'accepted';
+    order.acceptedAt = Date.now();
+  } else if (action === 'ready') {
+    if (order.status !== 'accepted') return res.status(400).json({ error: 'Accept the order first.' });
+    order.status = 'ready';
+    order.readyAt = Date.now();
+  } else if (action === 'handover') {
+    if (order.status !== 'ready' && order.status !== 'accepted') {
+      return res.status(400).json({ error: 'Mark the order ready first.' });
+    }
+    order.status = 'delivered';
+    order.deliveredAt = Date.now();
+    // Handover is the moment the goods actually change hands, so this is when
+    // income settles and — for cash — when the platform's cut is really earned.
+    const owner = ownerOf(store);
+    if (owner && !order.partnerSettled) {
+      if (order.payment === 'cash') {
+        // The shopkeeper took the customer's cash, so they owe SewaGo its cut.
+        owner.earnings = (owner.earnings || 0) - order.commission;
+        recordTxn('partner', owner, {
+          type: 'store_cash_commission', label: `Commission on cash order: ${store.name}`,
+          amount: order.commission, sign: -1, refId: order.id
+        });
+        recordPlatformRevenue({
+          source: 'store_commission', label: `Store commission (cash): ${store.name}`,
+          amount: order.commission, refId: order.id
+        });
+      } else {
+        owner.pendingEarnings = (owner.pendingEarnings || 0) - order.partnerCut;
+        owner.earnings = (owner.earnings || 0) + order.partnerCut;
+        recordTxn('partner', owner, {
+          type: 'store_income', label: `Order handed over — income: ${store.name}`,
+          amount: order.partnerCut, sign: 1, refId: order.id
+        });
+      }
+      order.partnerSettled = true;
+    }
+  }
+  save();
+  events.publish(`user:${order.userId}`, { topic: 'store_order' });
+  events.publish('admin', { topic: 'orders' });
+  res.json({ order });
+});
+
+/* ---------------- photos ---------------- */
+
+// Item photos ride the existing partner upload pipeline, then get an optional
+// AI cleanup pass. If no provider is configured the raw photo is used — a shop
+// must never be blocked from listing an item because an image API is down.
+router.post('/partner/stores/:id/items/:itemId/photo', authPartner, async (req, res) => {
+  const store = manageableStore(req, res, { helpersAllowed: false });
+  if (!store) return;
+  const item = itemIn(store, req.params.itemId);
+  if (!item || item.archived) return res.status(404).json({ error: 'Item not found.' });
+  const gallery = galleryFrom(req.partner, req.body || {});
+  if (!gallery.photo) return res.status(400).json({ error: 'Upload a photo first.' });
+  const result = await cleanupPhoto(gallery.photo, { label: item.name });
+  item.photo = result.url;
+  item.photos = [result.url];
+  item.photoCleaned = result.cleaned;
+  item.updatedAt = Date.now();
+  save();
+  res.json({ item: { id: item.id, photo: item.photo, cleaned: result.cleaned, note: result.note } });
+});
+
+module.exports = router;

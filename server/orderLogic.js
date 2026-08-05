@@ -34,15 +34,22 @@ function isLive(listing) {
 function refundOrder(order, { label, txnType = 'food_refund' }) {
   // Lazy require to avoid a circular import at module load time.
   const { recordTxn, recordPlatformRevenue } = require('./payments');
+  // Cash-on-delivery orders were never charged (the courier collects at the
+  // door), so there is nothing to refund and no booked revenue to reverse —
+  // only the partner's pending income unwinds.
+  const wasPrepaid = order.payment !== 'cash';
   const user = db.users.find((u) => u.id === order.userId);
-  if (user) {
+  if (user && wasPrepaid) {
     user.wallet += order.total;
     recordTxn('user', user, { type: txnType, label, amount: order.total, sign: 1, refId: order.id });
   }
   if (order.partnerCut && order.partnerId) {
     const owner = db.partners.find((p) => p.id === order.partnerId);
     if (owner) {
-      owner.earnings = (owner.earnings || 0) - order.partnerCut;
+      // Un-delivered orders only ever credited PENDING earnings (never
+      // withdrawable earnings), so reverse from there — this is what stops a
+      // partner cashing out income and then having the order refunded.
+      owner.pendingEarnings = (owner.pendingEarnings || 0) - order.partnerCut;
       recordTxn('partner', owner, {
         type: 'order_reversal',
         label: `Order cancelled: ${order.restaurantName}`,
@@ -51,14 +58,16 @@ function refundOrder(order, { label, txnType = 'food_refund' }) {
         refId: order.id
       });
     }
-    recordPlatformRevenue({
-      source: 'food_commission',
-      label: `Order cancelled — commission reversed: ${order.restaurantName}`,
-      amount: -(order.total - order.partnerCut - (order.serviceFee || 0)),
-      refId: order.id
-    });
+    if (wasPrepaid) {
+      recordPlatformRevenue({
+        source: 'food_commission',
+        label: `Order cancelled — commission reversed: ${order.restaurantName}`,
+        amount: -(order.total - order.partnerCut - (order.serviceFee || 0)),
+        refId: order.id
+      });
+    }
   }
-  if (order.serviceFee > 0) {
+  if (order.serviceFee > 0 && wasPrepaid) {
     recordPlatformRevenue({
       source: 'service_fee',
       label: `Order cancelled — service fee reversed: ${order.restaurantName}`,
@@ -100,9 +109,47 @@ function withStatus(order) {
 
 // The courier's current job, if any — assigned at 'preparing', done after
 // 'delivered'. A driver can hold one delivery OR one ride, never both.
+// A courier who accepts a delivery and then goes silent used to strand it
+// forever: the order never reached a terminal state, the partner's income stayed
+// frozen in pendingEarnings, a prepaid customer got no refund, and the courier
+// stayed pinned to a job they abandoned. Recover both cases on a timer.
+const PICKUP_DEADLINE_MS = 25 * 60 * 1000;   // accepted but never collected
+const DROPOFF_DEADLINE_MS = 90 * 60 * 1000;  // collected but never delivered
+
+function recoverAbandonedDeliveries() {
+  const now = Date.now();
+  let changed = 0;
+  for (const order of db.orders) {
+    if (order.fulfillment !== 'live' || !order.courierId) continue;
+    if (order.status === 'delivered' || order.status === 'cancelled') continue;
+
+    // Not picked up in time: release the courier and return it to the pool so
+    // another rider can take it. Nothing financial has happened yet.
+    if (order.status === 'preparing' && now - (order.courierAcceptedAt || 0) > PICKUP_DEADLINE_MS) {
+      order.courierId = null;
+      order.courier = null;
+      order.courierAcceptedAt = null;
+      order.reofferedAt = now;
+      changed += 1;
+      continue;
+    }
+    // Food collected but never delivered: this needs a human. Flag it for the
+    // admin queue and unpin the courier so they aren't blocked from other work,
+    // but keep the assignment recorded for the investigation.
+    if (order.status === 'out_for_delivery' && now - (order.pickedUpAt || 0) > DROPOFF_DEADLINE_MS && !order.abandonedAt) {
+      order.abandonedAt = now;
+      order.abandonedBy = order.courierId;
+      changed += 1;
+    }
+  }
+  return changed;
+}
+
 function currentDelivery(driverId) {
   const order = db.orders.find(
-    (o) => o.courierId === driverId && (o.status === 'preparing' || o.status === 'out_for_delivery')
+    (o) => o.courierId === driverId &&
+      !o.abandonedAt && // an abandoned job no longer blocks the courier
+      (o.status === 'preparing' || o.status === 'out_for_delivery')
   );
   return order ? withStatus(order) : null;
 }
@@ -157,6 +204,7 @@ module.exports = {
   refundOrder,
   courierPayoutFor,
   currentDelivery,
+  recoverAbandonedDeliveries,
   applyRating,
   addReview,
   reviewsFor,

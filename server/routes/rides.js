@@ -1,11 +1,12 @@
 const express = require('express');
 const { db, save, uid } = require('../db');
+const { config } = require('../config');
 const { authRequired, publicUser } = require('./auth');
 const { withStatus, driverPublic, etaToPickupMin, driverIsAvailable, driverNearPickup, ROAD_FACTOR, SEARCH_TIMEOUT_SECONDS } = require('../rideLogic');
 const { PLACES, haversineKm } = require('../places');
 const { searchPlaces, reverseGeocode, insideServiceArea, resolveLocation, routeBetween } = require('../geo');
 const sessionTokens = require('../sessionTokens');
-const { recordTxn, recordPlatformRevenue } = require('../payments');
+const { recordTxn, recordPlatformRevenue, debitWallet } = require('../payments');
 const { RIDE_SERVICE_FEE, surgeFor, cancelFeeSplit } = require('../fees');
 const { normalizePhone, validPhone } = require('../accountSecurity');
 const { applyRating } = require('../orderLogic');
@@ -176,6 +177,12 @@ router.post('/rides', authRequired, (req, res) => {
   // blocks) a trip they cannot drive to.
   const anyOnline = db.drivers.some((d) => driverIsAvailable(d, tier) && driverNearPickup(d, pickupPlace));
   const mode = anyOnline ? 'live' : 'sim';
+  // In production the simulated fallback is off: never charge a real wallet for
+  // a ride no real driver will drive. Refuse cleanly so the customer keeps their
+  // money and can try again when a driver comes online.
+  if (mode === 'sim' && !config.allowSimFulfillment) {
+    return res.status(503).json({ error: 'No drivers available near you right now — please try again in a few minutes.' });
+  }
   let driver = null;
   let driverStart = null;
   let driverEta = null;
@@ -223,7 +230,7 @@ router.post('/rides', authRequired, (req, res) => {
     createdAt: Date.now()
   };
   if (payMethod === 'wallet') {
-    req.user.wallet -= ride.total;
+    debitWallet(req.user, ride.total);
     recordTxn('user', req.user, {
       type: 'ride',
       label: `Ride: ${ride.pickup} → ${ride.dropoff}`,
@@ -249,9 +256,15 @@ router.post('/rides', authRequired, (req, res) => {
 });
 
 router.get('/rides/active', authRequired, (req, res) => {
-  const rides = db.rides.filter((r) => r.userId === req.user.id).map(withStatus);
-  const latest = rides[rides.length - 1];
-  if (!latest) return res.json({ ride: null });
+  // Hot path (polled every ~2.5s by every open app): rides append in time
+  // order, so scan backwards and stop at this user's newest ride instead of
+  // filtering + status-mapping their whole history.
+  let latestRaw = null;
+  for (let i = db.rides.length - 1; i >= 0; i--) {
+    if (db.rides[i].userId === req.user.id) { latestRaw = db.rides[i]; break; }
+  }
+  if (!latestRaw) return res.json({ ride: null });
+  const latest = withStatus(latestRaw);
   const showable =
     (latest.status !== 'completed' && latest.status !== 'cancelled') ||
     (latest.status === 'completed' && !latest.rating && Date.now() - (latest.completedAt || 0) < 10 * 60 * 1000) ||
@@ -365,7 +378,7 @@ router.post('/rides/:id/boost', authRequired, (req, res) => {
     if (req.user.wallet < amount) {
       return res.status(402).json({ error: 'Not enough wallet balance to raise the fare.' });
     }
-    req.user.wallet -= amount;
+    debitWallet(req.user, amount);
     recordTxn('user', req.user, {
       type: 'ride',
       label: `Fare raised (+Rs ${amount}): ${ride.pickup} → ${ride.dropoff}`,

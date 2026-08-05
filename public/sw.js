@@ -1,10 +1,12 @@
-const CACHE = 'sewago-static-v2';
+const CACHE = 'sewago-static-v3';
 const ASSETS = [
   '/',
   '/driver',
   '/partner',
   '/admin',
   '/download',
+  '/privacy',
+  '/terms',
   '/index.html',
   '/driver.html',
   '/partner.html',

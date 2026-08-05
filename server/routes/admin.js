@@ -68,28 +68,42 @@ router.post('/admin/logout', authAdmin, (req, res) => {
 
 router.get('/admin/overview', authAdmin, (req, res) => {
   const completedRides = db.rides.filter((r) => r.status === 'completed');
-  const rideCommission = completedRides.reduce((sum, r) => sum + (r.fare - (r.payout ?? payoutFor(r))), 0);
-  const taskFees = db.tasks.filter((t) => t.status === 'completed').reduce((sum, t) => sum + t.fee, 0);
-  const withdrawalFees = db.withdrawals.filter((w) => w.status !== 'rejected').reduce((sum, w) => sum + w.fee, 0);
-  // Commission on partner-owned listings (seeded demo listings have no partner to pay).
-  // Service fees and courier payouts have their own lines, so the commission
-  // here is what's left of the order after the partner, fees, and the courier.
-  const foodCommission = db.orders
-    .filter((o) => o.partnerCut && o.status !== 'cancelled')
-    .reduce((sum, o) => sum + (o.total - o.partnerCut - (o.serviceFee || 0) - (o.courierPayout || 0)), 0);
-  const stayCommission = db.bookings
-    .filter((b) => b.partnerCut && b.status !== 'cancelled')
-    .reduce((sum, b) => sum + (b.total - b.partnerCut), 0);
-  // Per-booking service fees are earned unless the booking was cancelled
-  // (cancellation reverses them); late-cancel fees keep only the platform half.
-  const serviceFees =
+  // REVENUE COMES FROM THE LEDGER, NOT A RECOMPUTE. The append-only platform
+  // ledger is the single source of truth: every rupee SewaGo earns is written
+  // there when the money actually moves (and reversed on refunds). Deriving the
+  // dashboard from booking rows instead would drift the moment any commission
+  // path changes — and would, for example, count a cash-on-delivery order's
+  // commission before the courier has collected a single rupee.
+  const led = platformRevenueTotals();
+  const ledger = (source) => led[source] || 0;
+  const rideCommission = ledger('ride_commission');
+  const taskFees = ledger('task_fee');
+  const withdrawalFees = ledger('withdraw_fee');
+  const foodCommission = ledger('food_commission');
+  const stayCommission = ledger('stay_commission');
+  const serviceFees = ledger('service_fee');
+  const cancelFees = ledger('cancel_fee');
+  const promotionFees = ledger('promotion_fee');
+  const courierPayouts = ledger('courier_payout'); // negative: a cost, not income
+
+  // Independent cross-check recomputed from the booking rows. It should track
+  // the ledger; any gap means a money path wrote one but not the other, so the
+  // drift is surfaced to staff instead of silently corrupting the books.
+  const derivedTotal =
+    completedRides.reduce((sum, r) => sum + (r.fare - (r.payout ?? payoutFor(r))), 0) +
+    db.tasks.filter((t) => t.status === 'completed').reduce((sum, t) => sum + t.fee, 0) +
+    db.withdrawals.filter((w) => w.status !== 'rejected').reduce((sum, w) => sum + w.fee, 0) +
+    db.orders
+      .filter((o) => o.partnerCut && o.status === 'delivered')
+      .reduce((sum, o) => sum + (o.total - o.partnerCut - (o.serviceFee || 0) - (o.courierPayout || 0)), 0) +
+    db.bookings
+      .filter((b) => b.partnerCut && b.status !== 'cancelled')
+      .reduce((sum, b) => sum + (b.total - b.partnerCut), 0) +
     db.rides.filter((r) => r.status !== 'cancelled').reduce((sum, r) => sum + (r.serviceFee || 0), 0) +
-    db.orders.filter((o) => o.status !== 'cancelled').reduce((sum, o) => sum + (o.serviceFee || 0), 0);
-  const cancelFees = db.rides.reduce((sum, r) => sum + (r.cancelFeePlatform || 0), 0);
-  // Featured-placement purchases live only in the platform ledger.
-  const promotionFees = db.platformLedger
-    .filter((e) => e.source === 'promotion_fee')
-    .reduce((sum, e) => sum + e.amount, 0);
+    db.orders.filter((o) => o.status === 'delivered').reduce((sum, o) => sum + (o.serviceFee || 0), 0) +
+    db.rides.reduce((sum, r) => sum + (r.cancelFeePlatform || 0), 0) +
+    promotionFees;
+
   const count = (arr, fn) => arr.filter(fn).length;
   res.json({
     stats: {
@@ -108,7 +122,7 @@ router.get('/admin/overview', authAdmin, (req, res) => {
       tasksOpen: count(db.tasks, (t) => t.status === 'open'),
       tasksActive: count(db.tasks, (t) => t.status === 'assigned' || t.status === 'done'),
       tasksCompleted: count(db.tasks, (t) => t.status === 'completed'),
-      revenue: rideCommission + taskFees + withdrawalFees + foodCommission + stayCommission + serviceFees + cancelFees + promotionFees,
+      revenue: led.total,
       rideCommission,
       taskFees,
       withdrawalFees,
@@ -117,10 +131,43 @@ router.get('/admin/overview', authAdmin, (req, res) => {
       serviceFees,
       cancelFees,
       promotionFees,
+      courierPayouts,
       withdrawalsPending: count(db.withdrawals, (w) => w.status === 'processing')
-    }
+    },
+    // Ledger vs. independently-recomputed revenue. drift must be 0; anything
+    // else means a money path updated one and not the other.
+    reconciliation: {
+      ledgerTotal: led.total,
+      derivedTotal,
+      drift: led.total - derivedTotal
+    },
+    revenueTrend: revenueTrend(14)
   });
 });
+
+// Daily platform revenue + completed rides for the last N days (ledger-driven),
+// oldest day first — feeds the Overview trend chart.
+function revenueTrend(days) {
+  const out = [];
+  const dayMs = 24 * 60 * 60 * 1000;
+  const startOfToday = new Date().setHours(0, 0, 0, 0);
+  for (let i = days - 1; i >= 0; i--) {
+    const from = startOfToday - i * dayMs;
+    out.push({ day: new Date(from).toISOString().slice(0, 10), from, to: from + dayMs, revenue: 0, rides: 0 });
+  }
+  const first = out[0].from;
+  for (const e of db.platformLedger) {
+    if (e.createdAt < first) continue;
+    const bucket = out[Math.min(out.length - 1, Math.floor((e.createdAt - first) / dayMs))];
+    if (bucket) bucket.revenue += e.amount;
+  }
+  for (const r of db.rides) {
+    if (r.status !== 'completed' || !r.completedAt || r.completedAt < first) continue;
+    const bucket = out[Math.min(out.length - 1, Math.floor((r.completedAt - first) / dayMs))];
+    if (bucket) bucket.rides += 1;
+  }
+  return out.map(({ day, revenue, rides }) => ({ day, revenue, rides }));
+}
 
 // Ops view: process health + request/error counters since last restart.
 router.get('/admin/metrics', authAdmin, (req, res) => {
@@ -249,8 +296,22 @@ router.post('/admin/withdrawals/:id/:action(approve|reject)', authAdmin, (req, r
   if (!withdrawal) return res.status(404).json({ error: 'Withdrawal not found.' });
   if (withdrawal.status !== 'processing') return res.status(400).json({ error: 'This withdrawal was already processed.' });
   if (req.params.action === 'approve') {
+    // Defense in depth: never disburse if the requester's balance has since gone
+    // negative (a reversal clawed the held funds back). Reject and refund so the
+    // platform never pays out money it no longer holds.
+    const owner = withdrawal.ownerKind === 'driver'
+      ? db.drivers.find((d) => d.id === withdrawal.ownerId)
+      : withdrawal.ownerKind === 'partner'
+        ? db.partners.find((p) => p.id === withdrawal.ownerId)
+        : db.users.find((u) => u.id === withdrawal.ownerId);
+    const balance = owner ? (withdrawal.ownerKind === 'user' ? owner.wallet : (owner.earnings || 0)) : 0;
+    if (!owner || balance < 0) {
+      return res.status(409).json({ error: 'Cannot pay out: the account balance no longer backs this withdrawal. Reject it to refund and investigate.' });
+    }
     withdrawal.status = 'paid';
     withdrawal.paidAt = Date.now();
+    // Record who to actually send the money to and that it awaits real transfer.
+    withdrawal.disbursedRef = String((req.body || {}).payoutRef || '').slice(0, 80) || null;
   } else {
     withdrawal.status = 'rejected';
     withdrawal.rejectedAt = Date.now();
@@ -304,7 +365,14 @@ router.get('/admin/queue', authAdmin, (req, res) => {
   const hotels = db.hotels
     .filter((h) => h.status === 'pending')
     .map((h) => ({ ...h, partner: partnerInfo(h.ownerId) }));
-  res.json({ restaurants, hotels });
+  const stores = db.stores
+    .filter((s) => s.status === 'pending')
+    .map((s) => ({
+      id: s.id, name: s.name, area: s.area, icon: s.icon, photo: s.photo,
+      itemCount: s.items.length, submittedAt: s.submittedAt,
+      partner: partnerInfo(s.ownerId)
+    }));
+  res.json({ restaurants, hotels, stores });
 });
 
 router.get('/admin/partners', authAdmin, (req, res) => {
@@ -380,6 +448,202 @@ router.post('/admin/hotels/:id/:action(approve|reject)', authAdmin, (req, res) =
   const result = reviewListing(db.hotels, req.params.id, req.params.action, (req.body || {}).note);
   if (result.error) return res.status(result.code).json({ error: result.error });
   res.json({ hotel: result.listing });
+});
+
+router.post('/admin/stores/:id/:action(approve|reject)', authAdmin, (req, res) => {
+  const result = reviewListing(db.stores, req.params.id, req.params.action, (req.body || {}).note);
+  if (result.error) return res.status(result.code).json({ error: result.error });
+  logAudit({
+    actor: adminActor(),
+    action: `stores.${req.params.action}`,
+    targetType: 'store',
+    targetId: result.listing.id,
+    meta: { note: result.listing.reviewNote },
+    ip: req.ip
+  });
+  events.publish(`partner:${result.listing.ownerId}`, { topic: 'stores' });
+  res.json({ store: result.listing });
+});
+
+/* ---------------- people: customer + driver ops ---------------- */
+
+function matchesQuery(q, ...fields) {
+  return fields.some((f) => f && String(f).toLowerCase().includes(q));
+}
+
+function adminUser(u) {
+  return {
+    id: u.id,
+    name: u.name,
+    email: u.email,
+    phone: u.phone || '—',
+    phoneVerified: !!u.phoneVerified,
+    wallet: u.wallet,
+    suspended: !!u.suspended,
+    joined: u.createdAt || null
+  };
+}
+
+function adminDriver(d) {
+  return {
+    id: d.id,
+    name: d.name,
+    email: d.email,
+    phone: d.phone || '—',
+    tier: d.tier,
+    vehicle: d.vehicle,
+    plate: d.plate,
+    rating: d.rating,
+    online: !!d.online,
+    locationFresh: driverHasFreshLocation(d),
+    verificationStatus: d.verificationStatus || (d.licenseVerified ? 'verified' : 'pending'),
+    earnings: d.earnings || 0,
+    commissionOwed: Math.max(0, -(d.earnings || 0)),
+    tripsCompleted: d.tripsCompleted || 0,
+    suspended: !!d.suspended
+  };
+}
+
+// Support lookup: search customers and drivers by name / email / phone.
+// Without a query, returns the most recent signups so the tab is never blank.
+router.get('/admin/people', authAdmin, (req, res) => {
+  const q = String(req.query.q || '').trim().toLowerCase();
+  const pick = (arr) => {
+    if (!q) return arr.slice(-20).reverse();
+    const out = [];
+    for (let i = arr.length - 1; i >= 0 && out.length < 20; i--) {
+      const p = arr[i];
+      if (matchesQuery(q, p.name, p.email, p.phone, p.plate)) out.push(p);
+    }
+    return out;
+  };
+  res.json({
+    users: pick(db.users).map(adminUser),
+    drivers: pick(db.drivers).map(adminDriver)
+  });
+});
+
+// Suspend / reinstate a customer or driver. Suspended accounts cannot log in
+// or act; suspended drivers also drop out of dispatch immediately.
+router.post('/admin/:kind(users|drivers)/:id/:action(suspend|unsuspend)', authAdmin, (req, res) => {
+  const list = req.params.kind === 'users' ? db.users : db.drivers;
+  const person = list.find((p) => p.id === req.params.id);
+  if (!person) return res.status(404).json({ error: 'Account not found.' });
+  person.suspended = req.params.action === 'suspend';
+  person.suspendedAt = person.suspended ? Date.now() : null;
+  person.suspendNote = person.suspended ? String((req.body || {}).note || '').slice(0, 200) : '';
+  logAudit({
+    actor: adminActor(),
+    action: `${req.params.kind}.${req.params.action}`,
+    targetType: req.params.kind === 'users' ? 'user' : 'driver',
+    targetId: person.id,
+    meta: { note: person.suspendNote },
+    ip: req.ip
+  });
+  save();
+  res.json(req.params.kind === 'users' ? { user: adminUser(person) } : { driver: adminDriver(person) });
+});
+
+// Manually approve / reject a driver's license verification.
+router.post('/admin/drivers/:id/verification/:action(approve|reject)', authAdmin, (req, res) => {
+  const driver = db.drivers.find((d) => d.id === req.params.id);
+  if (!driver) return res.status(404).json({ error: 'Driver not found.' });
+  const approve = req.params.action === 'approve';
+  driver.licenseVerified = approve;
+  driver.verificationStatus = approve ? 'verified' : 'rejected';
+  driver.verificationNote = String((req.body || {}).note || '').slice(0, 200);
+  if (approve) driver.licenseVerifiedAt = Date.now();
+  logAudit({
+    actor: adminActor(),
+    action: `drivers.verification.${req.params.action}`,
+    targetType: 'driver',
+    targetId: driver.id,
+    meta: { note: driver.verificationNote },
+    ip: req.ip
+  });
+  save();
+  res.json({ driver: adminDriver(driver) });
+});
+
+// Record a cash commission settlement collected from a driver in person. This
+// is how the platform ACTUALLY collects cash-trip commission: the driver hands
+// over the owed amount at a SewaGo point, staff record it here, it pays down the
+// driver's negative earnings and books the collection so revenue is real, not a
+// phantom receivable. Never credits above zero (that would be a payout, not a
+// settlement).
+router.post('/admin/drivers/:id/settle-cash', authAdmin, (req, res) => {
+  const driver = db.drivers.find((d) => d.id === req.params.id);
+  if (!driver) return res.status(404).json({ error: 'Driver not found.' });
+  const owed = Math.max(0, -(driver.earnings || 0));
+  if (owed <= 0) return res.status(400).json({ error: 'This driver owes no cash commission.' });
+  // Omitting the amount means "settle it all". But a MALFORMED amount (a typo,
+  // zero, negative) must be rejected — silently falling back to the full amount
+  // would write off the entire receivable on a slip of the keyboard.
+  const raw = (req.body || {}).amount;
+  const omitted = raw === undefined || raw === null || raw === '';
+  let amount;
+  if (omitted) {
+    amount = owed;
+  } else {
+    const requested = Number(raw);
+    if (!Number.isFinite(requested) || requested <= 0) {
+      return res.status(400).json({ error: 'Enter a positive amount of cash collected, or leave it blank to settle the full balance.' });
+    }
+    amount = Math.min(Math.round(requested), owed); // never credit past zero
+  }
+  driver.earnings = (driver.earnings || 0) + amount;
+  recordTxn('driver', driver, {
+    type: 'cash_settlement',
+    label: `Cash commission settled at SewaGo point`,
+    amount,
+    sign: 1,
+    refId: null
+  });
+  logAudit({
+    actor: adminActor(),
+    action: 'drivers.settle_cash',
+    targetType: 'driver',
+    targetId: driver.id,
+    meta: { amount, owedBefore: owed, owedAfter: Math.max(0, -driver.earnings) },
+    ip: req.ip
+  });
+  save();
+  res.json({ driver: adminDriver(driver), settled: amount });
+});
+
+// Support wallet adjustment (goodwill credit / correction debit). Guard-railed:
+// bounded amount, mandatory reason, never below zero, fully audit-trailed.
+router.post('/admin/wallet-adjust', authAdmin, (req, res) => {
+  const { userId, amount, reason } = req.body || {};
+  const amt = Math.round(Number(amount));
+  const why = String(reason || '').trim();
+  if (!Number.isFinite(amt) || amt === 0 || Math.abs(amt) > 10000) {
+    return res.status(400).json({ error: 'Amount must be between Rs -10,000 and Rs 10,000 (not zero).' });
+  }
+  if (why.length < 5) return res.status(400).json({ error: 'A reason (min 5 characters) is required — it goes on the audit trail.' });
+  const user = db.users.find((u) => u.id === userId);
+  if (!user) return res.status(404).json({ error: 'Customer not found.' });
+  if (user.wallet + amt < 0) {
+    return res.status(400).json({ error: `Debit too large — the wallet only has Rs ${user.wallet}.` });
+  }
+  user.wallet += amt;
+  recordTxn('user', user, {
+    type: 'adjustment',
+    label: amt > 0 ? `SewaGo support credit: ${why}` : `SewaGo support correction: ${why}`,
+    amount: Math.abs(amt),
+    sign: amt > 0 ? 1 : -1,
+    refId: null
+  });
+  logAudit({
+    actor: adminActor(),
+    action: 'users.wallet_adjust',
+    targetType: 'user',
+    targetId: user.id,
+    meta: { amount: amt, reason: why },
+    ip: req.ip
+  });
+  save();
+  res.json({ user: adminUser(user) });
 });
 
 module.exports = router;

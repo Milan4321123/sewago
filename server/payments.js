@@ -12,6 +12,18 @@ function balanceOf(kind, entity) {
   return kind === 'user' ? entity.wallet : (entity.earnings || 0);
 }
 
+// Debit a customer wallet, drawing down any held (freshly topped-up) balance
+// first so the withdrawal hold reflects money still in the wallet. Without this
+// the hold amount would outlive the funds it covers and wrongly block payouts of
+// the user's older, already-withdrawable balance. All wallet spends go through
+// here so no future path can forget it.
+function debitWallet(user, amount) {
+  user.wallet -= amount;
+  if (user.heldBalance) {
+    user.heldBalance = Math.max(0, user.heldBalance - amount);
+  }
+}
+
 // Append a ledger entry AFTER the wallet/earnings mutation so balanceAfter is correct.
 function recordTxn(kind, entity, { type, label, amount, sign, method = null, refId = null, status = 'completed' }) {
   const txn = {
@@ -82,6 +94,18 @@ function createWithdrawal(kind, entity, { amount, channel, account }) {
   if (balanceOf(kind, entity) < total) {
     return { error: `Not enough balance — you need the amount plus the Rs ${WITHDRAW_FEE} payout fee.` };
   }
+  // Freshly topped-up money is held for a cooling period (anti-laundering /
+  // card-chargeback). Only funds beyond the still-held amount are withdrawable.
+  if (kind === 'user' && (entity.heldUntil || 0) > Date.now()) {
+    // Held can never exceed the wallet (debitWallet keeps it in step); clamp
+    // defensively so `available` never goes negative and blocks old funds.
+    const held = Math.min(entity.heldBalance || 0, entity.wallet);
+    const available = entity.wallet - held;
+    if (total > available) {
+      const hrs = Math.max(1, Math.ceil((entity.heldUntil - Date.now()) / 3600000));
+      return { error: `Recently added funds are held for about ${hrs} more hour(s) before they can be withdrawn.` };
+    }
+  }
   if (kind === 'user') entity.wallet -= total;
   else entity.earnings = (entity.earnings || 0) - total;
   const withdrawal = {
@@ -119,6 +143,7 @@ module.exports = {
   recordTxn,
   recordPlatformRevenue,
   platformRevenueTotals,
+  debitWallet,
   createWithdrawal,
   SANDBOX_PIN,
   WITHDRAW_FEE,

@@ -3,6 +3,7 @@ const { db, save, uid } = require('../db');
 const { coordsFor } = require('../places');
 const { withStatus: orderWithStatus, refundOrder } = require('../orderLogic');
 const { recordTxn, recordPlatformRevenue, createWithdrawal } = require('../payments');
+const { settleDueBookings } = require('../settlement');
 const { PROMOTE_WEEK_PRICE, PROMOTE_WEEK_MS } = require('../fees');
 const { savePartnerPhoto, ownedPhotos } = require('../photos');
 
@@ -42,7 +43,10 @@ function profile(p) {
     businessKycStatus: p.businessKycStatus || 'pending',
     businessKycNote: p.businessKyc && p.businessKyc.note ? p.businessKyc.note : '',
     businessKycDocumentRef: p.businessKyc && p.businessKyc.documentRef ? p.businessKyc.documentRef : '',
-    earnings: p.earnings || 0
+    earnings: p.earnings || 0,
+    // Income from bookings/orders not yet checked-in/delivered — becomes
+    // withdrawable earnings on fulfillment; shown so the partner sees it coming.
+    pendingEarnings: p.pendingEarnings || 0
   };
 }
 
@@ -201,6 +205,7 @@ router.post('/partner/otp/verify', (req, res) => {
 });
 
 router.get('/partner/me', authPartner, (req, res) => {
+  settleDueBookings(); // reflect any check-ins reached since last load
   const transactions = db.transactions
     .filter((t) => t.ownerKind === 'partner' && t.ownerId === req.partner.id)
     .slice(-10)
@@ -290,6 +295,7 @@ router.post('/partner/withdraw', authPartner, (req, res) => {
   if (req.partner.businessKycStatus !== 'approved') {
     return res.status(403).json({ error: 'Business KYC must be approved before earnings can be withdrawn.' });
   }
+  settleDueBookings(); // settle any newly-checked-in stays before computing balance
   const result = createWithdrawal('partner', req.partner, req.body || {});
   if (result.error) return res.status(400).json({ error: result.error });
   save();
@@ -584,3 +590,8 @@ router.post('/partner/hotels/:id/resubmit', authPartner, (req, res) => {
 });
 
 module.exports = router;
+// Shared with the stores vertical so partner auth and the KYC gate are defined
+// in exactly one place — a second copy would drift.
+module.exports.authPartner = authPartner;
+module.exports.requirePartnerKyc = requirePartnerKyc;
+module.exports.galleryFrom = galleryFrom;

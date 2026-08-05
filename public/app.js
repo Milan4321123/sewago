@@ -7,6 +7,7 @@ const state = {
   user: null,
   tab: 'rides',
   authMode: 'login',
+  demo: false, // set from /api/app-info; only then do we show seed-account hints
   resetToken: '',
   resetFromLink: false,
   otpLogin: { phone: '', devCode: '' },
@@ -27,6 +28,7 @@ const state = {
   foodServiceFee: 0,
   deliverTo: '',
   deliverToLoc: null,
+  foodPayMethod: 'wallet', // 'cash' = pay the courier at the door (COD)
   dismissedOrders: {},
   restaurant: null, // currently open menu
   cart: {}, // itemId -> qty
@@ -340,7 +342,7 @@ function authView() {
       </div>
       ${isLogin ? `<div style="text-align:center;margin-top:10px"><button class="link" onclick="setAuthMode('reset')">Forgot password?</button></div>` : ''}
     </div>
-    ${isLogin ? `
+    ${isLogin && state.demo ? `
     <div class="card">
       <div class="muted small" style="line-height:1.8">
         <b style="color:var(--text)">Demo customers</b> (password: <b style="color:var(--text)">customer123</b>)<br/>
@@ -487,6 +489,7 @@ window.doLogout = async () => {
 
 const TABS = [
   { id: 'rides', label: 'Rides', ico: '🚗' },
+  { id: 'shops', label: 'Shops', ico: '🏪' },
   { id: 'food', label: 'Food', ico: '🍜' },
   { id: 'stays', label: 'Stays', ico: '🏨' },
   { id: 'tasks', label: 'Tasks', ico: '🧰' },
@@ -529,7 +532,8 @@ function renderTab() {
     mountRideMap(state.activeRide);
     return;
   }
-  if (state.tab === 'food') view.innerHTML = foodView();
+  if (state.tab === 'shops') view.innerHTML = shopsView();
+  else if (state.tab === 'food') view.innerHTML = foodView();
   else if (state.tab === 'stays') view.innerHTML = staysView();
   else if (state.tab === 'tasks') view.innerHTML = tasksView();
   else if (state.tab === 'activity') view.innerHTML = activityView();
@@ -541,7 +545,14 @@ window.setTab = async (tab) => {
   state.tab = tab;
   state.restaurant = null;
   try {
-    if (tab === 'food') {
+    if (tab === 'shops') {
+      const [s, o] = await Promise.all([api('/api/stores'), api('/api/store-orders')]);
+      state.shops = s.stores || [];
+      state.shopServiceFee = s.serviceFee || 0;
+      state.shopOrders = o.orders || [];
+      state.shop = null;
+      await loadSubscriptions();
+    } else if (tab === 'food') {
       const [r, o] = await Promise.all([api('/api/restaurants'), api('/api/orders')]);
       state.restaurants = r.restaurants;
       state.foodServiceFee = r.serviceFee || 0;
@@ -1069,8 +1080,13 @@ function ordersSlot() {
           <div><b>${o.restaurantIcon} ${esc(o.restaurantName)}</b></div>
           <div class="muted small">${o.items.map((i) => `${i.qty}× ${esc(i.name)}`).join(', ')}</div>
         </div>
-        <div><b>${money(o.total)}</b></div>
+        <div style="text-align:right">
+          <b>${money(o.total)}</b>
+          ${o.payment === 'cash' ? `<div class="muted small">💵 cash on delivery</div>` : ''}
+        </div>
       </div>
+      ${o.payment === 'cash' && o.status !== 'delivered' && o.status !== 'cancelled'
+        ? `<div class="muted small" style="margin:8px 0;color:#fbbf24">💵 Have ${money(o.total)} in cash ready for the courier.</div>` : ''}
       ${o.fulfillment === 'live' && o.status === 'placed'
         ? `<div class="muted small" style="margin:8px 0">🕐 Waiting for ${esc(o.restaurantName)} to confirm your order…</div>` : ''}
       ${stepper(ORDER_STEPS, idx)}
@@ -1260,8 +1276,18 @@ function menuView() {
     </label>
     <datalist id="deliver-places">${(state.places || []).map((p) => `<option value="${esc(p.name)}"></option>`).join('')}</datalist>
     <button class="btn ghost compact" onclick="useGpsForDelivery()">📍 Use my location</button>
+    <div class="section-title" style="margin:14px 0 8px">How do you want to pay?</div>
+    <div class="grid2">
+      <button class="btn ${state.foodPayMethod === 'wallet' ? '' : 'ghost'}" onclick="setFoodPayMethod('wallet')">👛 Wallet</button>
+      <button class="btn ${state.foodPayMethod === 'cash' ? '' : 'ghost'}" onclick="setFoodPayMethod('cash')">💵 Cash on delivery</button>
+    </div>
+    ${state.foodPayMethod === 'cash'
+      ? `<div class="muted small" style="text-align:center;margin-top:8px">Pay the courier at your door — no wallet top-up needed.</div>`
+      : `<div class="muted small" style="text-align:center;margin-top:8px">Paid from your wallet balance now.</div>`}
   </div>` : ''}
-  <div style="height:70px"></div>
+  <!-- Clearance for the fixed cart bar, which wraps to two lines with the fee
+       breakdown — too little and it covers the payment picker above it. -->
+  <div style="height:${count > 0 ? 170 : 70}px"></div>
   ${count > 0 ? `
   <div class="cartbar">
     <button class="btn" onclick="placeOrder()">
@@ -1271,6 +1297,11 @@ function menuView() {
     </button>
   </div>` : ''}`;
 }
+
+window.setFoodPayMethod = (method) => {
+  state.foodPayMethod = method;
+  render();
+};
 
 window.cartAdd = (id, delta) => {
   const next = (state.cart[id] || 0) + delta;
@@ -1303,7 +1334,13 @@ window.placeOrder = async () => {
   try {
     const data = await api('/api/orders', {
       method: 'POST',
-      body: { restaurantId: state.restaurant.id, items, deliveryTo }
+      body: {
+        restaurantId: state.restaurant.id,
+        items,
+        deliveryTo,
+        // Only partner restaurants can be COD (a real courier collects the cash).
+        payment: state.restaurant.ownerId ? state.foodPayMethod : 'wallet'
+      }
     });
     setUser(data.user);
     state.restaurant = null;
@@ -2291,6 +2328,12 @@ document.addEventListener('click', (e) => {
 });
 
 (async function boot() {
+  // Learn whether this is a demo/dev deployment before the first render, so
+  // seed-account credentials never surface on a real production login screen.
+  try {
+    const info = await fetch('/api/app-info').then((r) => r.json());
+    state.demo = !!info.demo;
+  } catch (e) { /* default: not demo */ }
   if (state.token) {
     try {
       const me = await api('/api/auth/me');
@@ -2326,3 +2369,216 @@ document.addEventListener('click', (e) => {
     toast(params.get('reason') || 'Payment failed — you were not charged.', true);
   }
 })();
+
+/* ==================================================================
+   Shops — order from your neighbourhood general store
+   ==================================================================
+   The customer half of the kirana vertical: browse nearby shops, see
+   what is actually on the shelf right now, and subscribe to the things
+   you buy every week for a lower price.
+*/
+
+function shopsView() {
+  if (state.shop) return shopDetailView();
+  const orders = (state.shopOrders || []).filter((o) => o.status !== 'delivered' && o.status !== 'cancelled');
+  return `
+  <div class="section-title" style="margin-top:0">Shops near you 🏪</div>
+  <div class="muted small" style="margin-bottom:12px">Your local general stores — order what they have on the shelf today.</div>
+  ${orders.length ? `
+    <div class="section-title">Your orders</div>
+    ${orders.map(shopOrderCard).join('')}
+  ` : ''}
+  ${(state.shops || []).length
+    ? state.shops.map(shopCard).join('')
+    : `<div class="empty"><div class="big">🏪</div>No shops nearby yet — they are being added.</div>`}
+  ${(state.subscriptions || []).length ? `
+    <div class="section-title">Your subscriptions 🔁</div>
+    ${state.subscriptions.map(subscriptionCard).join('')}` : ''}`;
+}
+
+function shopCard(s) {
+  return `
+  <div class="card" ${s.open ? `onclick="openShopFront('${s.id}')" style="cursor:pointer"` : ''}>
+    <div class="row">
+      <div class="grow">
+        <div style="font-weight:900">${s.icon} ${esc(s.name)}</div>
+        <div class="muted small">${esc(s.area || '')} · ${s.itemCount} items in stock${s.deliveryFee ? ` · ${money(s.deliveryFee)} delivery` : ' · free collection'}</div>
+      </div>
+      ${s.open ? '<span class="badge">OPEN</span>' : '<span class="badge gray">CLOSED</span>'}
+    </div>
+  </div>`;
+}
+
+function subscriptionCard(s) {
+  const saving = s.listPrice - s.price;
+  return `
+  <div class="card">
+    <div class="row">
+      <div class="grow">
+        <div style="font-weight:800">${esc(s.itemName)}</div>
+        <div class="muted small">${esc(s.storeName)} · every ${s.everyDays} days${s.available ? '' : ' · not in stock now'}</div>
+      </div>
+      <div style="text-align:right">
+        <div style="font-weight:900;color:var(--accent)">${money(s.price)}</div>
+        ${saving > 0 ? `<div class="muted small">save ${money(saving)}</div>` : ''}
+      </div>
+    </div>
+    <div style="display:flex;gap:6px;margin-top:10px">
+      <button class="btn ghost compact" onclick="openShopFront('${s.storeId}')">Open shop</button>
+      <button class="btn ghost compact danger" onclick="unsubscribeItem('${s.storeId}','${s.itemId}')">Cancel</button>
+    </div>
+  </div>`;
+}
+
+function shopOrderCard(o) {
+  const steps = { placed: 'Sent to the shop', accepted: 'Shopkeeper is packing', ready: 'Ready for you', delivered: 'Done', cancelled: 'Cancelled' };
+  return `
+  <div class="card">
+    <div class="row">
+      <div class="grow">
+        <div style="font-weight:800">${o.storeIcon || '🏪'} ${esc(o.storeName)}</div>
+        <div class="muted small">${o.items.map((l) => `${l.qty}× ${esc(l.name)}`).join(', ')}</div>
+        <div class="muted small" style="margin-top:4px;color:var(--accent)">${steps[o.status] || o.status}</div>
+      </div>
+      <div style="text-align:right">
+        <div style="font-weight:900">${money(o.total)}</div>
+        ${o.payment === 'cash' ? '<div class="muted small">💵 pay on handover</div>' : ''}
+      </div>
+    </div>
+    ${o.status === 'placed' ? `<button class="btn danger compact" style="margin-top:10px" onclick="cancelShopOrder('${o.id}')">Cancel order</button>` : ''}
+  </div>`;
+}
+
+function shopDetailView() {
+  const s = state.shop;
+  const cart = state.shopCart || {};
+  const lines = s.items.filter((i) => cart[i.id]);
+  const subtotal = lines.reduce((sum, i) => sum + i.price * cart[i.id], 0);
+  const fee = s.store.deliveryFee || 0;
+  const service = state.shopPay === 'cash' ? 0 : (state.shopServiceFee || 0);
+  const total = subtotal + fee + service;
+  return `
+  <button class="btn ghost compact" onclick="closeShopFront()">← Shops</button>
+  <div class="card" style="margin-top:10px">
+    <div style="font-weight:900;font-size:17px">${s.store.icon} ${esc(s.store.name)}</div>
+    <div class="muted small">${esc(s.store.area || '')}${fee ? ` · ${money(fee)} delivery` : ' · collect from the shop'}</div>
+  </div>
+  ${s.items.length ? s.items.map((i) => shopItemRow(i, cart[i.id] || 0)).join('')
+    : `<div class="empty"><div class="big">📦</div>This shop has not added items yet.</div>`}
+  <div style="height:${lines.length ? 190 : 70}px"></div>
+  ${lines.length ? `
+  <div class="cartbar">
+    <div class="grid2" style="margin-bottom:8px">
+      <button class="btn ${state.shopPay !== 'cash' ? '' : 'ghost'} compact" onclick="setShopPay('wallet')">👛 Wallet</button>
+      <button class="btn ${state.shopPay === 'cash' ? '' : 'ghost'} compact" onclick="setShopPay('cash')">💵 Cash</button>
+    </div>
+    <button class="btn" onclick="placeShopOrder()">
+      Order ${lines.length} item${lines.length > 1 ? 's' : ''} · ${money(total)}
+      <span class="small" style="font-weight:600">(${money(subtotal)} goods${fee ? ` + ${money(fee)} delivery` : ''}${service ? ` + ${money(service)} fee` : ''})</span>
+    </button>
+  </div>` : ''}`;
+}
+
+function shopItemRow(i, qty) {
+  const saving = i.subscribePrice ? i.listPrice - i.subscribePrice : 0;
+  return `
+  <div class="card" style="${i.inStock ? '' : 'opacity:.55'}">
+    <div class="row">
+      ${i.photo ? `<img src="${esc(i.photo)}" alt="" style="width:52px;height:52px;object-fit:cover;border-radius:10px" />` : ''}
+      <div class="grow">
+        <div style="font-weight:800">${esc(i.name)}</div>
+        <div class="muted small">
+          ${money(i.price)} / ${esc(i.unitLabel)}
+          ${i.subscribed ? ' · <span style="color:var(--accent)">🔁 subscriber price</span>' : ''}
+          ${!i.inStock ? ' · out of stock' : i.lowStock ? ' · only a few left' : ''}
+        </div>
+        ${!i.subscribed && i.subscribePrice ? `
+          <button class="link small" style="margin-top:4px" onclick="subscribeItem('${i.id}')">
+            🔁 Subscribe and pay ${money(i.subscribePrice)} — save ${money(saving)}
+          </button>` : ''}
+      </div>
+      ${i.inStock ? `
+      <div class="qty">
+        ${qty > 0 ? `<button onclick="shopCartAdd('${i.id}', -1)">−</button><span class="n">${qty}</span>` : ''}
+        <button onclick="shopCartAdd('${i.id}', 1)">+</button>
+      </div>` : ''}
+    </div>
+  </div>`;
+}
+
+window.openShopFront = async (id) => {
+  try {
+    const data = await api(`/api/stores/${id}`);
+    state.shop = data;
+    state.shopCart = {};
+    state.shopServiceFee = data.serviceFee || 0;
+    render();
+  } catch (e) { toast(e.message, true); }
+};
+
+window.closeShopFront = () => { state.shop = null; state.shopCart = {}; render(); };
+
+window.shopCartAdd = (id, delta) => {
+  state.shopCart = state.shopCart || {};
+  const next = (state.shopCart[id] || 0) + delta;
+  if (next <= 0) delete state.shopCart[id];
+  else state.shopCart[id] = next;
+  render();
+};
+
+window.setShopPay = (how) => { state.shopPay = how; render(); };
+
+window.subscribeItem = async (itemId) => {
+  try {
+    await api(`/api/stores/${state.shop.store.id}/items/${itemId}/subscribe`, { method: 'POST', body: { everyDays: 7 } });
+    await openShopFront(state.shop.store.id);
+    await loadSubscriptions();
+    toast('Subscribed — you now pay the lower price 🔁');
+  } catch (e) { toast(e.message, true); }
+};
+
+window.unsubscribeItem = async (storeId, itemId) => {
+  try {
+    await api(`/api/stores/${storeId}/items/${itemId}/subscribe`, { method: 'DELETE' });
+    await loadSubscriptions();
+    toast('Subscription cancelled.');
+    render();
+  } catch (e) { toast(e.message, true); }
+};
+
+async function loadSubscriptions() {
+  try {
+    const d = await api('/api/subscriptions');
+    state.subscriptions = d.subscriptions || [];
+  } catch (e) { state.subscriptions = []; }
+}
+
+window.placeShopOrder = async () => {
+  const cart = state.shopCart || {};
+  const items = Object.entries(cart).map(([itemId, qty]) => ({ itemId, qty }));
+  if (!items.length) return;
+  try {
+    const data = await api('/api/store-orders', {
+      method: 'POST',
+      body: { storeId: state.shop.store.id, items, payment: state.shopPay === 'cash' ? 'cash' : 'wallet' }
+    });
+    if (data.user) setUser(data.user);
+    state.shop = null;
+    state.shopCart = {};
+    const o = await api('/api/store-orders');
+    state.shopOrders = o.orders || [];
+    toast('Order sent to the shop 🏪');
+    render();
+  } catch (e) { toast(e.message, true); }
+};
+
+window.cancelShopOrder = async (id) => {
+  try {
+    const data = await api(`/api/store-orders/${id}/cancel`, { method: 'POST' });
+    if (data.user) setUser(data.user);
+    const o = await api('/api/store-orders');
+    state.shopOrders = o.orders || [];
+    toast('Order cancelled and refunded.');
+    render();
+  } catch (e) { toast(e.message, true); }
+};
