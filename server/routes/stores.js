@@ -587,8 +587,9 @@ router.post('/partner/stores/:id/subscribe-requests/:reqId/accept', authPartner,
   request.status = 'accepted';
   request.decidedAt = Date.now();
   save();
-  // "The shop accepted — subscribe now" lands on the customer's app instantly.
-  events.publish(`user:${request.userId}`, { topic: 'subscription' });
+  // "The shop accepted — subscribe now" lands on the customer's app instantly;
+  // names ride along so the toast can say which shop and which item.
+  events.publish(`user:${request.userId}`, { topic: 'subscription', storeName: store.name, itemName: item.name });
   res.json({ request, item: { id: item.id, subscribePrice: item.subscribePrice } });
 });
 

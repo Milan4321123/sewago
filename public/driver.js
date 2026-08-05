@@ -1546,7 +1546,7 @@ function runStopLine(s, isNext) {
     ? `Collect ${s.orders} order${s.orders > 1 ? 's' : ''}`
     : 'Deliver';
   return `
-  <div class="row" style="padding:8px 0;border-bottom:1px solid var(--line);${s.done ? 'opacity:.45' : ''}">
+  <div class="row" style="padding:8px 0;border-bottom:1px solid var(--border);${s.done ? 'opacity:.45' : ''}">
     <div class="grow">
       <div style="font-weight:${isNext ? '900' : '700'};${isNext ? 'color:var(--accent)' : ''}">
         ${s.done ? '✓' : icon} ${esc(s.name)}

@@ -304,14 +304,18 @@ function mountLiveMap(data) {
   L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', { maxZoom: 19 }).addTo(liveMap);
   liveLayer = L.layerGroup().addTo(liveMap);
   const pts = plotLive(data);
-  // The container was just inserted, so Leaflet may have measured it at 0x0 —
-  // recompute the size on the next frame or fitBounds picks a world-level zoom.
-  setTimeout(() => {
+  // The container was just inserted and the tab is still running its entry
+  // animation, so Leaflet can measure it mid-layout and fitBounds then picks a
+  // world-level zoom. Fit once right away and again after the animation
+  // settles; the second pass is a no-op unless the first one measured wrong.
+  const fit = () => {
     if (!liveMap) return;
     liveMap.invalidateSize();
     if (pts.length) liveMap.fitBounds(L.latLngBounds(pts).pad(0.3), { maxZoom: 15 });
     else liveMap.setView(KATHMANDU, 12);
-  }, 50);
+  };
+  setTimeout(fit, 50);
+  setTimeout(fit, 450);
 }
 
 function updateLiveMap(data) {
