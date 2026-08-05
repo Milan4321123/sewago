@@ -570,7 +570,7 @@ function attentionView() {
   ${list.map((o) => `
     <div class="card" style="border:1px solid #b91c1c">
       <div class="row"><div>
-        <div style="font-weight:900">${esc(o.storeName)} · ${money(o.total)} <span class="badge gray">${o.payment === 'cash' ? 'CASH' : 'PAID IN APP'}</span></div>
+        <div style="font-weight:900">${o.kind === 'food' ? '🍔' : '🏪'} ${esc(o.name)} · ${money(o.total)} <span class="badge gray">${o.payment === 'cash' ? 'CASH' : 'PAID IN APP'}</span></div>
         <div class="muted small">${esc(o.items)}</div>
         <div class="muted small">${fmtTime(o.abandonedAt)} · ${o.refunded ? 'customer auto-refunded' : 'customer had not paid'} · rider billed ${money(o.total)}</div>
       </div></div>
@@ -588,7 +588,7 @@ function attentionView() {
 window.resolveAttention = async (id) => {
   const note = prompt('What happened? (kept on the audit trail — e.g. "goods recovered", "written off, rider suspended")') || '';
   try {
-    await api(`/api/admin/store-orders/${id}/attention/resolve`, { method: 'POST', body: { note } });
+    await api(`/api/admin/attention/${id}/resolve`, { method: 'POST', body: { note } });
     toast('Incident cleared ✓');
     const att = await api('/api/admin/attention');
     state.attention = att.orders || [];

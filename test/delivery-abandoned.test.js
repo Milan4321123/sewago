@@ -229,13 +229,13 @@ test('a half-collected run resolves the taken order and releases the untouched o
   assert.ok(!queue.data.orders.find((o) => o.id === orderB.id), 'the released order is not an incident');
 
   // Staff close the loop; the flag clears and stays cleared.
-  const resolve = await api(`/admin/store-orders/${orderA.id}/attention/resolve`, {
+  const resolve = await api(`/admin/attention/${orderA.id}/resolve`, {
     method: 'POST', token: adminToken, body: { note: 'rider suspended, goods written off' }
   });
   assert.equal(resolve.status, 200, JSON.stringify(resolve.data));
   const emptied = await api('/admin/attention', { token: adminToken });
   assert.ok(!emptied.data.orders.find((o) => o.id === orderA.id), 'resolved incidents leave the queue');
-  const again = await api(`/admin/store-orders/${orderA.id}/attention/resolve`, { method: 'POST', token: adminToken });
+  const again = await api(`/admin/attention/${orderA.id}/resolve`, { method: 'POST', token: adminToken });
   assert.equal(again.status, 400, 'resolving twice is refused');
 });
 
@@ -274,4 +274,14 @@ test('a collected cash order bills the vanished rider and pays the shop', async 
   const flagged = queue.data.orders.find((o) => o.id === order.id);
   assert.ok(flagged, 'the cash incident is queued for staff too');
   assert.equal(flagged.refunded, false, 'staff can see no refund was involved');
+
+  // After a wallet abandonment, a cash abandonment and a counter handover, the
+  // books must still check themselves: the ledger and the revenue recomputed
+  // from order rows have to agree, or the admin dashboard cries wolf forever.
+  const overview = await api('/admin/overview', { token: adminToken });
+  assert.equal(
+    overview.data.reconciliation.drift, 0,
+    `ledger (${overview.data.reconciliation.ledgerTotal}) and recomputed revenue ` +
+    `(${overview.data.reconciliation.derivedTotal}) must agree after abandonments`
+  );
 });
