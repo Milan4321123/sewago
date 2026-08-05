@@ -829,3 +829,20 @@ test('a declined request can be asked again, and only the owner answers the inbo
   });
   assert.equal(reAsk.status, 200, JSON.stringify(reAsk.data));
 });
+
+// --- the books must check themselves ------------------------------------------
+
+test('the platform ledger reconciles with revenue recomputed from store bookings', async () => {
+  // By now the suite has pushed wallet orders, a cancellation, handovers and
+  // pickups through this server. Store commissions and service fees land in the
+  // platform ledger; the /admin/overview cross-check recomputes revenue from
+  // booking rows, and any gap means a money path wrote one but not the other.
+  const { data } = await api('/admin/overview', { token: adminToken });
+  assert.ok(data.reconciliation, 'overview must expose a reconciliation block');
+  assert.equal(
+    data.reconciliation.drift,
+    0,
+    `ledger (${data.reconciliation.ledgerTotal}) and recomputed revenue (${data.reconciliation.derivedTotal}) must agree — ` +
+    'a non-zero drift means some money path writes one but not the other'
+  );
+});

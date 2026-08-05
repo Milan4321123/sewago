@@ -105,6 +105,19 @@ router.get('/admin/overview', authAdmin, (req, res) => {
     db.bookings
       .filter((b) => b.partnerCut && b.status !== 'cancelled')
       .reduce((sum, b) => sum + (b.total - b.partnerCut), 0) +
+    // Store orders: wallet orders book commission + service fee at placement
+    // (reversed on cancel); cash orders carry no service fee and book their
+    // commission only when the goods are handed over.
+    (db.storeOrders || [])
+      .filter((o) => o.payment !== 'cash' && o.status !== 'cancelled')
+      .reduce((sum, o) => sum + (o.commission || 0) + (o.serviceFee || 0), 0) +
+    (db.storeOrders || [])
+      .filter((o) => o.payment === 'cash' && o.status === 'delivered')
+      .reduce((sum, o) => sum + (o.commission || 0), 0) +
+    // Courier run payouts are a cost, booked once when the run completes.
+    (db.deliveryRuns || [])
+      .filter((r) => r.status === 'completed')
+      .reduce((sum, r) => sum - (r.payout || 0), 0) +
     db.rides.filter((r) => r.status !== 'cancelled').reduce((sum, r) => sum + (r.serviceFee || 0), 0) +
     db.orders.filter((o) => o.status === 'delivered').reduce((sum, o) => sum + (o.serviceFee || 0), 0) +
     db.rides.reduce((sum, r) => sum + (r.cancelFeePlatform || 0), 0) +
