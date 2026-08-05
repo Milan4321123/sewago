@@ -296,15 +296,64 @@ test('a wallet order conserves money from customer to shopkeeper to platform', a
 
   await api(`/partner/store-orders/${o.id}/accept`, { method: 'POST', token: shop.token });
   await api(`/partner/store-orders/${o.id}/ready`, { method: 'POST', token: shop.token });
-  const done = await api(`/partner/store-orders/${o.id}/handover`, { method: 'POST', token: shop.token });
-  assert.equal(done.status, 200, JSON.stringify(done.data));
 
-  const settled = await api('/partner/me', { token: shop.token });
-  assert.equal(settled.data.partner.earnings, 490, 'income settles on handover');
-  assert.equal(settled.data.partner.pendingEarnings, 0);
+  // This is a DELIVERY order: the customer paid Rs 30 to have it brought to
+  // them, and nothing has travelled yet. The shop cannot settle it on its own
+  // word — the courier's dropoff does that (see delivery-runs.test.js).
+  const done = await api(`/partner/store-orders/${o.id}/handover`, { method: 'POST', token: shop.token });
+  assert.equal(done.status, 409, JSON.stringify(done.data));
+
+  const stillPending = await api('/partner/me', { token: shop.token });
+  assert.equal(stillPending.data.partner.earnings, 0, 'nothing withdrawable until it is delivered');
+  assert.equal(stillPending.data.partner.pendingEarnings, 490, 'the income is still held');
 
   // Customer paid 535 = shopkeeper 490 + platform 45 (40 commission + 5 fee).
   assert.equal(o.partnerCut + o.commission + o.serviceFee, o.total);
+});
+
+test('a shop cannot pocket a prepaid delivery order by declaring it handed over', async () => {
+  // The handover code check only guarded pickup. For a delivery order the shop
+  // could POST an empty body, flip the order to 'delivered' and move the whole
+  // prepaid total — delivery fee included — into withdrawable earnings, for
+  // goods that never left the counter. Neither cancel nor reject survives
+  // 'delivered', so the customer's money was simply gone.
+  const shop = await openShop('Pocket Kirana');
+  const created = await api(`/partner/stores/${shop.storeId}/items`, {
+    method: 'POST', token: shop.token, body: { name: 'Ghee', unit: 'l', price: 800, stock: 5 }
+  });
+  const { token: cust } = await registerUser('pocket-victim');
+  const walletBefore = (await api('/auth/me', { token: cust })).data.user.wallet;
+
+  const order = await api('/store-orders', {
+    method: 'POST', token: cust,
+    body: { storeId: shop.storeId, items: [{ itemId: created.data.item.id, qty: 1 }], payment: 'wallet' }
+  });
+  const o = order.data.order;
+  assert.equal(o.fulfilment, 'delivery');
+  await api(`/partner/store-orders/${o.id}/accept`, { method: 'POST', token: shop.token });
+  await api(`/partner/store-orders/${o.id}/ready`, { method: 'POST', token: shop.token });
+
+  const grab = await api(`/partner/store-orders/${o.id}/handover`, { method: 'POST', token: shop.token });
+  assert.equal(grab.status, 409, 'declaring a delivery handed over is refused');
+  assert.match(grab.data.error, /courier/i);
+  // A guessed code must not work either — delivery orders have no code at all.
+  const withCode = await api(`/partner/store-orders/${o.id}/handover`, {
+    method: 'POST', token: shop.token, body: { code: '1234' }
+  });
+  assert.equal(withCode.status, 409);
+
+  const mine = await api('/store-orders', { token: cust });
+  assert.equal(mine.data.orders.find((x) => x.id === o.id).status, 'ready', 'still waiting for a rider');
+  assert.equal((await api('/partner/me', { token: shop.token })).data.partner.earnings, 0);
+
+  // And the shop is not stuck with it: with no rider available, rejecting the
+  // order refunds the customer in full.
+  const refund = await api(`/partner/store-orders/${o.id}/reject`, { method: 'POST', token: shop.token });
+  assert.equal(refund.status, 200, JSON.stringify(refund.data));
+  const walletAfter = (await api('/auth/me', { token: cust })).data.user.wallet;
+  assert.equal(walletAfter, walletBefore, 'every rupee comes back');
+  const after = await api('/partner/me', { token: shop.token });
+  assert.equal(after.data.partner.pendingEarnings, 0, 'nothing dangling in pending income');
 });
 
 test('click & collect: no delivery fee, and handover needs the customer\'s code', async () => {
@@ -360,7 +409,7 @@ test('click & collect: no delivery fee, and handover needs the customer\'s code'
   assert.equal(me.data.partner.pendingEarnings, 0);
 });
 
-test('a delivery order still charges the fee and hands over without a code', async () => {
+test('a delivery order charges the fee, needs an address, and is not the shop\'s to settle', async () => {
   const shop = await openShop();
   const created = await api(`/partner/stores/${shop.storeId}/items`, {
     method: 'POST', token: shop.token, body: { name: 'Salt', unit: 'packet', price: 50, stock: 5 }
@@ -389,8 +438,10 @@ test('a delivery order still charges the fee and hands over without a code', asy
 
   await api(`/partner/store-orders/${o.id}/accept`, { method: 'POST', token: shop.token });
   await api(`/partner/store-orders/${o.id}/ready`, { method: 'POST', token: shop.token });
+  // There is no code to demand here because there is no counter handover: the
+  // rider settles this one at the customer's door.
   const done = await api(`/partner/store-orders/${o.id}/handover`, { method: 'POST', token: shop.token });
-  assert.equal(done.status, 200, 'no code demanded when there is no pickup');
+  assert.equal(done.status, 409, 'the shop does not get to declare a delivery delivered');
 });
 
 test('an uncollected pickup order can be refunded by the shop, never stranded', async () => {

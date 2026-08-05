@@ -1065,10 +1065,15 @@ router.post('/partner/store-orders/:orderId/:action(accept|reject|ready|handover
   const action = req.params.action;
 
   if (action === 'reject') {
-    // A packed pickup order's only other exit is a handover code the absent
-    // customer holds — without reject-at-ready, a no-show would strand the
-    // customer's money and the shop's pending income forever.
-    const noShow = order.status === 'ready' && order.fulfilment === 'pickup';
+    // A packed order's only other exit is someone actually taking it: the
+    // customer's handover code for pickup, a courier's dropoff for delivery.
+    // Without reject-at-ready, a no-show — or a delivery with no rider on the
+    // network yet — would strand the customer's money and the shop's pending
+    // income forever. An order a courier is already carrying is not the shop's
+    // to cancel: the rider has the goods, and for cash they have the money.
+    const carried = require('../deliveryRuns').runContainingOrder(order.id);
+    const noShow = order.status === 'ready' &&
+      !(carried && (carried.status === 'collecting' || carried.status === 'delivering'));
     if (order.status !== 'placed' && order.status !== 'accepted' && !noShow) {
       return res.status(400).json({ error: 'This order can no longer be rejected.' });
     }
@@ -1107,7 +1112,19 @@ router.post('/partner/store-orders/:orderId/:action(accept|reject|ready|handover
         error: 'A courier is delivering this order — it settles at the customer’s door.'
       });
     }
-    if (order.fulfilment === 'pickup') {
+    // A DELIVERY order never settles here. The customer paid a delivery fee for
+    // goods that still have to travel, and only the customer's own code (pickup)
+    // or the courier's dropoff proves they arrived. Settling on the shop's word
+    // alone let a shop mark an untouched order delivered and move the whole
+    // prepaid total — delivery fee included — into withdrawable earnings, with
+    // no refund path left for the customer. Reject-and-refund is the exit when
+    // no rider is available.
+    if (order.fulfilment !== 'pickup') {
+      return res.status(409).json({
+        error: 'A courier collects this order — it settles when the customer gets it. Reject it to refund them if no rider is available.'
+      });
+    }
+    {
       // The code has 9000 possible values, so unlimited guesses would let a
       // shopkeeper script their way to settling a prepaid order nobody
       // collected. Five failures lock the order; reject-and-refund is the exit.

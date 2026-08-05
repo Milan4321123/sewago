@@ -284,24 +284,33 @@ test('an order settled by shopkeeper handover never double-debits the courier wh
   const runPayout = run.payout;
   assert.ok(runPayout > 0);
 
-  // Shopkeeper hands the order over while the run is still only offered — this
-  // marks it delivered and settled on the shop side (the race window).
+  // The shopkeeper tries to hand the order over while the run is still only
+  // offered — the old race window. The settle-side of it is now closed at the
+  // source: a delivery order is never the shop's to declare delivered, so the
+  // two settlement paths can no longer both fire on one order.
   const handover = await api(`/partner/store-orders/${orderId}/handover`, { method: 'POST', token: shop.token });
-  assert.equal(handover.status, 200, JSON.stringify(handover.data));
-  assert.equal(handover.data.order.status, 'delivered');
+  assert.equal(handover.status, 409, JSON.stringify(handover.data));
 
-  // The courier can still accept and work the already-settled run.
+  const stillReady = await api('/store-orders', { token: cust.token });
+  assert.equal(stillReady.data.orders.find((o) => o.id === orderId).status, 'ready',
+    'the order is still waiting for its rider, not settled behind their back');
+
+  // The courier works the run, and the door is the only place money moves.
   const accepted = await api(`/driver/runs/${run.id}/accept`, { method: 'POST', token: courier.token });
   assert.equal(accepted.status, 200, JSON.stringify(accepted.data));
   await api(`/driver/runs/${run.id}/stops/0/done`, { method: 'POST', token: courier.token }); // pickup
   const drop = await api(`/driver/runs/${run.id}/stops/1/done`, { method: 'POST', token: courier.token }); // dropoff
   assert.equal(drop.status, 200, JSON.stringify(drop.data));
 
-  // The courier keeps their run payout and is NOT debited the order total for
-  // cash they never collected. Before the fix this was runPayout - orderTotal.
+  // The courier collected the cash at the door, so they owe it in, and they keep
+  // their run payout. Exactly one settlement happened, not two and not none.
   const me = await api('/driver/me', { token: courier.token });
-  assert.equal(me.data.driver.earnings, runPayout,
-    'courier earns the run payout only — no phantom COD debit for an already-settled order');
+  assert.equal(me.data.driver.earnings, runPayout - orderTotal,
+    'the courier is debited the cash they actually took, exactly once');
+
+  const settled = await api('/partner/me', { token: shop.token });
+  assert.equal(settled.data.partner.earnings, placed.data.order.partnerCut,
+    'the shop is paid once, at the door — not when it declared the bag gone');
 });
 
 test('a lone order is not stranded waiting for a batch to fill', async () => {

@@ -1029,13 +1029,21 @@ function storeOrderCard(o) {
   // offering "Handed over" here would be the wrong tap at exactly the moment
   // the shopkeeper hands the bag over.
   const withCourier = !!o.courierId;
-  const next = withCourier ? null : STORE_NEXT_ACTION[o.status];
+  // A delivery order is never handed over here either: the rider carries it and
+  // it settles at the customer's door. Offering the button would only produce a
+  // 409 at the busiest moment of the shopkeeper's day.
+  const settledElsewhere = withCourier || o.fulfilment !== 'pickup';
+  const nextAction = STORE_NEXT_ACTION[o.status];
+  const next = settledElsewhere && nextAction && nextAction[0] === 'handover' ? null : nextAction;
   // The customer proves it is their order by reading out the code from their
   // app — the server rejects a handover with the wrong one.
   const needsCode = next && next[0] === 'handover' && o.fulfilment === 'pickup';
+  // Reject-at-ready is the refund exit for a no-show pickup AND for a delivery
+  // no rider has taken yet, so neither can strand the customer's money.
   const canReject = o.status === 'placed' || o.status === 'accepted'
-    || (o.status === 'ready' && o.fulfilment === 'pickup' && !withCourier);
-  const rejectLabel = o.status === 'ready' ? 'Never collected — refund' : "Can't fulfil — refund";
+    || (o.status === 'ready' && !withCourier);
+  const rejectLabel = o.status !== 'ready' ? "Can't fulfil — refund"
+    : o.fulfilment === 'pickup' ? 'Never collected — refund' : 'No rider — refund';
   return `
   <div class="card" ${o.status === 'placed' ? 'style="border-color:var(--accent)"' : ''}>
     <div class="row">
