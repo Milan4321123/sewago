@@ -514,6 +514,51 @@ test('a hired helper can count stock, and their work is attributed to them', asy
   assert.equal(soap.stock, 23, 'but the count the helper made still lands');
 });
 
+test('helper invite codes cannot be guessed into a stranger’s inventory', async () => {
+  // A helper can add items and rewrite stock counts, and join matches a code
+  // against EVERY shop on the platform — so a guesser only has to hit any live
+  // invite anywhere. Six digits is 900k codes; the general per-IP budget alone
+  // allowed hundreds of tries a minute at it.
+  const shop = await openShop('Guess Target Kirana');
+  const invite = await api(`/partner/stores/${shop.storeId}/helpers`, {
+    method: 'POST', token: shop.token, body: { name: 'Sita' }
+  });
+  const realCode = invite.data.invite.code;
+  assert.ok(invite.data.invite.expiresAt > Date.now(), 'an invite must expire');
+
+  // Codes are unique while live, or join could walk a helper into the wrong shop.
+  const second = await api(`/partner/stores/${shop.storeId}/helpers`, {
+    method: 'POST', token: shop.token, body: { name: 'Hari' }
+  });
+  assert.notEqual(second.data.invite.code, realCode);
+
+  const attacker = await registerUser('code-guesser');
+  let blockedAt = null;
+  for (let i = 0; i < 12; i += 1) {
+    // Never accidentally guess the real code: walk codes that cannot be live.
+    const guess = String(100000 + i);
+    const tried = await api('/stores/helper/join', {
+      method: 'POST', token: attacker.token, body: { code: guess }
+    });
+    if (tried.status === 429) { blockedAt = i; break; }
+    assert.equal(tried.status, 404, JSON.stringify(tried.data));
+  }
+  assert.ok(blockedAt !== null && blockedAt <= 10, `guessing must be cut off, got ${blockedAt}`);
+
+  // Even holding a real code now, the throttled account stays out.
+  const stillBlocked = await api('/stores/helper/join', {
+    method: 'POST', token: attacker.token, body: { code: realCode }
+  });
+  assert.equal(stillBlocked.status, 429, 'the lockout is not bypassed by a valid code');
+
+  // And the real helper the shopkeeper actually invited is unaffected.
+  const sita = await registerUser('sita-real');
+  const joined = await api('/stores/helper/join', {
+    method: 'POST', token: sita.token, body: { code: realCode }
+  });
+  assert.equal(joined.status, 200, JSON.stringify(joined.data));
+});
+
 test('a shopkeeper cannot delete their account on top of live orders', async () => {
   // Account deletion only knew about restaurants and hotels. A kirana owner
   // could delete while customers had already paid — the shop vanished from the

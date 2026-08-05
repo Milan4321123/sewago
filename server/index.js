@@ -135,6 +135,11 @@ app.use(
     '/api/driver/phone/request-otp', '/api/driver/phone/verify'],
   moneyLimiter
 );
+// Redeeming a shop's helper invite grants write access to that shop's stock, and
+// the code is matched against every shop on the platform — so it needs a budget
+// of its own. Deliberately NOT the money limiter: someone fat-fingering an
+// invite code must never be able to spend the budget that guards withdrawals.
+app.use('/api/stores/helper/join', makeLimiter(10 * 60 * 1000, 30));
 
 // Tells the download page whether a real native app is available to install.
 app.get('/api/app-info', (req, res) => {

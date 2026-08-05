@@ -433,23 +433,55 @@ router.post('/partner/stores/:id/ai/inventory', authPartner, async (req, res) =>
 
 /* ---------------- shopkeeper: helpers ---------------- */
 
+// An invite code is the only thing between a stranger and write access to a
+// shop's stock, and join matches a code against EVERY shop on the platform —
+// so one lucky guess anywhere is a hit. That makes three things load-bearing:
+// the code must be unguessable (crypto, like every other code in this app),
+// it must expire (invites that live forever only ever grow the pool an
+// attacker is shooting at), and it must be unique while live (a collision
+// would walk a helper into a stranger's inventory, since join takes the first
+// shop that matches).
+const HELPER_INVITE_TTL = 24 * 60 * 60 * 1000;
+
+// Invites written before expiry existed fall back to their creation time, so
+// they run out their natural 24h instead of being invalidated on deploy.
+function inviteIsLive(h) {
+  return h.status === 'invited' && (h.expiresAt || (h.createdAt || 0) + HELPER_INVITE_TTL) > Date.now();
+}
+
+function freshInviteCode() {
+  for (let i = 0; i < 20; i += 1) {
+    const code = String(crypto.randomInt(100000, 1000000));
+    const taken = db.stores.some(
+      (s) => !s.removedAt && (s.helpers || []).some((h) => h.code === code && inviteIsLive(h))
+    );
+    if (!taken) return code;
+  }
+  return null;
+}
+
 router.post('/partner/stores/:id/helpers', authPartner, (req, res) => {
   const store = manageableStore(req, res, { helpersAllowed: false });
   if (!store) return;
   store.helpers = store.helpers || [];
-  if (store.helpers.filter((h) => h.status === 'active' || h.status === 'invited').length >= 5) {
+  // Only live invites hold a slot — an expired one must not cost the shop a
+  // helper place forever.
+  if (store.helpers.filter((h) => h.status === 'active' || inviteIsLive(h)).length >= 5) {
     return res.status(400).json({ error: 'A shop can have up to 5 helpers.' });
   }
+  const code = freshInviteCode();
+  if (!code) return res.status(503).json({ error: 'Could not create an invite code — try again.' });
   const invite = {
-    code: String(Math.floor(100000 + Math.random() * 900000)),
+    code,
     status: 'invited',
     userId: null,
     name: String((req.body || {}).name || '').trim().slice(0, 40),
-    createdAt: Date.now()
+    createdAt: Date.now(),
+    expiresAt: Date.now() + HELPER_INVITE_TTL
   };
   store.helpers.push(invite);
   save();
-  res.json({ invite: { code: invite.code, name: invite.name } });
+  res.json({ invite: { code: invite.code, name: invite.name, expiresAt: invite.expiresAt } });
 });
 
 router.get('/partner/stores/:id/helpers', authPartner, (req, res) => {
@@ -457,7 +489,10 @@ router.get('/partner/stores/:id/helpers', authPartner, (req, res) => {
   if (!store) return;
   res.json({
     helpers: (store.helpers || []).map((h) => ({
-      code: h.status === 'invited' ? h.code : null,
+      // A dead code is worse than no code: the shopkeeper would read it out and
+      // the helper would be turned away with no explanation.
+      code: inviteIsLive(h) ? h.code : null,
+      expired: h.status === 'invited' && !inviteIsLive(h),
       name: h.name || '',
       status: h.status,
       userId: h.userId,
@@ -479,12 +514,33 @@ router.delete('/partner/stores/:id/helpers/:code', authPartner, (req, res) => {
 
 // A helper joins with the code the shopkeeper read out to them, using their own
 // customer account — so their counting work is attributed to them by name.
+// Wrong codes are cheap for an attacker and rare for a real helper, so they get
+// their own budget. The per-IP API limiter alone allows hundreds of guesses a
+// minute against a 900k code space — enough to find someone's live invite.
+const JOIN_MAX_TRIES = 10;
+const JOIN_WINDOW = 60 * 60 * 1000;
+const joinFailures = new Map(); // userId -> recent failed attempt timestamps
+
+function joinFailuresFor(userId) {
+  const now = Date.now();
+  const recent = (joinFailures.get(userId) || []).filter((t) => now - t < JOIN_WINDOW);
+  joinFailures.set(userId, recent);
+  return recent;
+}
+
 router.post('/stores/helper/join', authRequired, (req, res) => {
   const code = String((req.body || {}).code || '').trim();
   if (!/^\d{6}$/.test(code)) return res.status(400).json({ error: 'Enter the 6-digit code from the shopkeeper.' });
-  const store = db.stores.find((s) => !s.removedAt && (s.helpers || []).some((h) => h.code === code && h.status === 'invited'));
-  if (!store) return res.status(404).json({ error: 'That code is not valid any more.' });
-  const helper = store.helpers.find((h) => h.code === code);
+  if (joinFailuresFor(req.user.id).length >= JOIN_MAX_TRIES) {
+    return res.status(429).json({ error: 'Too many wrong codes — ask the shopkeeper for a new one and try later.' });
+  }
+  const store = db.stores.find((s) => !s.removedAt && (s.helpers || []).some((h) => h.code === code && inviteIsLive(h)));
+  if (!store) {
+    joinFailuresFor(req.user.id).push(Date.now());
+    return res.status(404).json({ error: 'That code is not valid any more.' });
+  }
+  const helper = store.helpers.find((h) => h.code === code && inviteIsLive(h));
+  joinFailures.delete(req.user.id);
   helper.status = 'active';
   helper.userId = req.user.id;
   helper.name = helper.name || req.user.name;
