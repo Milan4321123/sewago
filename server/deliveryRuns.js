@@ -207,6 +207,35 @@ function eligibleCouriers(runCash, near) {
     .sort((a, b) => a.km - b.km);
 }
 
+// An order can leave a run before any rider accepts it: handed over at the
+// counter while the run was still forming, cancelled, or released from an
+// abandoned run and then handed over at the till. Left alone, the run still
+// lists it — a rider gets dispatched to collect a bag that no longer exists
+// and is paid per stop for ticking hollow stops. Prune dead orders and
+// re-plan the route; a run with nothing left to carry is cancelled outright.
+// Only 'forming' runs are pruned: they have no rider and no ticked stops, so
+// rewriting the plan is safe, and every offered run cycles back through
+// 'forming' whenever an offer lapses or is declined.
+function pruneDeadOrders(run) {
+  const orders = run.orderIds
+    .map((id) => (db.storeOrders || []).find((o) => o.id === id))
+    .filter((o) => o && o.status !== 'delivered' && o.status !== 'cancelled');
+  if (orders.length === run.orderIds.length) return 0;
+  if (!orders.length) {
+    run.status = 'cancelled';
+    run.cancelledAt = Date.now();
+    run.cancelReason = 'nothing_left_to_carry';
+    return 1;
+  }
+  const from = pickupLocOf(orders[0]);
+  run.orderIds = orders.map((o) => o.id);
+  run.stops = planStops(orders, from);
+  run.distanceKm = routeDistanceKm(run.stops, from);
+  run.payout = payoutFor(run.stops, run.distanceKm);
+  run.cashToCollect = cashTotal(orders);
+  return 1;
+}
+
 /**
  * The batching sweep. Forms runs from ready orders and offers each to the
  * nearest suitable courier, cycling to the next when an offer lapses.
@@ -266,8 +295,11 @@ function sweepDeliveryRuns() {
   }
 
   // 3. Offer every run that is waiting for a courier, including the ones just
-  //    formed above.
+  //    formed above. Prune first: never dispatch a rider for orders that were
+  //    handed over or cancelled while the run sat in the pool.
   for (const run of db.deliveryRuns || []) {
+    if (run.status !== 'forming') continue;
+    changed += pruneDeadOrders(run);
     if (run.status !== 'forming') continue;
     const declined = new Set((run.offer && run.offer.declined) || []);
     const passed = (run.offer && run.offer.passed) || {};

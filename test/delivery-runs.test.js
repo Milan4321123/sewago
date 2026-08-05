@@ -376,3 +376,72 @@ test('a run is never offered to a rider whose cash float it would blow', async (
   const offered = await waitForRun(courier.token, 8);
   assert.equal(offered.run, null, 'a rider must never be handed more cash than their float covers');
 });
+
+test('a run whose only order was handed over at the counter is never dispatched', async () => {
+  // Regression: a 'forming' run kept its orders forever. Hand the bag to the
+  // customer at the till while the run sits in the pool, and the next rider to
+  // come online was dispatched to collect nothing — and paid the full run
+  // payout for ticking hollow stops.
+  const shop = await openShop('Ghost Kirana', 27.7359, 85.3009);
+  const c = await registerUser('ghost-c');
+  await orderAndPack(shop, c.token, { lat: 27.7340, lng: 85.2990, name: 'Balaju' });
+
+  // No courier is online, so the run forms and waits in the pool. The max wait
+  // is ~1s and the sweep runs every 5s — 8s guarantees it has formed.
+  await new Promise((r) => setTimeout(r, 8000));
+
+  // The customer shows up at the counter instead; the shopkeeper hands over.
+  const orders = await api('/store-orders', { token: c.token });
+  const handover = await api(`/partner/store-orders/${orders.data.orders[0].id}/handover`, {
+    method: 'POST', token: shop.token
+  });
+  assert.equal(handover.status, 200, JSON.stringify(handover.data));
+
+  // A rider comes online right next to the shop: the ghost run must be pruned
+  // away, never offered.
+  const courier = await onboardCourier(27.7355, 85.3005);
+  const offered = await waitForRun(courier.token, 15);
+  assert.equal(offered.run, null, 'a run with nothing left to carry must never be dispatched');
+});
+
+test('a half-dead run is re-planned so the rider only rides for live orders', async () => {
+  // Two orders from one shop batch into one run (1 pickup + 2 drops). One is
+  // handed over at the counter while the run is still forming — the rider who
+  // then comes online must be offered a 2-stop run for the LIVE order only,
+  // with the payout recomputed for the smaller route.
+  const shop = await openShop('Half Kirana', 27.6789, 85.3494);
+  const c1 = await registerUser('half-c1');
+  const c2 = await registerUser('half-c2');
+  const o1 = await orderAndPack(shop, c1.token, { lat: 27.6770, lng: 85.3470, name: 'Koteshwor' });
+  const o2 = await orderAndPack(shop, c2.token, { lat: 27.6765, lng: 85.3465, name: 'Jadibuti' });
+
+  await new Promise((r) => setTimeout(r, 8000)); // both batched into one waiting run
+
+  const handover = await api(`/partner/store-orders/${o1.id}/handover`, { method: 'POST', token: shop.token });
+  assert.equal(handover.status, 200, JSON.stringify(handover.data));
+
+  const courier = await onboardCourier(27.6785, 85.3490);
+  const { run } = await waitForRunFrom(courier.token, 'Half Kirana');
+  assert.ok(run, 'the surviving order still gets its courier');
+  assert.equal(run.orders, 1, 'only the live order rides');
+  assert.equal(run.stops.length, 2, 'one pickup, one drop — the dead stop is gone');
+  assert.ok(
+    !run.stops.some((s) => s.type === 'dropoff' && s.name === 'half-c1'),
+    'the handed-over customer is no longer a stop'
+  );
+  // Payout is recomputed for the smaller route: base 40 + 15/stop + 12/km.
+  assert.equal(
+    run.payout,
+    Math.round(40 + 15 * run.stops.length + 12 * run.distanceKm),
+    'the payout must be priced from the pruned route, not the original one'
+  );
+
+  // And order 2 is genuinely deliverable: the courier can work the run.
+  assert.equal((await api(`/driver/runs/${run.id}/accept`, { method: 'POST', token: courier.token })).status, 200);
+  for (const stop of run.stops) {
+    const done = await api(`/driver/runs/${run.id}/stops/${stop.seq}/done`, { method: 'POST', token: courier.token });
+    assert.equal(done.status, 200, JSON.stringify(done.data));
+  }
+  const custView = await api('/store-orders', { token: c2.token });
+  assert.equal(custView.data.orders.find((o) => o.id === o2.id).status, 'delivered');
+});
