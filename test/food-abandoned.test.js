@@ -122,7 +122,7 @@ before(async () => {
   dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sewago-food-abandoned-'));
   server = spawn(process.execPath, [path.join(__dirname, '..', 'server', 'index.js')], {
     env: {
-      ...process.env, NODE_ENV: 'development', PORT: String(PORT), DATA_STORE: 'json', DATA_DIR: dataDir,
+      ...process.env, EXIT_WHEN_STDIN_CLOSES: '1', NODE_ENV: 'development', PORT: String(PORT), DATA_STORE: 'json', DATA_DIR: dataDir,
       ADMIN_EMAIL, ADMIN_PASSWORD, OTP_PROVIDER: 'sandbox', EMAIL_PROVIDER: 'sandbox',
       DRIVER_LICENSE_DEMO_CODE: '123456', FOOD_SERVICE_FEE: '15',
       FOOD_PICKUP_DEADLINE_MIN: '5',  // must never fire here — only the dropoff branch is under test
@@ -130,7 +130,7 @@ before(async () => {
       CASH_CREDIT_LIMIT: '2000',
       LOG_LEVEL: 'error'
     },
-    stdio: ['ignore', 'ignore', 'inherit']
+    stdio: ['pipe', 'ignore', 'inherit']
   });
   for (let i = 0; i < 100; i += 1) {
     try { if ((await fetch(`${BASE}/health`)).ok) break; } catch (e) { /* not up */ }

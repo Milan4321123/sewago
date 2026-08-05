@@ -25,6 +25,22 @@ process.on('unhandledRejection', (reason) => {
   logger.error('unhandled_rejection', { reason: reason && reason.message ? reason.message : String(reason) });
 });
 
+// Die with the harness that spawned us. Test suites spawn this server as a
+// child and SIGTERM it in their teardown — but a runner that dies hard
+// (SIGKILL, crashed terminal, killed CI job) never runs teardown, and the
+// orphaned server then squats on its port and poisons every later run with
+// port-in-use / ECONNREFUSED failures. A harness that sets
+// EXIT_WHEN_STDIN_CLOSES=1 must also pipe our stdin; the OS closes that pipe
+// the moment the runner dies — however it dies — and we exit with it.
+// Hard exit on purpose: the data dir is a throwaway and a graceful close
+// could hang on open SSE connections.
+if (process.env.EXIT_WHEN_STDIN_CLOSES === '1') {
+  process.stdin.resume();
+  for (const ev of ['end', 'close', 'error']) {
+    process.stdin.on(ev, () => process.exit(0));
+  }
+}
+
 const app = express();
 const PORT = config.port;
 

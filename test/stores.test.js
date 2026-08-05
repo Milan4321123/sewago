@@ -66,11 +66,11 @@ before(async () => {
   dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sewago-stores-'));
   server = spawn(process.execPath, [path.join(__dirname, '..', 'server', 'index.js')], {
     env: {
-      ...process.env, NODE_ENV: 'development', PORT: String(PORT), DATA_STORE: 'json', DATA_DIR: dataDir,
+      ...process.env, EXIT_WHEN_STDIN_CLOSES: '1', NODE_ENV: 'development', PORT: String(PORT), DATA_STORE: 'json', DATA_DIR: dataDir,
       ADMIN_EMAIL, ADMIN_PASSWORD, OTP_PROVIDER: 'sandbox', EMAIL_PROVIDER: 'sandbox',
       STORE_COMMISSION_PCT: '8', STORE_SERVICE_FEE: '5', LOG_LEVEL: 'error'
     },
-    stdio: ['ignore', 'ignore', 'inherit']
+    stdio: ['pipe', 'ignore', 'inherit']
   });
   for (let i = 0; i < 100; i += 1) {
     try { if ((await fetch(`${BASE}/health`)).ok) break; } catch (e) { /* not up */ }
