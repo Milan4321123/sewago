@@ -514,6 +514,33 @@ test('a hired helper can count stock, and their work is attributed to them', asy
   assert.equal(soap.stock, 23, 'but the count the helper made still lands');
 });
 
+test('voice parsing needs a real session, not just an Authorization header', async () => {
+  // The route took either a shopkeeper or a helper, and checked that by asking
+  // whether the header existed at all — so any string got in.
+  const junk = await api('/stores/voice/parse', {
+    method: 'POST', token: 'not-a-real-token', body: { text: 'दुई किलो चिनी सय रुपैयाँ' }
+  });
+  assert.equal(junk.status, 401, JSON.stringify(junk.data));
+
+  const none = await api('/stores/voice/parse', { method: 'POST', body: { text: 'two kilo sugar' } });
+  assert.equal(none.status, 401);
+
+  // Both real sessions still work: the shopkeeper...
+  const shop = await openShop('Voice Auth Kirana');
+  const asPartner = await api('/stores/voice/parse', {
+    method: 'POST', token: shop.token, body: { text: 'two kilo sugar 100 rupees' }
+  });
+  assert.equal(asPartner.status, 200, JSON.stringify(asPartner.data));
+  assert.equal(asPartner.data.item.name.toLowerCase(), 'sugar');
+
+  // ...and the customer, who may be speaking as a hired helper.
+  const customer = await registerUser('voice-helper');
+  const asUser = await api('/stores/voice/parse', {
+    method: 'POST', token: customer.token, body: { text: 'two kilo sugar 100 rupees' }
+  });
+  assert.equal(asUser.status, 200, JSON.stringify(asUser.data));
+});
+
 test('helper invite codes cannot be guessed into a stranger’s inventory', async () => {
   // A helper can add items and rewrite stock counts, and join matches a code
   // against EVERY shop on the platform — so a guesser only has to hit any live

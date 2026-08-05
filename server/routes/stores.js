@@ -3,6 +3,7 @@ const express = require('express');
 const { db, save, uid } = require('../db');
 const { config } = require('../config');
 const { authRequired, publicUser } = require('./auth');
+const sessionTokens = require('../sessionTokens');
 const partnerRoutes = require('./partner');
 const { recordTxn, recordPlatformRevenue, debitWallet, creditWallet } = require('../payments');
 const { STORE_COMMISSION_PCT, STORE_SERVICE_FEE } = require('../fees');
@@ -77,21 +78,48 @@ function ownerOf(store) {
 
 /* ---------------- voice ---------------- */
 
+// Either a shopkeeper or a customer working as a hired helper may be speaking,
+// so this route takes either session — but it has to be a real one. Checking
+// only that an Authorization header was PRESENT meant the literal string
+// "Bearer x" opened the parser to anyone.
+function authPartnerOrUser(req, res, next) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (token) {
+    const partnerId = sessionTokens.tokenOwner(db.partnerTokens, token);
+    const partner = partnerId && db.partners.find((p) => p.id === partnerId);
+    if (partner && !partner.suspended) {
+      req.partner = partner;
+      return next();
+    }
+    const userId = sessionTokens.tokenOwner(db.tokens, token);
+    const user = userId && db.users.find((u) => u.id === userId);
+    if (user && !user.suspended) {
+      req.user = user;
+      return next();
+    }
+  }
+  return res.status(401).json({ error: 'Please log in again.' });
+}
+
 // Shared by the shopkeeper and helper flows: speech text in, item fields out.
 // Never writes anything — the client always confirms before saving.
-router.post('/stores/voice/parse', (req, res, next) => {
-  // Either a partner or a customer (helper) may be speaking.
-  if (req.headers.authorization) return next();
-  res.status(401).json({ error: 'Please log in again.' });
-}, (req, res) => {
+const MAX_SPEECH_CHARS = 400; // one spoken shelf line; the body cap is 200kb
+const MAX_SPEECH_LINES = 50;
+
+router.post('/stores/voice/parse', authPartnerOrUser, (req, res) => {
   const { text, lines } = req.body || {};
   if (Array.isArray(lines)) {
-    return res.json({ items: lines.slice(0, 50).map((l) => parseItemSpeech(l)) });
+    return res.json({
+      items: lines
+        .slice(0, MAX_SPEECH_LINES)
+        .map((l) => parseItemSpeech(String(l == null ? '' : l).slice(0, MAX_SPEECH_CHARS)))
+    });
   }
   if (typeof text !== 'string' || !text.trim()) {
     return res.status(400).json({ error: 'Say the item name, quantity and price.' });
   }
-  res.json({ item: parseItemSpeech(text) });
+  res.json({ item: parseItemSpeech(text.slice(0, MAX_SPEECH_CHARS)) });
 });
 
 /* ---------------- shopkeeper: the store itself ---------------- */
