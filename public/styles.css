@@ -411,6 +411,18 @@ a.link { text-decoration: none; }
   width: calc(100% - 36px);
   max-width: 444px;
   z-index: 9;
+  /* A checkout bar with a fulfilment toggle, a payment toggle, an address field
+     and the pay button is several stacked rows — without an opaque panel the
+     shelf list scrolls through the gaps between them and the bar looks broken.
+     Same blur-what-scrolls-under glass as the toast. A single-button bar (food)
+     just reads as a button resting in a subtle tray, which is tidier anyway. */
+  background: var(--glass-chrome);
+  -webkit-backdrop-filter: blur(20px) saturate(160%);
+  backdrop-filter: blur(20px) saturate(160%);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px;
+  box-shadow: 0 10px 34px rgba(0, 0, 0, 0.5);
 }
 
 .qty { display: flex; align-items: center; gap: 10px; }

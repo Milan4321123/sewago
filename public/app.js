@@ -2809,10 +2809,25 @@ async function syncActiveRideUI() {
 // SSE: the server nudges us the instant a driver accepts / starts / finishes,
 // so status changes feel immediate instead of waiting for the next tick.
 let sseSource = null;
-function connectEvents() {
-  if (!state.token || typeof EventSource === 'undefined') return;
+let sseRetry = null;
+let sseConnecting = false;
+// The stream credential is a one-minute single-use ticket, not our session
+// token — query strings end up in proxy access logs. Because the ticket burns on
+// use, EventSource's own retry would loop on 401, so reconnects are ours to do.
+async function connectEvents() {
+  if (!state.token || typeof EventSource === 'undefined' || sseConnecting) return;
+  sseConnecting = true;
   disconnectEvents();
-  sseSource = new EventSource('/api/events?role=user&token=' + encodeURIComponent(state.token));
+  let ticket;
+  try {
+    ticket = (await api('/api/events/ticket', { method: 'POST', body: { role: 'user' } })).ticket;
+  } catch (_) {
+    sseConnecting = false;
+    return scheduleEventsRetry(); // polling below still keeps the UI correct
+  }
+  sseConnecting = false;
+  if (!state.token) return; // logged out while the ticket was in flight
+  sseSource = new EventSource('/api/events?role=user&ticket=' + encodeURIComponent(ticket));
   sseSource.onmessage = (e) => {
     let msg;
     try { msg = JSON.parse(e.data); } catch (_) { return; }
@@ -2897,9 +2912,14 @@ function connectEvents() {
       if (msg.event === 'withdrawal_rejected') toast('Your withdrawal was rejected — the amount is back in your wallet.', true);
     }
   };
-  // EventSource reconnects on its own; nothing to do on error.
+  sseSource.onerror = () => scheduleEventsRetry();
+}
+function scheduleEventsRetry() {
+  if (sseRetry || !state.token) return;
+  sseRetry = setTimeout(() => { sseRetry = null; connectEvents(); }, 5000);
 }
 function disconnectEvents() {
+  if (sseRetry) { clearTimeout(sseRetry); sseRetry = null; }
   if (sseSource) { sseSource.close(); sseSource = null; }
 }
 
@@ -3343,7 +3363,10 @@ function shopDetailView() {
   </div>
   ${s.items.length ? s.items.map((i) => shopItemRow(i, cart[i.id] || 0)).join('')
     : `<div class="empty"><div class="big">📦</div>This shop has not added items yet.</div>`}
-  <div style="height:${lines.length ? 190 : Object.keys(state.baskets).length ? 140 : 70}px"></div>
+  <!-- Clearance for the fixed cart bar. It is opaque now, so the last shelf
+       item must be able to scroll clear of it — delivery mode is tallest (it
+       adds the address field), so reserve the most there. -->
+  <div style="height:${lines.length ? (fulfil === 'delivery' ? 270 : canDeliver ? 224 : 178) : Object.keys(state.baskets).length ? 140 : 70}px"></div>
   ${lines.length ? `
   <div class="cartbar">
     ${canDeliver ? `
