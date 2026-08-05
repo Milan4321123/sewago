@@ -18,6 +18,7 @@ const {
   publicItem, publicStore
 } = require('../stores');
 const search = require('../storeSearch');
+const ai = require('../ai');
 
 const { authPartner, requirePartnerKyc, galleryFrom } = partnerRoutes;
 const router = express.Router();
@@ -58,6 +59,15 @@ function subscribedItemIds(userId, storeId) {
     db.itemSubscriptions
       .filter((s) => s.userId === userId && s.storeId === storeId && s.status === 'active')
       .map((s) => s.itemId)
+  );
+}
+
+// Items this customer has asked the shop to make subscribable, still unanswered.
+function pendingRequestItemIds(userId, storeId) {
+  return new Set(
+    db.subscriptionRequests
+      .filter((r) => r.userId === userId && r.storeId === storeId && r.status === 'pending')
+      .map((r) => r.itemId)
   );
 }
 
@@ -374,6 +384,53 @@ router.get('/partner/stores/:id/moves', authPartner, (req, res) => {
   res.json({ moves });
 });
 
+/* ---------------- shopkeeper: AI inventory assistant ---------------- */
+
+// The model is not free, so each partner gets a small per-minute budget —
+// enough for a real session, useless for a scripted loop. In-memory on purpose:
+// a restart forgiving the count is fine for a soft limit.
+const AI_DRAFT_LIMIT = 10;
+const aiDraftCalls = new Map(); // partnerId -> timestamps within the last minute
+
+function aiRateLimited(partnerId) {
+  const now = Date.now();
+  const recent = (aiDraftCalls.get(partnerId) || []).filter((t) => now - t < 60000);
+  if (recent.length >= AI_DRAFT_LIMIT) {
+    aiDraftCalls.set(partnerId, recent);
+    return true;
+  }
+  recent.push(now);
+  aiDraftCalls.set(partnerId, recent);
+  return false;
+}
+
+// Free text in, DRAFT rows out — nothing is written here. The client shows the
+// drafts in the same editable review table the voice flow uses and commits the
+// approved rows through POST /partner/stores/:id/items/bulk (where a duplicate
+// name+unit is a restock, which is exactly right for "restock what's low").
+router.post('/partner/stores/:id/ai/inventory', authPartner, async (req, res) => {
+  const store = manageableStore(req, res, { helpersAllowed: false });
+  if (!store) return;
+  if (!ai.aiEnabled()) {
+    // The client hides the assistant card on this exact status.
+    return res.status(503).json({ error: 'AI assistant is not configured on this server.' });
+  }
+  const prompt = String((req.body || {}).prompt || '').trim();
+  if (prompt.length < 3 || prompt.length > 2000) {
+    return res.status(400).json({ error: 'Describe what to add or restock (3-2000 characters).' });
+  }
+  if (aiRateLimited(req.partner.id)) {
+    return res.status(429).json({ error: 'Too many AI requests — wait a minute and try again.' });
+  }
+  try {
+    const result = await ai.draftInventory({ prompt, store });
+    if (result.error) return res.status(400).json({ error: result.error });
+    res.json({ items: result.items, note: result.note });
+  } catch (err) {
+    res.status(502).json({ error: 'The AI assistant could not be reached — try again.' });
+  }
+});
+
 /* ---------------- shopkeeper: helpers ---------------- */
 
 router.post('/partner/stores/:id/helpers', authPartner, (req, res) => {
@@ -477,6 +534,62 @@ router.post('/stores/:id/helper/items/:itemId/count', authRequired, (req, res) =
   res.json({ item: { id: item.id, stock: item.stock } });
 });
 
+/* ---------------- shopkeeper: subscription requests ---------------- */
+
+// The inbox of customers asking for a subscriber price. Pending first, newest
+// first; per-item pending counts let the inventory list badge the items people
+// are actually asking about.
+router.get('/partner/stores/:id/subscribe-requests', authPartner, (req, res) => {
+  const store = manageableStore(req, res, { helpersAllowed: false });
+  if (!store) return;
+  const requests = db.subscriptionRequests
+    .filter((r) => r.storeId === store.id)
+    .sort((a, b) =>
+      (Number(b.status === 'pending') - Number(a.status === 'pending')) || b.createdAt - a.createdAt)
+    .slice(0, 100);
+  const pendingByItem = {};
+  for (const r of requests) {
+    if (r.status === 'pending') pendingByItem[r.itemId] = (pendingByItem[r.itemId] || 0) + 1;
+  }
+  res.json({ requests, pendingByItem });
+});
+
+router.post('/partner/stores/:id/subscribe-requests/:reqId/accept', authPartner, (req, res) => {
+  const store = manageableStore(req, res, { helpersAllowed: false });
+  if (!store) return;
+  const request = db.subscriptionRequests.find((r) => r.id === req.params.reqId && r.storeId === store.id);
+  if (!request) return res.status(404).json({ error: 'Request not found.' });
+  if (request.status !== 'pending') return res.status(409).json({ error: 'This request was already answered.' });
+  const item = itemIn(store, request.itemId);
+  if (!item || item.archived) return res.status(404).json({ error: 'That item is no longer sold here.' });
+  const sp = Math.round(Number((req.body || {}).subscribePrice));
+  // Same bound the item PATCH enforces: at or above the shelf price is a worse
+  // deal, not an offer — and the price is validated HERE, never trusted later.
+  if (!Number.isFinite(sp) || sp <= 0 || sp >= item.price) {
+    return res.status(400).json({ error: `Subscriber price must be between Rs 1 and Rs ${item.price - 1}.` });
+  }
+  item.subscribePrice = sp;
+  item.updatedAt = Date.now();
+  request.status = 'accepted';
+  request.decidedAt = Date.now();
+  save();
+  // "The shop accepted — subscribe now" lands on the customer's app instantly.
+  events.publish(`user:${request.userId}`, { topic: 'subscription' });
+  res.json({ request, item: { id: item.id, subscribePrice: item.subscribePrice } });
+});
+
+router.post('/partner/stores/:id/subscribe-requests/:reqId/decline', authPartner, (req, res) => {
+  const store = manageableStore(req, res, { helpersAllowed: false });
+  if (!store) return;
+  const request = db.subscriptionRequests.find((r) => r.id === req.params.reqId && r.storeId === store.id);
+  if (!request) return res.status(404).json({ error: 'Request not found.' });
+  if (request.status !== 'pending') return res.status(409).json({ error: 'This request was already answered.' });
+  request.status = 'declined';
+  request.decidedAt = Date.now();
+  save();
+  res.json({ request });
+});
+
 /* ---------------- customer: browse ---------------- */
 
 // Where the customer is, if their phone shared it. Everything else degrades
@@ -527,9 +640,10 @@ router.get('/stores/:id', authRequired, (req, res) => {
   const { lat, lng } = pointFrom(req.query);
   const distanceKm = search.storeDistance(store, Number.isFinite(lat) ? { lat, lng } : null);
   const subs = subscribedItemIds(req.user.id, store.id);
+  const requested = pendingRequestItemIds(req.user.id, store.id);
   const items = store.items
     .filter((i) => !i.archived)
-    .map((i) => publicItem(i, { subscribedIds: subs }))
+    .map((i) => publicItem(i, { subscribedIds: subs, requestedIds: requested }))
     .sort((a, b) => Number(b.inStock) - Number(a.inStock) || a.name.localeCompare(b.name));
   res.json({ store: { ...publicStore(store), distanceKm }, items, serviceFee: STORE_SERVICE_FEE });
 });
@@ -569,6 +683,39 @@ router.post('/stores/:id/items/:itemId/subscribe', authRequired, (req, res) => {
   db.itemSubscriptions.push(subscription);
   save();
   res.json({ subscription });
+});
+
+// A customer asks the shop to put a subscriber price on an item that has none.
+// The shopkeeper answers from their app; acceptance is pushed back over SSE so
+// the customer can subscribe the moment the offer exists.
+router.post('/stores/:id/items/:itemId/subscribe-request', authRequired, (req, res) => {
+  const store = storeById(req.params.id);
+  if (!storeIsLive(store)) return res.status(404).json({ error: 'Shop not found.' });
+  const item = itemIn(store, req.params.itemId);
+  if (!item || item.archived) return res.status(404).json({ error: 'Item not found.' });
+  if (item.subscribePrice) {
+    return res.status(400).json({ error: 'This item already has a subscriber price — just subscribe.' });
+  }
+  const pending = db.subscriptionRequests.find(
+    (r) => r.userId === req.user.id && r.itemId === item.id && r.status === 'pending'
+  );
+  if (pending) {
+    return res.status(409).json({ error: 'You have already asked — the shop has not answered yet.' });
+  }
+  const request = {
+    id: uid(),
+    userId: req.user.id,
+    userName: req.user.name,
+    storeId: store.id,
+    itemId: item.id,
+    itemName: item.name,
+    status: 'pending',
+    createdAt: Date.now()
+  };
+  db.subscriptionRequests.push(request);
+  save();
+  events.publish(`partner:${store.ownerId}`, { topic: 'subscribe_requests' });
+  res.json({ request });
 });
 
 router.delete('/stores/:id/items/:itemId/subscribe', authRequired, (req, res) => {

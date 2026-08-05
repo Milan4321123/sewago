@@ -13,9 +13,10 @@
     "demo:seed": "node scripts/seed-demo.js",
     "supabase:push": "node scripts/supabase-push.js",
     "supabase:pull": "node scripts/supabase-pull.js",
-    "verify": "find server public -name '*.js' -print0 | xargs -0 -n1 node --check"
+    "verify": "find server public -name '*.js' -print0 | xargs -0 -n1 node --check && node --check server/ai.js"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.115.0",
     "@supabase/supabase-js": "^2.109.0",
     "compression": "^1.8.1",
     "dotenv": "^17.4.2",

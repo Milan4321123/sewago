@@ -197,7 +197,7 @@ function canManageStore(store, { partnerId = null, userId = null }) {
   return null;
 }
 
-function publicItem(item, { subscribedIds = new Set() } = {}) {
+function publicItem(item, { subscribedIds = new Set(), requestedIds = new Set() } = {}) {
   const subscribed = subscribedIds.has(item.id);
   const price = subscribed && item.subscribePrice ? item.subscribePrice : item.price;
   return {
@@ -209,6 +209,9 @@ function publicItem(item, { subscribedIds = new Set() } = {}) {
     listPrice: item.price,
     subscribePrice: item.subscribePrice || null,
     subscribed,
+    // The caller has asked the shop to make this item subscribable and the shop
+    // has not answered yet — the row shows "Requested ✓" instead of the CTA.
+    subscribeRequested: requestedIds.has(item.id),
     category: item.category || '',
     photo: item.photo || '',
     inStock: (Number(item.stock) || 0) > 0,

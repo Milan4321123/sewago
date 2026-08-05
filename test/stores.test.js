@@ -712,3 +712,120 @@ test('a shop awaiting review is invisible to customers until it is approved', as
   const after = await api(`/store-search?q=secret masala&lat=${THAMEL.lat}&lng=${THAMEL.lng}&radiusKm=2`, { token: cust });
   assert.equal(after.data.results.length, 1, 'approval puts the shop into search immediately');
 });
+
+/* ---------------- subscription requests (customer asks, shopkeeper answers) ---------------- */
+
+test('a customer asks for a subscriber price and the shop accepts with a real offer', async () => {
+  const shop = await openShop();
+  const created = await api(`/partner/stores/${shop.storeId}/items`, {
+    method: 'POST', token: shop.token, body: { name: 'Dahi', unit: 'each', price: 90, stock: 12 }
+  });
+  const itemId = created.data.item.id;
+  const { token: cust } = await registerUser('asker');
+
+  // Before asking, the row carries no request flag and no offer.
+  const before = await api(`/stores/${shop.storeId}`, { token: cust });
+  assert.equal(before.data.items[0].subscribeRequested, false);
+  assert.equal(before.data.items[0].subscribePrice, null);
+
+  const asked = await api(`/stores/${shop.storeId}/items/${itemId}/subscribe-request`, {
+    method: 'POST', token: cust
+  });
+  assert.equal(asked.status, 200, JSON.stringify(asked.data));
+  assert.equal(asked.data.request.status, 'pending');
+
+  // Asking twice while the shop has not answered is refused.
+  const again = await api(`/stores/${shop.storeId}/items/${itemId}/subscribe-request`, {
+    method: 'POST', token: cust
+  });
+  assert.equal(again.status, 409);
+
+  // The customer's own view shows the pending ask.
+  const flagged = await api(`/stores/${shop.storeId}`, { token: cust });
+  assert.equal(flagged.data.items[0].subscribeRequested, true);
+
+  // The shopkeeper sees it in the inbox, with a per-item pending count.
+  const inbox = await api(`/partner/stores/${shop.storeId}/subscribe-requests`, { token: shop.token });
+  assert.equal(inbox.status, 200, JSON.stringify(inbox.data));
+  const reqRow = inbox.data.requests.find((r) => r.itemId === itemId);
+  assert.ok(reqRow, 'the request reaches the shopkeeper');
+  assert.equal(reqRow.status, 'pending');
+  assert.ok(reqRow.userName, 'the shopkeeper sees who is asking');
+  assert.equal(inbox.data.pendingByItem[itemId], 1);
+
+  // The offered price is validated server-side: zero, negative and >= list are out.
+  for (const bad of [0, -5, 90, 120]) {
+    const rejected = await api(`/partner/stores/${shop.storeId}/subscribe-requests/${reqRow.id}/accept`, {
+      method: 'POST', token: shop.token, body: { subscribePrice: bad }
+    });
+    assert.equal(rejected.status, 400, `subscribePrice ${bad} must be refused`);
+  }
+
+  const accepted = await api(`/partner/stores/${shop.storeId}/subscribe-requests/${reqRow.id}/accept`, {
+    method: 'POST', token: shop.token, body: { subscribePrice: 80 }
+  });
+  assert.equal(accepted.status, 200, JSON.stringify(accepted.data));
+  assert.equal(accepted.data.request.status, 'accepted');
+  assert.equal(accepted.data.item.subscribePrice, 80);
+
+  // Accepting twice is refused — the request is already decided.
+  const twice = await api(`/partner/stores/${shop.storeId}/subscribe-requests/${reqRow.id}/accept`, {
+    method: 'POST', token: shop.token, body: { subscribePrice: 70 }
+  });
+  assert.equal(twice.status, 409);
+
+  // The customer can now actually subscribe, at the offered price.
+  const sub = await api(`/stores/${shop.storeId}/items/${itemId}/subscribe`, {
+    method: 'POST', token: cust, body: { everyDays: 3 }
+  });
+  assert.equal(sub.status, 200, JSON.stringify(sub.data));
+  assert.equal(sub.data.subscription.price, 80);
+
+  // Asking for an item that already has an offer is pointless — just subscribe.
+  const { token: late } = await registerUser('late-asker');
+  const moot = await api(`/stores/${shop.storeId}/items/${itemId}/subscribe-request`, {
+    method: 'POST', token: late
+  });
+  assert.equal(moot.status, 400);
+});
+
+test('a declined request can be asked again, and only the owner answers the inbox', async () => {
+  const shop = await openShop();
+  const created = await api(`/partner/stores/${shop.storeId}/items`, {
+    method: 'POST', token: shop.token, body: { name: 'Ghiu', unit: 'l', price: 950, stock: 3 }
+  });
+  const itemId = created.data.item.id;
+  const { token: cust } = await registerUser('hopeful');
+
+  const asked = await api(`/stores/${shop.storeId}/items/${itemId}/subscribe-request`, {
+    method: 'POST', token: cust
+  });
+  assert.equal(asked.status, 200, JSON.stringify(asked.data));
+  const reqId = asked.data.request.id;
+
+  // Another shopkeeper can neither read nor answer this shop's requests.
+  const rival = await openShop('Rival Pasal');
+  const spy = await api(`/partner/stores/${shop.storeId}/subscribe-requests`, { token: rival.token });
+  assert.equal(spy.status, 403);
+  const meddle = await api(`/partner/stores/${shop.storeId}/subscribe-requests/${reqId}/decline`, {
+    method: 'POST', token: rival.token
+  });
+  assert.equal(meddle.status, 403);
+
+  const declined = await api(`/partner/stores/${shop.storeId}/subscribe-requests/${reqId}/decline`, {
+    method: 'POST', token: shop.token
+  });
+  assert.equal(declined.status, 200, JSON.stringify(declined.data));
+  assert.equal(declined.data.request.status, 'declined');
+
+  // The row no longer shows a pending ask, and the item still has no offer.
+  const view = await api(`/stores/${shop.storeId}`, { token: cust });
+  assert.equal(view.data.items[0].subscribeRequested, false);
+  assert.equal(view.data.items[0].subscribePrice, null);
+
+  // A "no" today is not a "no" forever — the customer may ask again.
+  const reAsk = await api(`/stores/${shop.storeId}/items/${itemId}/subscribe-request`, {
+    method: 'POST', token: cust
+  });
+  assert.equal(reAsk.status, 200, JSON.stringify(reAsk.data));
+});

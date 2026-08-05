@@ -1,6 +1,7 @@
 const { db, uid } = require('./db');
 const { haversineKm } = require('./places');
 const { driverIsAvailable, cashJobFitsFloat, ROAD_FACTOR } = require('./rideLogic');
+const events = require('./events');
 
 // Batched multi-stop courier runs.
 //
@@ -24,14 +25,20 @@ function envNum(name, fallback, min, max) {
   return Number.isFinite(n) && n >= min && n <= max ? n : fallback;
 }
 
-const BATCH_TARGET = envNum('DELIVERY_BATCH_TARGET', 4, 1, 12);        // orders per run
+const BATCH_TARGET = envNum('DELIVERY_BATCH_TARGET', 6, 1, 10);        // orders per run
+const MAX_ORDERS = 10; // hard per-run ceiling, whatever the env target says
 const MAX_WAIT_MIN = envNum('DELIVERY_MAX_WAIT_MIN', 12, 0.01, 120);   // never strand an order
 const PICKUP_RADIUS_KM = envNum('DELIVERY_PICKUP_RADIUS_KM', 2, 0.2, 15);
 const DROP_RADIUS_KM = envNum('DELIVERY_DROP_RADIUS_KM', 3, 0.2, 20);
 const OFFER_SECONDS = envNum('DELIVERY_OFFER_SECONDS', 25, 5, 120);
 // How long a rider who let an offer lapse is skipped before being asked again.
 const LAPSE_COOLDOWN_MS = envNum('DELIVERY_LAPSE_COOLDOWN_SEC', 45, 5, 600) * 1000;
-const MAX_STOPS = envNum('DELIVERY_MAX_STOPS', 10, 2, 20);
+// 16 lets a full 10-order run across a few shops fit (10 drops + up to 6 pickups).
+const MAX_STOPS = envNum('DELIVERY_MAX_STOPS', 16, 2, 20);
+// A run is only offered to riders actually near its first pickup. Offering the
+// nearest of the whole city meant a rider 20 km out could be handed a Thamel
+// run and burn the offer window (or the petrol) getting nowhere.
+const OFFER_RADIUS_KM = envNum('DELIVERY_OFFER_RADIUS_KM', 6, 0.5, 50);
 
 // Courier pay: a base for showing up, something per stop because stops are the
 // real work, and distance for the long ones.
@@ -79,7 +86,9 @@ function buildCluster(seed, pool) {
   const cluster = [seed];
   const seedPickup = pickupLocOf(seed);
   for (const order of pool) {
-    if (order === seed || cluster.length >= BATCH_TARGET) continue;
+    // BATCH_TARGET is the dispatch trigger; MAX_ORDERS is the ceiling a single
+    // rider's bag (and sanity) can hold even if the env pushes the target up.
+    if (order === seed || cluster.length >= Math.min(BATCH_TARGET, MAX_ORDERS)) continue;
     const pickup = pickupLocOf(order);
     if (!pickup) continue;
     if (haversineKm(seedPickup, pickup) > PICKUP_RADIUS_KM) continue;
@@ -204,6 +213,9 @@ function eligibleCouriers(runCash, near) {
         ? haversineKm({ lat: d.currentLat, lng: d.currentLng }, near)
         : 999
     }))
+    // Only riders actually near the first pickup. A rider with no known
+    // location scores 999 and is skipped too — we cannot show they are close.
+    .filter((c) => !near || c.km <= OFFER_RADIUS_KM)
     .sort((a, b) => a.km - b.km);
 }
 
@@ -288,6 +300,9 @@ function sweepDeliveryRuns() {
       // rider could be handed the same run on the very next sweep, forever.
       passed
     };
+    // Nudge the rider's app to fetch the offer now — a 25s window is mostly
+    // gone by the time a 10s poll happens to notice it.
+    events.publish(`driver:${run.offer.driverId}`, { topic: 'run_offer' });
     changed += 1;
   }
 

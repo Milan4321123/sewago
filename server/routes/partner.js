@@ -56,6 +56,9 @@ function authPartner(req, res, next) {
   const partnerId = sessionTokens.tokenOwner(db.partnerTokens, token);
   const partner = partnerId && db.partners.find((p) => p.id === partnerId);
   if (!partner) return res.status(401).json({ error: 'Please log in again.' });
+  if (partner.suspended) {
+    return res.status(403).json({ error: 'Your partner account is suspended — contact SewaGo support.' });
+  }
   req.partner = partner;
   next();
 }

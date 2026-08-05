@@ -819,6 +819,392 @@ a.link { text-decoration: none; }
 .map-legend { margin: 0 2px 14px; }
 
 /* ============================================================
+   Shared components
+   Built once here, used across customer / driver / partner /
+   admin. Everything fits the 480px .phone shell, respects
+   safe-area insets and reuses the tokens above — no new colors.
+   ============================================================ */
+
+/* ---------- offer sheet ---------- */
+/* Full-viewport takeover for incoming driver offers (rides, deliveries,
+   batch runs). Above the tabbar but below toasts, so an error toast
+   during accept still shows. Content is bottom-anchored like a native
+   sheet; whatever card goes inside slides up with the spring. */
+.offer-sheet {
+  position: fixed;
+  inset: 0;
+  z-index: 40; /* tabbar 10 < sheet < toast 50 */
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  padding: calc(16px + env(safe-area-inset-top, 0px)) 14px calc(16px + env(safe-area-inset-bottom, 0px));
+  background: rgba(3, 5, 9, 0.62);
+  -webkit-backdrop-filter: blur(18px) saturate(150%);
+  backdrop-filter: blur(18px) saturate(150%);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  animation: fade-in 0.18s ease;
+}
+.offer-sheet.hidden { display: none; }
+.offer-sheet > * { animation: sheet-up 0.32s var(--spring); }
+@keyframes sheet-up {
+  from { opacity: 0; transform: translateY(26px) scale(0.985); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+/* Big money number at the top of an offer card. */
+.offer-fare { font-size: 34px; font-weight: 900; letter-spacing: -1px; line-height: 1.05; }
+.offer-fare em { color: var(--accent); font-style: normal; text-shadow: 0 0 20px rgba(52, 211, 153, 0.45); }
+/* Meta line under the fare: pickup ETA, distance, payment type. */
+.offer-meta { display: flex; flex-wrap: wrap; gap: 6px 16px; margin-top: 6px; color: var(--muted); font-size: 13px; font-weight: 600; }
+.offer-meta b { color: var(--text); }
+/* Batch runs: vertical stop list — P pills for pickups, D for drops. */
+.offer-stops { margin-top: 10px; }
+.offer-stops .stop {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 6px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  font-size: 13px;
+}
+.offer-stops .stop:last-child { border-bottom: none; }
+.stop-tag {
+  flex-shrink: 0;
+  min-width: 30px;
+  text-align: center;
+  padding: 2px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 900;
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.stop-tag.drop { background: rgba(251, 191, 36, 0.15); color: var(--amber); }
+
+/* ---------- ring timer ---------- */
+/* Conic countdown ring for offer expiry. JS drives it once a second:
+   el.style.setProperty('--pct', 62) — percent REMAINING, 100 → 0.
+   Registering --pct lets supporting browsers tween smoothly between the
+   JS updates; everywhere else the ring simply steps — both read fine. */
+@property --pct { syntax: "<number>"; inherits: true; initial-value: 100; }
+.ring-timer {
+  --pct: 100;
+  position: relative;
+  width: 56px;
+  height: 56px;
+  flex-shrink: 0;
+  display: grid;
+  place-items: center;
+  font-size: 15px;
+  font-weight: 900;
+  font-variant-numeric: tabular-nums;
+  color: var(--accent);
+}
+.ring-timer::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background: conic-gradient(var(--accent) calc(var(--pct) * 1%), rgba(255, 255, 255, 0.1) 0);
+  /* Punch out the middle so only a 5px ring paints — the count sits inside. */
+  -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 6px), #000 calc(100% - 5px));
+  mask: radial-gradient(farthest-side, transparent calc(100% - 6px), #000 calc(100% - 5px));
+  filter: drop-shadow(0 0 8px rgba(52, 211, 153, 0.4));
+  transition: --pct 1s linear;
+}
+/* Last seconds: JS adds .low → ring and number turn red. */
+.ring-timer.low { color: var(--danger); }
+.ring-timer.low::before {
+  background: conic-gradient(var(--danger) calc(var(--pct) * 1%), rgba(255, 255, 255, 0.1) 0);
+  filter: drop-shadow(0 0 8px rgba(248, 113, 113, 0.45));
+}
+
+/* ---------- add / qty stepper morph ---------- */
+/* Blinkit-style ADD pill on product rows. Tapping adds to the basket and
+   the re-render swaps it for a [− n +] stepper with the SAME 100×36
+   footprint, so the row never jumps — the swap reads as a morph.
+   NOTE: .stepper is also the ride progress stepper above (.step
+   children); the qty variant is scoped with :has(> button) plus child
+   selectors the progress markup can never match. Browsers without
+   :has() (pre-2023) only inherit the progress margins — cosmetic. */
+.add-btn {
+  width: 100px;
+  height: 36px;
+  flex-shrink: 0;
+  border-radius: 999px;
+  border: 1px solid rgba(52, 211, 153, 0.5);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: 0.4px;
+  cursor: pointer;
+  box-shadow: var(--glass-hi), 0 0 14px rgba(52, 211, 153, 0.1);
+  transition: transform 0.12s var(--spring), box-shadow 0.2s ease;
+}
+.add-btn:active { transform: scale(0.94); }
+.stepper:has(> button) {
+  width: 100px;
+  height: 36px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  margin: 0;
+  border-radius: 999px;
+  border: 1px solid rgba(52, 211, 153, 0.5);
+  background: linear-gradient(135deg, var(--accent), var(--accent-dark));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.25), 0 0 16px rgba(52, 211, 153, 0.22);
+  overflow: hidden;
+  animation: pop-in 0.18s var(--spring);
+}
+.stepper > button {
+  flex: 1;
+  height: 100%;
+  background: none;
+  border: none;
+  color: #04130a;
+  font-size: 17px;
+  font-weight: 900;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+.stepper > button:active { background: rgba(0, 0, 0, 0.12); }
+.stepper > .n {
+  min-width: 24px;
+  text-align: center;
+  color: #04130a;
+  font-size: 14px;
+  font-weight: 900;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- basket bar ---------- */
+/* Floating "view basket" pill just above the tabbar (same slot as
+   .cartbar). The whole bar is one tap target; JS toggles .bump on every
+   add for a micro pop (remove the class on animationend to re-arm). */
+.basket-bar {
+  position: fixed;
+  bottom: calc(88px + env(safe-area-inset-bottom, 0px));
+  left: 50%;
+  transform: translateX(-50%);
+  width: calc(100% - 36px);
+  max-width: 444px;
+  z-index: 9; /* under the tabbar so its blur reads correctly */
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 13px 18px;
+  border: none;
+  border-radius: 18px;
+  background: linear-gradient(135deg, var(--accent), var(--accent-dark));
+  color: #04130a;
+  font-size: 14px;
+  font-weight: 800;
+  cursor: pointer;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.28), 0 12px 32px rgba(0, 0, 0, 0.45), var(--accent-glow);
+  animation: basket-in 0.3s var(--spring);
+}
+.basket-bar:active { transform: translateX(-50%) scale(0.975); }
+.basket-bar .go { font-weight: 900; white-space: nowrap; }
+.basket-bar.bump { animation: basket-bump 0.32s var(--spring); }
+/* Entry/bump keyframes carry the centering translateX — a plain
+   translateY keyframe would snap the bar off-center mid-animation. */
+@keyframes basket-in {
+  from { opacity: 0; transform: translate(-50%, 16px); }
+  to { opacity: 1; transform: translate(-50%, 0); }
+}
+@keyframes basket-bump {
+  0% { transform: translateX(-50%) scale(1); }
+  35% { transform: translateX(-50%) scale(1.05); }
+  100% { transform: translateX(-50%) scale(1); }
+}
+
+/* ---------- pipe tabs ---------- */
+/* Equal-width segmented control for order pipelines / inventory tabs.
+   Glass trough; the active segment lifts with the accent tint. */
+.pipe-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 4px;
+  margin-bottom: 12px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: var(--glass-hi);
+}
+.pipe-tabs button {
+  flex: 1 1 0;
+  min-width: 0;
+  padding: 9px 4px;
+  border: none;
+  border-radius: 10px;
+  background: none;
+  color: var(--muted);
+  font-size: 12.5px;
+  font-weight: 800;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: background 0.18s ease, color 0.18s ease;
+}
+.pipe-tabs button.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+  box-shadow: var(--glass-hi), 0 0 12px rgba(52, 211, 153, 0.12);
+}
+/* Optional count chip: <button>New <b class="tab-badge">3</b></button> */
+.pipe-tabs .tab-badge {
+  display: inline-block;
+  margin-left: 4px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--amber);
+  color: #1a1205;
+  font-size: 10.5px;
+  font-weight: 800;
+}
+
+/* ---------- GO button ---------- */
+/* The driver's one big decision: a circular GO that breathes while it
+   waits. Going offline is deliberately NOT this easy — that lives in
+   the quiet .status-strip action below. */
+.go-btn {
+  display: grid;
+  place-items: center;
+  width: 132px;
+  height: 132px;
+  margin: 26px auto;
+  border-radius: 50%;
+  border: none;
+  background: radial-gradient(circle at 32% 28%, #6ee7b7, var(--accent) 42%, var(--accent-dark));
+  color: #04130a;
+  font-size: 30px;
+  font-weight: 900;
+  letter-spacing: 1px;
+  cursor: pointer;
+  box-shadow: inset 0 2px 0 rgba(255, 255, 255, 0.35), 0 14px 40px rgba(52, 211, 153, 0.35);
+  animation: go-breathe 2.6s ease-in-out infinite;
+  transition: transform 0.14s var(--spring);
+}
+.go-btn:active { transform: scale(0.93); animation: none; }
+.go-btn small { display: block; font-size: 11px; font-weight: 800; letter-spacing: 0.6px; opacity: 0.75; }
+@keyframes go-breathe {
+  0%, 100% { box-shadow: inset 0 2px 0 rgba(255, 255, 255, 0.35), 0 14px 40px rgba(52, 211, 153, 0.3), 0 0 0 0 rgba(52, 211, 153, 0.32); }
+  50% { box-shadow: inset 0 2px 0 rgba(255, 255, 255, 0.35), 0 14px 46px rgba(52, 211, 153, 0.45), 0 0 0 16px rgba(52, 211, 153, 0); }
+}
+
+/* ---------- status strip ---------- */
+/* Slim full-width bar showing shift state (driver online, store open…).
+   Neutral by default; .online turns it emerald — drop a .dot-live inside
+   for the pulse. Keep the "go offline" control a quiet .link on the
+   right; JS should still confirm (two-tap / hold) before killing a shift. */
+.status-strip {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 10px 14px;
+  margin-bottom: 12px;
+  border-radius: 13px;
+  border: 1px solid var(--border);
+  background: var(--card);
+  font-size: 13px;
+  font-weight: 700;
+  box-shadow: var(--glass-hi);
+}
+.status-strip.online {
+  border-color: rgba(52, 211, 153, 0.35);
+  background: var(--accent-soft);
+  color: var(--accent);
+  box-shadow: var(--glass-hi), 0 0 18px rgba(52, 211, 153, 0.1);
+}
+.status-strip .grow { text-align: left; }
+.status-strip button.link { font-size: 13px; flex-shrink: 0; }
+
+/* ---------- inline form ---------- */
+/* Small in-place expansion that replaces prompt()/confirm() flows:
+   opens right under the row that triggered it. First <span> child is a
+   full-width label line; inputs and compact buttons wrap on one row. */
+.inline-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 10px;
+  margin-top: 8px;
+  background: var(--card2);
+  border: 1px solid var(--border);
+  border-radius: 13px;
+  box-shadow: var(--glass-hi);
+  animation: pop-in 0.18s var(--spring);
+}
+.inline-form > span { width: 100%; font-size: 12px; color: var(--muted); font-weight: 600; }
+/* Keep 16px input font (inherited) — smaller makes iOS zoom on focus. */
+.inline-form input, .inline-form select { flex: 1 1 90px; width: auto; min-width: 0; padding: 10px 12px; }
+.inline-form .btn { width: auto; padding: 10px 14px; font-size: 13px; flex-shrink: 0; }
+
+/* ---------- queue row ---------- */
+/* Admin approval inbox: one row per pending item, oldest first, with an
+   age chip that heats up as things sit (JS adds .warn / .late). Rows
+   expand in place — put the expanded controls in a .queue-detail. */
+.queue-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+}
+.queue-row:last-child { border-bottom: none; }
+.queue-row .emoji {
+  font-size: 20px;
+  width: 38px;
+  height: 38px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--card2);
+  border-radius: 11px;
+  flex-shrink: 0;
+}
+.queue-row h4 { font-size: 14px; font-weight: 800; }
+.queue-row .sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
+.queue-row .age {
+  margin-left: auto;
+  flex-shrink: 0;
+  padding: 3px 9px;
+  border-radius: 999px;
+  background: rgba(139, 147, 167, 0.15);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.queue-row .age.warn { background: rgba(245, 158, 11, 0.15); color: var(--amber); }
+.queue-row .age.late { background: rgba(239, 68, 68, 0.15); color: var(--danger); }
+.queue-detail {
+  padding: 4px 0 14px 48px; /* aligns under the row text, past the emoji */
+  border-bottom: 1px solid var(--border);
+  animation: pop-in 0.18s var(--spring);
+}
+.queue-detail:last-child { border-bottom: none; }
+
+/* Compact phones: shrink the big shared pieces with the frame. */
+@media (max-width: 380px) {
+  .go-btn { width: 116px; height: 116px; font-size: 26px; }
+  .add-btn, .stepper:has(> button) { width: 92px; }
+  .pipe-tabs button { font-size: 11.5px; }
+}
+
+/* Looping decorative motion stops entirely under reduced motion (the
+   global guard at the bottom of the file zeroes everything else). */
+@media (prefers-reduced-motion: reduce) {
+  .go-btn, .basket-bar.bump { animation: none; }
+}
+
+/* ============================================================
    Motion system
    One spring curve everywhere so the whole app moves like one
    material. Entry animations only fire on real navigation
@@ -872,3 +1258,47 @@ a.link { text-decoration: none; }
     transition-duration: 0.01ms !important;
   }
 }
+
+/* ============================================================
+   App-specific additions
+   One section per app below. Shared styles belong ABOVE this
+   line; each app writes ONLY inside its own marker.
+   ============================================================ */
+
+/* ===== app-specific: customer ===== */
+
+/* ===== app-specific: driver ===== */
+
+/* Quiet, centered "Pass" / dismiss link under a full-width Accept bar on
+   offer-sheet cards — the big green button stays the only loud thing. */
+.link.offer-pass {
+  display: block;
+  margin: 10px auto 0;
+  padding: 6px 10px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+/* ===== app-specific: partner ===== */
+
+/* ===== app-specific: admin ===== */
+
+/* Count bubble sitting on a tab icon's shoulder (approvals inbox, live rides).
+   Scoped to the admin shell so other apps' tabbars stay untouched. */
+.admin-shell .tabbar .ico { position: relative; }
+.admin-shell .tabbar .tab-badge {
+  position: absolute;
+  top: -4px;
+  right: -15px;
+  padding: 0 5px;
+  border-radius: 999px;
+  line-height: 15px;
+  background: var(--amber);
+  color: #1a1205;
+  font-size: 10px;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+}
+/* The inbox spans the wide admin shell — keep detail actions hand-sized. */
+.admin-shell .queue-detail .grid2 { max-width: 560px; }
+.admin-shell .queue-detail .field { max-width: 560px; }

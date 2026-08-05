@@ -543,6 +543,7 @@ function renderTab() {
 window.setTab = async (tab) => {
   state._pageAnim = state.tab !== tab;
   state.tab = tab;
+  localStorage.setItem('sewago_tab', tab); // reload lands back on the same tab
   state.restaurant = null;
   try {
     if (tab === 'shops') {
@@ -2284,6 +2285,20 @@ function connectEvents() {
         if (state.tab === 'shops') render();
       }).catch(() => {});
     }
+    if (msg.topic === 'subscription') {
+      // A shopkeeper answered a subscribe request — invite the subscribe on the
+      // spot, and refresh the open shop front so the CTA is there when they look.
+      toast(`🔁 ${msg.storeName || 'The shop'} accepted your subscription request${
+        msg.itemName ? ` for ${msg.itemName}` : ''} — subscribe now for the lower price!`);
+      if (state.shop) {
+        api(`/api/stores/${state.shop.store.id}`).then((data) => {
+          if (state.shop && state.shop.store.id === data.store.id) {
+            state.shop = data;
+            if (state.tab === 'shops') render();
+          }
+        }).catch(() => {});
+      }
+    }
     if (msg.topic === 'wallet') {
       // A withdrawal was decided — refetch balance + ledger, then tell the user.
       Promise.all([api('/api/auth/me'), loadTxns()]).then(([me]) => {
@@ -2356,6 +2371,9 @@ document.addEventListener('click', (e) => {
       localStorage.removeItem('sewago_token');
     }
   }
+  // Reopen the tab they were on last time (a fresh login still lands on rides).
+  const savedTab = localStorage.getItem('sewago_tab');
+  if (state.user && savedTab && TABS.some((t) => t.id === savedTab)) state.tab = savedTab;
   // Back from a payment gateway redirect (eSewa / Khalti).
   const params = new URLSearchParams(window.location.search);
   // Password-reset link from the email: open the reset form with the token in.
@@ -2373,6 +2391,8 @@ document.addEventListener('click', (e) => {
     if (state.user && state.tab === 'profile') await loadTxns().catch(() => {});
   }
   render();
+  // The restored tab paints instantly from empty state; hydrate it right after.
+  if (state.user && state.tab !== 'rides') setTab(state.tab).catch(() => {});
   if (payResult === 'success') {
     const amount = Number(params.get('amount'));
     toast(`Payment successful — Rs ${amount || ''} added to your wallet 💸`);
@@ -2388,6 +2408,118 @@ document.addEventListener('click', (e) => {
    what is actually on the shelf right now, and subscribe to the things
    you buy every week for a lower price.
 */
+
+/* ---------------- basket (one shop at a time) ---------------- */
+/* The basket outlives any single view: ADD from search, a category browse or a
+   shop front and the floating .basket-bar follows you around the tab. Lines
+   snapshot name/price for the bar's running total only — the shop front and the
+   server both recompute from the live shelf, so a stale snapshot never
+   mischarges anyone. */
+
+function basketQty(storeId, itemId) {
+  const b = state.basket;
+  return b && b.store.id === storeId && b.items[itemId] ? b.items[itemId].qty : 0;
+}
+
+function basketSummary() {
+  const lines = state.basket ? Object.values(state.basket.items) : [];
+  return {
+    count: lines.reduce((n, l) => n + l.qty, 0),
+    total: lines.reduce((n, l) => n + l.qty * l.price, 0)
+  };
+}
+
+// The one write path. Adding from a different shop than the basket's asks which
+// basket survives (basketSwitchSheet) instead of silently merging or wiping.
+function basketChange(store, item, delta) {
+  if (state.basket && state.basket.store.id !== store.id) {
+    if (delta > 0) { state.basketSwitch = { store, item }; render(); }
+    return;
+  }
+  if (!state.basket) {
+    if (delta <= 0) return;
+    state.basket = { store, items: {} };
+  }
+  const items = state.basket.items;
+  const line = items[item.id] || { id: item.id, name: item.name, price: item.price, qty: 0 };
+  line.qty = Math.min(50, line.qty + delta);
+  line.price = item.price; // freshest price we've seen wins
+  if (line.qty <= 0) delete items[item.id];
+  else items[item.id] = line;
+  if (!Object.keys(items).length) state.basket = null;
+  render();
+  if (delta > 0) {
+    const bar = document.querySelector('.basket-bar');
+    if (bar) bar.classList.add('bump'); // micro pop; onanimationend re-arms it
+  }
+}
+
+// ADD pill ⇄ [− n +] stepper with the same footprint, so the swap on re-render
+// reads as a morph. `fn` is a window handler name, `ids` its leading string
+// args; the qty delta goes last.
+function qtyControl(qty, fn, ids) {
+  const call = (d) => `${fn}(${ids.map((x) => `'${x}'`).join(',')},${d})`;
+  if (qty <= 0) return `<button class="add-btn" onclick="${call(1)}">ADD</button>`;
+  return `
+  <div class="stepper">
+    <button onclick="${call(-1)}" aria-label="one less">−</button>
+    <span class="n">${qty}</span>
+    <button onclick="${call(1)}" aria-label="one more">+</button>
+  </div>`;
+}
+
+// Floating pill above the tabbar on every shops surface except the basket's own
+// shop front (the full cartbar checkout takes over there). Tapping it opens
+// that shop — the basket IS the shop.
+function basketBar() {
+  const b = state.basket;
+  if (!b) return '';
+  const { count, total } = basketSummary();
+  return `
+  <button class="basket-bar" onclick="openShopFront('${b.store.id}')" onanimationend="this.classList.remove('bump')">
+    <span>${b.store.icon} ${count} item${count === 1 ? '' : 's'} · ${money(total)}</span>
+    <span class="go">View basket →</span>
+  </button>`;
+}
+
+function basketSwitchSheet() {
+  const sw = state.basketSwitch;
+  if (!sw || !state.basket) return '';
+  const { count } = basketSummary();
+  return `
+  <div class="offer-sheet" onclick="if (event.target === this) dismissBasketSwitch()">
+    <div class="card">
+      <div style="font-weight:900;font-size:17px">Start a new basket at ${esc(sw.store.name)}?</div>
+      <div class="muted small" style="margin:8px 0 14px">
+        You have ${count} item${count === 1 ? '' : 's'} from ${esc(state.basket.store.name)} — one basket
+        at a time, so starting here clears that one.
+      </div>
+      <button class="btn" onclick="confirmBasketSwitch()">Clear it — add this instead</button>
+      <button class="btn ghost" style="margin-top:8px" onclick="dismissBasketSwitch()">Keep my ${esc(state.basket.store.name)} basket</button>
+    </div>
+  </div>`;
+}
+
+window.confirmBasketSwitch = () => {
+  const sw = state.basketSwitch;
+  state.basketSwitch = null;
+  if (!sw) return render();
+  state.basket = null;
+  basketChange(sw.store, sw.item, 1);
+};
+
+window.dismissBasketSwitch = () => { state.basketSwitch = null; render(); };
+
+// ADD straight from a search / category row — no need to open the shop first.
+window.searchBasketAdd = (storeId, itemId, delta) => {
+  const r = ((state.shopResults || {}).results || []).find((x) => x.storeId === storeId && x.itemId === itemId);
+  if (!r) return;
+  basketChange(
+    { id: r.storeId, name: r.storeName, icon: r.storeIcon },
+    { id: r.itemId, name: r.name, price: r.price },
+    delta
+  );
+};
 
 function shopsView() {
   if (state.shop) return shopDetailView();
@@ -2438,26 +2570,30 @@ function shopsView() {
     : `<div class="empty"><div class="big">🏪</div>No shops nearby yet — they are being added.</div>`}
   ${(state.subscriptions || []).length ? `
     <div class="section-title">Your subscriptions 🔁</div>
-    ${state.subscriptions.map(subscriptionCard).join('')}` : ''}`;
+    ${state.subscriptions.map(subscriptionCard).join('')}` : ''}
+  ${state.basket ? '<div style="height:76px"></div>' : ''}
+  ${basketBar()}
+  ${basketSwitchSheet()}`;
 }
 
-// One search hit: the product, which shop has it, how far, how much.
+// One search hit, two actions: ADD drops the product straight into the basket,
+// the store chip walks you into the shop it lives in.
 function productRow(r) {
+  const qty = basketQty(r.storeId, r.itemId);
   return `
-  <div class="card" onclick="openShopFront('${r.storeId}')" style="cursor:pointer">
+  <div class="card">
     <div class="row">
       ${r.photo ? `<img src="${esc(r.photo)}" alt="" style="width:48px;height:48px;object-fit:cover;border-radius:10px" />` : ''}
       <div class="grow">
         <div style="font-weight:800">${esc(r.name)}</div>
-        <div class="muted small">
-          ${r.storeIcon} ${esc(r.storeName)}${r.distanceKm !== null ? ` · ${r.distanceKm} km` : ''}${r.storeOpen ? '' : ' · closed'}
-        </div>
+        <div class="small"><b>${money(r.price)}</b> <span class="muted">per ${esc(r.unit === 'each' ? 'pc' : r.unit)}</span>${
+          r.subscribePrice ? ` <span class="muted">· 🔁 ${money(r.subscribePrice)} for subscribers</span>` : ''}</div>
         ${r.lowStock ? `<div class="muted small" style="color:#fbbf24">only a few left</div>` : ''}
+        <button class="link small" style="margin-top:4px" onclick="openShopFront('${r.storeId}')">
+          ${r.storeIcon} ${esc(r.storeName)}${r.distanceKm !== null ? ` · ${r.distanceKm} km` : ''}${r.storeOpen ? '' : ' · closed'} ›
+        </button>
       </div>
-      <div style="text-align:right">
-        <div style="font-weight:900">${money(r.price)}</div>
-        <div class="muted small">per ${esc(r.unit === 'each' ? 'pc' : r.unit)}</div>
-      </div>
+      ${r.storeOpen && r.inStock ? qtyControl(qty, 'searchBasketAdd', [r.storeId, r.itemId]) : ''}
     </div>
   </div>`;
 }
@@ -2530,7 +2666,10 @@ function shopOrderCard(o) {
 
 function shopDetailView() {
   const s = state.shop;
-  const cart = state.shopCart || {};
+  // The persistent basket IS the cart — but only when it belongs to this shop.
+  const mine = state.basket && state.basket.store.id === s.store.id ? state.basket : null;
+  const cart = {};
+  if (mine) for (const l of Object.values(mine.items)) cart[l.id] = l.qty;
   const lines = s.items.filter((i) => cart[i.id]);
   const subtotal = lines.reduce((sum, i) => sum + i.price * cart[i.id], 0);
   // Order from the sofa, collect at the counter: pickup skips the delivery fee.
@@ -2547,7 +2686,7 @@ function shopDetailView() {
   </div>
   ${s.items.length ? s.items.map((i) => shopItemRow(i, cart[i.id] || 0)).join('')
     : `<div class="empty"><div class="big">📦</div>This shop has not added items yet.</div>`}
-  <div style="height:${lines.length ? 190 : 70}px"></div>
+  <div style="height:${lines.length ? 190 : state.basket ? 140 : 70}px"></div>
   ${lines.length ? `
   <div class="cartbar">
     ${canDeliver ? `
@@ -2569,7 +2708,8 @@ function shopDetailView() {
       <span class="small" style="font-weight:600">(${money(subtotal)} goods${fee ? ` + ${money(fee)} delivery` : ''}${service ? ` + ${money(service)} fee` : ''})</span>
     </button>
     ${fulfil === 'pickup' ? `<div class="muted small" style="text-align:center;margin-top:6px">Pack it while you walk over — show your code, grab it, go 🏃</div>` : ''}
-  </div>` : ''}`;
+  </div>` : basketBar() /* browsing shop B with a shop-A basket: keep it a tap away */}
+  ${basketSwitchSheet()}`;
 }
 
 function shopItemRow(i, qty) {
@@ -2587,14 +2727,13 @@ function shopItemRow(i, qty) {
         </div>
         ${!i.subscribed && i.subscribePrice ? `
           <button class="link small" style="margin-top:4px" onclick="subscribeItem('${i.id}')">
-            🔁 Subscribe and pay ${money(i.subscribePrice)} — save ${money(saving)}
+            🔁 Subscribe — ${money(i.subscribePrice)} for subscribers, save ${money(saving)}
           </button>` : ''}
+        ${!i.subscribePrice ? (i.subscribeRequested
+          ? `<div class="small" style="margin-top:4px;color:var(--accent)">Requested ✓ — we'll tell you when the shop makes an offer</div>`
+          : `<button class="link small" style="margin-top:4px;color:var(--muted)" onclick="requestSubscription('${i.id}')">🔁 Request a subscriber price</button>`) : ''}
       </div>
-      ${i.inStock ? `
-      <div class="qty">
-        ${qty > 0 ? `<button onclick="shopCartAdd('${i.id}', -1)">−</button><span class="n">${qty}</span>` : ''}
-        <button onclick="shopCartAdd('${i.id}', 1)">+</button>
-      </div>` : ''}
+      ${i.inStock ? qtyControl(qty, 'shopCartAdd', [i.id]) : ''}
     </div>
   </div>`;
 }
@@ -2603,21 +2742,34 @@ window.openShopFront = async (id) => {
   try {
     const data = await api(`/api/stores/${id}`);
     state.shop = data;
-    state.shopCart = {};
     state.shopFulfil = 'pickup';
     state.shopServiceFee = data.serviceFee || 0;
+    // The shelf is authoritative: sync basket snapshots to it (renames, price
+    // changes) and drop lines the shop no longer sells or has run out of.
+    if (state.basket && state.basket.store.id === data.store.id) {
+      for (const l of Object.values(state.basket.items)) {
+        const live = data.items.find((i) => i.id === l.id);
+        if (!live || !live.inStock) delete state.basket.items[l.id];
+        else { l.name = live.name; l.price = live.price; }
+      }
+      if (!Object.keys(state.basket.items).length) state.basket = null;
+    }
     render();
   } catch (e) { toast(e.message, true); }
 };
 
-window.closeShopFront = () => { state.shop = null; state.shopCart = {}; render(); };
+// The basket survives leaving the shop — the floating bar keeps carrying it.
+window.closeShopFront = () => { state.shop = null; render(); };
 
-window.shopCartAdd = (id, delta) => {
-  state.shopCart = state.shopCart || {};
-  const next = (state.shopCart[id] || 0) + delta;
-  if (next <= 0) delete state.shopCart[id];
-  else state.shopCart[id] = next;
-  render();
+window.shopCartAdd = (itemId, delta) => {
+  const s = state.shop;
+  const i = s && s.items.find((x) => x.id === itemId);
+  if (!i) return;
+  basketChange(
+    { id: s.store.id, name: s.store.name, icon: s.store.icon },
+    { id: i.id, name: i.name, price: i.price },
+    delta
+  );
 };
 
 window.setShopPay = (how) => { state.shopPay = how; render(); };
@@ -2633,6 +2785,18 @@ window.subscribeItem = async (itemId) => {
     await openShopFront(state.shop.store.id);
     await loadSubscriptions();
     toast('Subscribed — you now pay the lower price 🔁');
+  } catch (e) { toast(e.message, true); }
+};
+
+// Ask the shop to put a subscriber price on an item that has none yet. The
+// answer comes back over SSE (topic 'subscription') whenever the shop decides.
+window.requestSubscription = async (itemId) => {
+  try {
+    await api(`/api/stores/${state.shop.store.id}/items/${itemId}/subscribe-request`, { method: 'POST' });
+    const item = state.shop.items.find((i) => i.id === itemId);
+    if (item) item.subscribeRequested = true;
+    toast('Asked the shop for a subscriber price 🔁 — we\'ll tell you when they answer.');
+    render();
   } catch (e) { toast(e.message, true); }
 };
 
@@ -2653,8 +2817,8 @@ async function loadSubscriptions() {
 }
 
 window.placeShopOrder = async () => {
-  const cart = state.shopCart || {};
-  const items = Object.entries(cart).map(([itemId, qty]) => ({ itemId, qty }));
+  const mine = state.basket && state.basket.store.id === state.shop.store.id ? state.basket : null;
+  const items = mine ? Object.values(mine.items).map((l) => ({ itemId: l.id, qty: l.qty })) : [];
   if (!items.length) return;
   const canDeliver = (state.shop.store.deliveryFee || 0) > 0;
   const fulfilment = canDeliver && state.shopFulfil === 'delivery' ? 'delivery' : 'pickup';
@@ -2668,7 +2832,7 @@ window.placeShopOrder = async () => {
     const data = await api('/api/store-orders', { method: 'POST', body });
     if (data.user) setUser(data.user);
     state.shop = null;
-    state.shopCart = {};
+    state.basket = null;
     const o = await api('/api/store-orders');
     state.shopOrders = o.orders || [];
     toast(fulfilment === 'pickup' ? 'Order sent — we\'ll tell you when it\'s packed 🏪' : 'Order sent to the shop 🏪');

@@ -8,6 +8,7 @@ const state = {
   authMode: 'login',
   resetToken: '',
   otpLogin: { phone: '', devCode: '' },
+  tab: localStorage.getItem('sewago_driver_tab') || 'drive',
   job: null,
   requests: [],
   delivery: null,
@@ -20,6 +21,10 @@ const state = {
   locationError: '',
   showWithdraw: false,
   showPhoneEdit: false, // re-open the OTP form to change a verified phone
+  showDeleteAccount: false,
+  offlineArm: false,      // first tap of the two-tap "go offline" confirm
+  offersHiddenKey: null,  // "not now" on the offer sheet, until offers change
+  _pageAnim: false,
   _uiKey: null
 };
 
@@ -28,6 +33,13 @@ const TIER_META = {
   car: { label: 'Car', icon: '🚗' },
   xl: { label: 'XL', icon: '🚐' }
 };
+
+const TABS = [
+  { id: 'drive', label: 'Drive', ico: '🛵' },
+  { id: 'earnings', label: 'Earnings', ico: '💰' },
+  { id: 'activity', label: 'Activity', ico: '🧾' },
+  { id: 'profile', label: 'Profile', ico: '👤' }
+];
 
 /* ---------------- helpers ---------------- */
 
@@ -57,6 +69,10 @@ function esc(s) {
 
 function money(n) {
   return 'Rs ' + Number(n).toLocaleString('en-IN');
+}
+
+function when(ts) {
+  return new Date(ts).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 }
 
 let toastTimer;
@@ -442,8 +458,9 @@ window.toggleDeleteAccount = (show) => {
   render();
 };
 
+// No confirm() popup: the inline expansion + password re-entry IS the
+// two-step confirmation.
 window.driverDeleteAccount = async () => {
-  if (!confirm('Delete your SewaGo driver account forever? This cannot be undone.')) return;
   try {
     await api('/api/driver/account/delete', { method: 'POST', body: { password: $('#del-password').value } });
     toast('Your account has been deleted. Goodbye 👋');
@@ -644,78 +661,61 @@ function updateJobMap(job) {
 }
 
 // Re-render only when something structural changes; dynamic bits (driver
-// marker, ETA, progress) are patched in place so the map never flickers.
+// marker, ETA, progress, countdown rings) are patched in place so the map
+// never flickers. Offers and active work overlay every tab, so they live in
+// the base key; per-tab extras are appended so a background poll can never
+// repaint a tab the driver isn't looking at.
 function uiKey() {
   const d = state.driver;
-  return JSON.stringify([
-    !!d, state.authMode, d && d.online, d && d.earnings,
-    d && d.licenseVerified, d && d.phoneVerified, d && d.locationFresh, state.showWithdraw, state.showPhoneEdit,
+  const key = [
+    !!d, state.authMode, state.tab, d && d.online, d && d.mustSettle,
+    d && d.licenseVerified, d && d.phoneVerified, d && d.locationFresh,
     state.job && state.job.id, state.job && state.job.status,
     state.delivery && state.delivery.id, state.delivery && state.delivery.status,
-    state.requests.map((r) => r.id), state.deliveries.map((d) => d.id), state.history.length,
+    state.requests.map((r) => r.id), state.deliveries.map((x) => x.id),
     // A run's progress lives in which stop is next, so that has to be in the key
     // or the poll would never repaint the rider's screen between stops.
-    state.run && state.run.id, state.run && state.run.nextSeq, state.run && state.run.status, state.runOffered
-  ]);
+    state.run && state.run.id, state.run && state.run.nextSeq, state.run && state.run.status, state.runOffered,
+    state.offersHiddenKey
+  ];
+  if (state.tab === 'drive') key.push(state.locationError, state.offlineArm, d && d.commissionOwed);
+  if (state.tab === 'earnings') key.push(d && d.earnings, d && d.commissionOwed, d && d.tripsCompleted, state.showWithdraw, state.history.length);
+  if (state.tab === 'activity') key.push(state.history.map((h) => h.id));
+  if (state.tab === 'profile') key.push(d && d.kycStatus, d && d.kycNote, d && d.phone, state.showPhoneEdit, state.showDeleteAccount);
+  return JSON.stringify(key);
 }
 
-/* ---------------- dashboard ---------------- */
+/* ---------------- shell (tabs + takeover) ---------------- */
 
-function kycCard(d) {
-  // Fully verified drivers don't need this card at all — the dashboard badges
-  // already say it. It only reappears to change the number or fix a rejection.
-  const showPhoneForm = !d.phoneVerified || state.showPhoneEdit;
-  if (!showPhoneForm && d.licenseVerified && !d.kycNote) {
-    return `
-  <div class="card">
-    <div class="row">
-      <div>
-        <div style="font-weight:900">Driver verification</div>
-        <div class="muted small">📱 ${esc(d.phone)} — verified · license approved. You're all set.</div>
-      </div>
-      <span class="badge">APPROVED</span>
-    </div>
-    <button class="btn ghost compact" style="margin-top:12px" onclick="togglePhoneEdit(true)">Change phone number</button>
-  </div>`;
-  }
+// An active job takes over the whole screen — own topbar, no tabbar, one
+// primary action per state — so nothing competes with the road.
+function activeTakeoverView() {
+  if (state.job) return takeoverShell('🚦 ON TRIP', jobCard(state.job));
+  if (state.run && !state.runOffered) return takeoverShell('🛵 ON RUN', runCard(state.run));
+  if (state.delivery) return takeoverShell('🛵 DELIVERING', deliveryCard(state.delivery));
+  return null;
+}
+
+function takeoverShell(badge, body) {
   return `
-  <div class="card">
-    <div class="row">
-      <div>
-        <div style="font-weight:900">Driver verification</div>
-        <div class="muted small">License, phone and GPS are required before going online.</div>
-      </div>
-      <span class="badge ${d.kycStatus === 'approved' ? '' : 'amber'}">${esc((d.kycStatus || 'pending').toUpperCase())}</span>
-    </div>
-    <div class="status-grid" style="margin-top:12px">
-      ${verificationBadge(d)}
-      ${phoneBadge(d)}
-      <span class="badge ${locationFresh(d) ? '' : 'amber'}">${locationFresh(d) ? '📍 GPS LIVE' : '📍 GPS NEEDED'}</span>
-    </div>
-    ${d.kycNote ? `<div class="muted small" style="color:var(--danger);margin-top:8px">${esc(d.kycNote)}</div>` : ''}
-    ${showPhoneForm ? `
-    <label class="field" style="margin-top:12px"><span>Phone</span>
-      <input id="driver-phone" value="${esc(d.phone || '')}" placeholder="e.g. 9841000000" />
-    </label>
-    <div class="grid2">
-      <button class="btn ghost" onclick="driverRequestOtp()">Send OTP</button>
-      <label class="field"><span>OTP code</span><input id="driver-otp" placeholder="123456" /></label>
-    </div>
-    <button class="btn" onclick="driverVerifyOtp()">Verify phone</button>
-    ${state.showPhoneEdit ? `<button class="btn ghost" style="margin-top:8px" onclick="togglePhoneEdit(false)">Cancel</button>` : ''}` : `
-    <div class="muted small" style="margin-top:12px">📱 ${esc(d.phone)} — verified. <button class="link" onclick="togglePhoneEdit(true)">Change</button></div>`}
-  </div>`;
+  <header class="topbar">
+    <div class="brand"><img class="brand-mark" src="/icon.svg" alt="" />Sewa<em>Go</em> <span class="muted" style="font-size:13px;font-weight:700">DRIVER</span></div>
+    <span class="badge">${badge}</span>
+  </header>
+  <main>${body}</main>`;
 }
-
-window.togglePhoneEdit = (show) => {
-  state.showPhoneEdit = show;
-  render();
-};
 
 function render() {
   const app = $('#app');
   if (!state.driver) {
     app.innerHTML = authView();
+    return;
+  }
+  const takeover = activeTakeoverView();
+  if (takeover) {
+    app.innerHTML = takeover;
+    state._uiKey = uiKey();
+    if (state.job) mountJobMap(state.job);
     return;
   }
   const d = state.driver;
@@ -724,118 +724,282 @@ function render() {
       <div class="brand"><img class="brand-mark" src="/icon.svg" alt="" />Sewa<em>Go</em> <span class="muted" style="font-size:13px;font-weight:700">DRIVER</span></div>
       <span class="badge ${d.online ? '' : 'gray'}">${d.online ? '🟢 ONLINE' : '⚫ OFFLINE'}</span>
     </header>
-    <main>
-      <div class="card">
-        <div class="row">
-          <div>
-            <div style="font-size:18px;font-weight:900">${TIER_META[d.tier].icon} ${esc(d.name)}</div>
-            <div class="muted small">${esc(d.vehicle)} · ${esc(d.plate)} · ★ ${d.rating}</div>
-          </div>
-        </div>
-        <div class="status-grid" style="margin-top:12px">
-          ${verificationBadge(d)}
-          ${phoneBadge(d)}
-          <span class="badge ${locationFresh(d) ? '' : 'amber'}">${locationFresh(d) ? '📍 GPS LIVE' : '📍 GPS NEEDED'}</span>
-        </div>
-        <div class="muted small" style="margin-top:8px" id="gps-line">${esc(locationLine(d))}</div>
-        ${state.locationError ? `<div class="muted small" style="color:#fca5a5;margin-top:6px">${esc(state.locationError)}</div>` : ''}
-        <button class="btn ghost" style="margin-top:12px" onclick="updateGps()" ${state.locationBusy ? 'disabled' : ''}>
-          ${state.locationBusy ? 'Reading GPS…' : 'Update live GPS'}
-        </button>
-        <button class="btn ${d.online ? 'danger' : ''}" style="margin-top:8px" onclick="toggleOnline()" ${!d.licenseVerified || !d.phoneVerified || d.mustSettle ? 'disabled' : ''}>
-          ${d.online ? 'Go offline' : 'Go online'}
-        </button>
-        ${d.mustSettle ? `
-        <div class="card" style="margin-top:10px;border:1px solid #b91c1c;background:rgba(185,28,28,0.12)">
-          <div style="font-weight:900;color:#fca5a5">⚠️ Settle to keep driving</div>
-          <div class="muted small" style="margin-top:4px">You owe <b style="color:var(--text)">${money(d.commissionOwed)}</b> in cash-trip commission — over the limit. Pay it at any SewaGo point and you're back online instantly.</div>
-        </div>` : (d.commissionOwed > 0 ? `
-        <div class="muted small" style="margin-top:8px;color:#fbbf24">💵 Cash commission owed: <b>${money(d.commissionOwed)}</b> — settle at a SewaGo point before it hits the limit.</div>` : '')}
-      </div>
-      ${kycCard(d)}
-      <div class="card">
-        <div class="row">
-          <div>
-            <div class="muted small">${d.commissionOwed > 0 ? 'Commission owed' : 'Earnings balance'} <span title="You keep 80% of each fare">(80% of fares)</span></div>
-            <div style="font-size:24px;font-weight:900;color:${d.commissionOwed > 0 ? '#fca5a5' : 'inherit'}">${d.commissionOwed > 0 ? '–' + money(d.commissionOwed) : money(d.earnings)}</div>
-          </div>
-          <div style="text-align:right">
-            <div class="muted small">Trips</div>
-            <div style="font-size:24px;font-weight:900">${d.tripsCompleted}</div>
-          </div>
-        </div>
-        <button class="btn ghost" style="margin-top:12px" onclick="toggleWithdraw()">🏦 Withdraw earnings</button>
-        ${state.showWithdraw ? `
-        <div class="divider"></div>
-        <div class="grid2">
-          <label class="field"><span>Amount (Rs)</span><input id="wd-amount" type="number" placeholder="1000" min="100" /></label>
-          <label class="field"><span>Payout to</span>
-            <select id="wd-channel">
-              <option value="esewa">eSewa</option>
-              <option value="khalti">Khalti</option>
-              <option value="bank">Bank transfer</option>
-            </select>
-          </label>
-        </div>
-        <label class="field"><span>Account / wallet ID</span><input id="wd-account" placeholder="e.g. 9841000000 or account no." /></label>
-        <div class="muted small" style="margin-bottom:10px">Rs 10 payout fee · paid out after SewaGo approves it (usually same day).</div>
-        <button class="btn" onclick="driverWithdraw()">Request payout</button>` : ''}
-      </div>
-      <div id="job-slot">${jobSlot()}</div>
-      ${historySection()}
-      <button class="btn ghost" style="margin-top:8px" onclick="doLogout()">Log out</button>
-      <div class="card" style="margin-top:14px;border-color:#7f1d1d">
-        <div style="font-weight:800">Delete account</div>
-        <div class="muted small" style="margin:6px 0 10px;line-height:1.6">
-          Removes your personal data permanently. Withdraw your earnings and finish any
-          active trip first. <a href="/privacy" target="_blank" class="link">Privacy policy</a>
-        </div>
-        ${state.showDeleteAccount ? `
-        <label class="field"><span>Confirm with your password</span>
-          <input id="del-password" type="password" placeholder="Your password" />
-        </label>
-        <div class="grid2">
-          <button class="btn danger" onclick="driverDeleteAccount()">Delete forever</button>
-          <button class="btn ghost" onclick="toggleDeleteAccount(false)">Keep my account</button>
-        </div>` : `
-        <button class="btn ghost" style="border-color:#7f1d1d;color:#f87171" onclick="toggleDeleteAccount(true)">Delete my account…</button>`}
-      </div>
-    </main>`;
+    <main id="view"></main>
+    <nav class="tabbar">
+      ${TABS.map((t) => `
+        <button class="${state.tab === t.id ? 'active' : ''}" onclick="setTab('${t.id}')">
+          <span class="ico">${t.ico}</span>${t.label}
+        </button>`).join('')}
+    </nav>
+    ${offerSheet()}`;
+  renderTab();
   state._uiKey = uiKey();
-  if (state.job) mountJobMap(state.job);
-  else mountRequestMaps();
+  mountRequestMaps(); // ride-offer minimaps live inside the offer sheet
 }
 
-function jobSlot() {
-  if (state.job) return jobCard(state.job);
-  if (state.run) return state.runOffered ? runOfferCard(state.run) : runCard(state.run);
-  if (state.delivery) return deliveryCard(state.delivery);
-  if (!state.driver.online) {
-    return `<div class="empty"><div class="big">😴</div>You're offline.<br/>Share live GPS and go online to receive ride requests.</div>`;
+function renderTab() {
+  const view = $('#view');
+  if (!view) return;
+  // Glide-in only on real navigation (tab tap) — background re-renders from
+  // polling/SSE must not replay the animation.
+  if (state._pageAnim) {
+    view.classList.add('page-enter');
+    state._pageAnim = false;
   }
-  return requestsSection() + deliveriesSection();
+  if (state.tab === 'earnings') view.innerHTML = earningsView();
+  else if (state.tab === 'activity') view.innerHTML = activityView();
+  else if (state.tab === 'profile') view.innerHTML = profileView();
+  else view.innerHTML = driveView();
+}
+
+window.setTab = async (tab) => {
+  state._pageAnim = state.tab !== tab;
+  state.tab = tab;
+  localStorage.setItem('sewago_driver_tab', tab);
+  // One refresh covers every tab (driver + job + run + offers + history);
+  // a failure still renders the cached state.
+  try { await refresh(); } catch (e) { /* offline — show what we have */ }
+  render();
+};
+
+/* ---------------- Drive tab ---------------- */
+
+function offersCount() {
+  return state.requests.length + state.deliveries.length + (state.run && state.runOffered ? 1 : 0);
+}
+
+// Identity of the currently offered set — "not now" hides the sheet only
+// until this changes, so a fresh offer always resurfaces it.
+function offersKey() {
+  return JSON.stringify([
+    state.requests.map((r) => r.id),
+    state.deliveries.map((x) => x.id),
+    state.run && state.runOffered ? state.run.id : null
+  ]);
+}
+
+function requirementsCard(d) {
+  return `
+  <div class="card">
+    <div style="font-weight:900">Before you can go online</div>
+    <div class="status-grid" style="margin-top:10px">
+      ${verificationBadge(d)}
+      ${phoneBadge(d)}
+    </div>
+    ${d.kycNote ? `<div class="muted small" style="color:var(--danger);margin-top:8px">${esc(d.kycNote)}</div>` : ''}
+    <div class="muted small" style="margin-top:8px">Finish verification in your Profile tab, then come back here.</div>
+    <button class="btn ghost compact" style="margin-top:10px" onclick="setTab('profile')">Open Profile</button>
+  </div>`;
+}
+
+function driveView() {
+  const d = state.driver;
+  const verified = d.licenseVerified && d.phoneVerified;
+  const waiting = offersCount() === 0;
+  const hiddenOffers = offersCount() > 0 && state.offersHiddenKey === offersKey();
+  return `
+    ${d.online ? `
+    <div class="status-strip online">
+      <span class="dot-live"></span>
+      <div class="grow">Online — ${waiting ? 'waiting for requests' : 'offer waiting'}</div>
+      ${state.offlineArm
+        ? `<button class="link" style="color:var(--danger)" onclick="armGoOffline()">Tap again — go offline</button>`
+        : `<button class="link" onclick="armGoOffline()">Go offline</button>`}
+    </div>` : `
+    <div class="status-strip">
+      <span>⚫</span>
+      <div class="grow">You're offline — not receiving requests</div>
+    </div>`}
+    ${!d.online && verified && !d.mustSettle ? `
+    <button class="go-btn" onclick="goOnline()">GO<small>ONLINE</small></button>
+    <div class="muted small" style="text-align:center;margin:-10px 0 16px">One tap — requests start the moment you're on.</div>` : ''}
+    ${!d.online && !verified ? requirementsCard(d) : ''}
+    ${d.mustSettle ? `
+    <div class="card" style="border:1px solid #b91c1c;background:rgba(185,28,28,0.12)">
+      <div style="font-weight:900;color:#fca5a5">⚠️ Settle to keep driving</div>
+      <div class="muted small" style="margin-top:4px">You owe <b style="color:var(--text)">${money(d.commissionOwed)}</b> in cash-trip commission — over the limit. Pay it at any SewaGo point and you're back online instantly.</div>
+      <button class="btn ghost compact" style="margin-top:10px" onclick="setTab('earnings')">See the details</button>
+    </div>` : (d.commissionOwed > 0 ? `
+    <div class="muted small" style="margin:0 2px 12px;color:#fbbf24">💵 Cash commission owed: <b>${money(d.commissionOwed)}</b> — details in Earnings.</div>` : '')}
+    <div class="card">
+      <div class="row">
+        <div style="font-weight:900">Live GPS</div>
+        <span class="badge ${locationFresh(d) ? '' : 'amber'}">${locationFresh(d) ? '📍 GPS LIVE' : '📍 GPS NEEDED'}</span>
+      </div>
+      <div class="muted small" style="margin-top:8px" id="gps-line">${esc(locationLine(d))}</div>
+      ${state.locationError ? `<div class="muted small" style="color:#fca5a5;margin-top:6px">${esc(state.locationError)}</div>` : ''}
+      <button class="btn ghost" style="margin-top:12px" onclick="updateGps()" ${state.locationBusy ? 'disabled' : ''}>
+        ${state.locationBusy ? 'Reading GPS…' : 'Update live GPS'}
+      </button>
+    </div>
+    ${hiddenOffers ? `
+    <button class="btn" onclick="showOffers()">📨 ${offersCount()} offer${offersCount() > 1 ? 's' : ''} waiting — view</button>` : ''}
+    ${d.online && waiting ? `
+    <div class="empty"><div class="big">📡</div>Waiting for requests…<br/>
+      <span class="small">The nearest request is offered to you exclusively — accept or pass.</span></div>` : ''}`;
+}
+
+// Going online is one glorious tap; going offline mid-shift must survive a
+// mistap, so it takes two taps within ~3.5s.
+window.goOnline = () => { setOnline(true); };
+
+let offlineArmTimer = null;
+window.armGoOffline = () => {
+  if (!state.offlineArm) {
+    state.offlineArm = true;
+    clearTimeout(offlineArmTimer);
+    offlineArmTimer = setTimeout(() => {
+      state.offlineArm = false;
+      render();
+    }, 3500);
+    render();
+    return;
+  }
+  clearTimeout(offlineArmTimer);
+  state.offlineArm = false;
+  setOnline(false);
+};
+
+async function setOnline(wantsOnline) {
+  try {
+    if (wantsOnline) {
+      await ensureLocation();
+      startLocationWatch(true);
+    }
+    const data = await api('/api/driver/online', { method: 'POST', body: { online: wantsOnline } });
+    state.driver = data.driver;
+    if (data.driver.online) acquireWakeLock();
+    else {
+      stopLocationWatch();
+      releaseWakeLock();
+    }
+    toast(data.driver.online ? 'You are online — waiting for requests 🟢 Keep this screen on.' : 'You are offline.');
+    await refresh();
+    render();
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+/* ---------------- offer sheet ---------------- */
+/* Every incoming offer — exclusive ride offers, delivery requests, batch
+   run offers — surfaces in ONE full-screen sheet over whatever tab the
+   driver is on: big payout number, ETA + km, countdown ring where an
+   expiry exists, full-width Accept, quiet Pass. */
+
+// Countdown rings tick locally between polls: the server value re-anchors
+// the deadline on every render, the 1s interval animates in between.
+const ringState = { totals: {}, deadlines: {}, iv: null };
+
+function ringTimer(key, secLeft) {
+  const sec = Math.max(0, Math.round(secLeft));
+  // First sight of an offer fixes its total window, so the ring drains from
+  // wherever the offer actually started instead of a hardcoded guess.
+  if (ringState.totals[key] == null) ringState.totals[key] = Math.max(sec, 1);
+  ringState.deadlines[key] = Date.now() + sec * 1000;
+  const pct = Math.max(0, Math.min(100, (sec / ringState.totals[key]) * 100));
+  startRingTick();
+  return `<div class="ring-timer${sec <= 5 ? ' low' : ''}" id="ring-${key}" style="--pct:${pct.toFixed(1)}">${sec}</div>`;
+}
+
+function startRingTick() {
+  if (ringState.iv) return;
+  ringState.iv = setInterval(() => {
+    let live = false;
+    for (const key of Object.keys(ringState.deadlines)) {
+      const el = document.getElementById('ring-' + key);
+      if (!el) { // offer gone from the DOM — forget it
+        delete ringState.deadlines[key];
+        delete ringState.totals[key];
+        continue;
+      }
+      live = true;
+      const sec = Math.max(0, Math.round((ringState.deadlines[key] - Date.now()) / 1000));
+      el.style.setProperty('--pct', String(Math.max(0, Math.min(100, (sec / ringState.totals[key]) * 100))));
+      el.textContent = sec;
+      el.classList.toggle('low', sec <= 5);
+    }
+    if (!live) {
+      clearInterval(ringState.iv);
+      ringState.iv = null;
+    }
+  }, 1000);
+}
+
+function offerSheet() {
+  if (state.job || state.delivery || (state.run && !state.runOffered)) return '';
+  if (offersCount() === 0) return '';
+  if (state.offersHiddenKey === offersKey()) return '';
+  const cards = [
+    ...state.requests.map((r) => rideOfferCard(r)),
+    state.run && state.runOffered ? runOfferCard(state.run) : '',
+    ...state.deliveries.map((del) => deliveryOfferCard(del))
+  ].join('');
+  return `
+  <div class="offer-sheet">
+    ${cards}
+    <button class="link offer-pass" onclick="hideOffers()">Not now — back to the app</button>
+  </div>`;
+}
+
+window.hideOffers = () => {
+  state.offersHiddenKey = offersKey();
+  render();
+};
+
+window.showOffers = () => {
+  state.offersHiddenKey = null;
+  render();
+};
+
+function rideOfferCard(r) {
+  const cash = r.payment === 'cash';
+  return `
+  <div class="card" style="border-color:var(--accent)">
+    <div class="row">
+      <div class="grow">
+        <div class="offer-fare"><em>${money(cash ? r.fare : r.payout)}</em></div>
+        <div class="offer-meta">
+          <span>🕐 <b>~${r.etaToPickupMin} min</b> to pickup</span>
+          <span><b>${r.distanceKm} km</b> trip</span>
+          <span>${cash ? '💵 cash' : '👛 wallet'}</span>
+        </div>
+      </div>
+      ${ringTimer('ride-' + r.id, r.offerExpiresIn ?? 15)}
+    </div>
+    <div style="margin-top:10px">
+      ${r.kind === 'parcel' ? '<span class="badge">📦 PARCEL</span> ' : ''}${r.fareBoost ? `<span class="badge" style="background:#7c2d12;color:#fdba74">⚡ +${money(r.fareBoost)} BOOSTED</span> ` : ''}
+      <b>${esc(r.pickup)} → ${esc(r.dropoff)}</b>
+      <div class="muted small">${esc(r.customerName)}${r.recipientName ? ` → hand to ${esc(r.recipientName)}` : ''}</div>
+    </div>
+    <div class="small" style="margin-top:6px;color:var(--accent);font-weight:800">
+      ${cash ? `collect ${money(r.fare)} cash · ${money(r.fare - r.payout)} commission` : `you earn ${money(r.payout)}`}
+    </div>
+    ${r.pickupLoc && r.dropoffLoc ? `<div id="request-map-${r.id}" class="ride-map request-map">${mapPreview(r)}</div>` : ''}
+    <button class="btn" style="margin-top:12px" onclick="acceptRide('${r.id}')">Accept ride</button>
+    <button class="link offer-pass" onclick="declineRide('${r.id}')">Pass — offer it to the next driver</button>
+  </div>`;
+}
+
+function deliveryOfferCard(del) {
+  return `
+  <div class="card" style="border-color:var(--accent)">
+    <div class="offer-fare"><em>${money(del.payout)}</em></div>
+    <div class="offer-meta">
+      ${del.etaToPickupMin != null ? `<span>🕐 <b>~${del.etaToPickupMin} min</b> to pickup</span>` : ''}
+      ${del.routeKm != null ? `<span><b>${del.routeKm} km</b></span>` : ''}
+      <span>${del.items} item${del.items > 1 ? 's' : ''}</span>
+    </div>
+    <div style="margin-top:10px">
+      <b>${del.restaurantIcon || '🍽️'} ${esc(del.restaurantName)} → ${esc(del.dropoffName)}</b>
+      <div class="muted small">requested ${del.secondsAgo}s ago</div>
+    </div>
+    ${del.collectCash ? `<div class="small" style="margin-top:6px;color:#fbbf24;font-weight:800">💵 collect ${money(del.collectCash)} at the door</div>` : ''}
+    <button class="btn" style="margin-top:12px" onclick="acceptDelivery('${del.id}')">Accept delivery</button>
+  </div>`;
 }
 
 /* ---------------- food deliveries (bike couriers) ---------------- */
-
-function deliveriesSection() {
-  if (state.driver.tier !== 'bike' || state.deliveries.length === 0) return '';
-  return `<div class="section-title">Delivery requests 🍜</div>` + state.deliveries.map((d) => `
-    <div class="card">
-      <div class="row">
-        <div>
-          <div><b>${d.restaurantIcon || '🍽️'} ${esc(d.restaurantName)} → ${esc(d.dropoffName)}</b></div>
-          <div class="muted small">${d.items} item${d.items > 1 ? 's' : ''} · ${d.routeKm != null ? d.routeKm + ' km · ' : ''}${d.secondsAgo}s ago</div>
-          ${d.etaToPickupMin != null ? `<div class="small" style="margin-top:2px">🕐 restaurant is ~${d.etaToPickupMin} min from your live GPS</div>` : ''}
-        </div>
-        <div style="text-align:right">
-          <div class="small" style="color:var(--accent);font-weight:800">you earn ${money(d.payout)}</div>
-          ${d.collectCash ? `<div class="small" style="color:#fbbf24;font-weight:800">💵 collect ${money(d.collectCash)}</div>` : ''}
-        </div>
-      </div>
-      <button class="btn" style="margin-top:12px" onclick="acceptDelivery('${d.id}')">Accept delivery</button>
-    </div>`).join('');
-}
 
 function deliveryCard(d) {
   const atRestaurant = d.status === 'preparing';
@@ -903,35 +1067,6 @@ window.completeDelivery = async (id) => {
   }
 };
 
-function requestsSection() {
-  if (state.requests.length === 0) {
-    return `<div class="empty"><div class="big">📡</div>Waiting for ride requests…<br/>
-      <span class="small">The nearest request is offered to you exclusively — accept or pass.</span></div>`;
-  }
-  return `<div class="section-title">Your offer 📡</div>` + state.requests.map((r) => `
-    <div class="card" style="border-color:var(--accent)">
-      <div class="row">
-        <div>
-          <div>${r.kind === 'parcel' ? '<span class="badge">📦 PARCEL</span> ' : ''}${r.fareBoost ? `<span class="badge" style="background:#7c2d12;color:#fdba74">⚡ +${money(r.fareBoost)} BOOSTED</span> ` : ''}<b>${esc(r.pickup)} → ${esc(r.dropoff)}</b></div>
-          <div class="muted small">${esc(r.customerName)}${r.recipientName ? ` → hand to ${esc(r.recipientName)}` : ''} · ${r.distanceKm} km</div>
-          <div class="small" style="margin-top:2px">🕐 pickup is ~${r.etaToPickupMin} min from your live GPS</div>
-        </div>
-        <div style="text-align:right">
-          <div><b>${money(r.fare)}</b> ${r.payment === 'cash' ? '💵' : '👛'}</div>
-          <div class="small" style="color:var(--accent);font-weight:800">
-            ${r.payment === 'cash' ? `collect cash · ${money(r.fare - r.payout)} fee` : `you earn ${money(r.payout)}`}
-          </div>
-        </div>
-      </div>
-      <div class="muted small" style="margin-top:6px">⏳ Reserved for you ~${r.offerExpiresIn ?? 15}s — then it goes to the next driver.</div>
-      ${r.pickupLoc && r.dropoffLoc ? `<div id="request-map-${r.id}" class="ride-map request-map">${mapPreview(r)}</div>` : ''}
-      <div class="grid2" style="margin-top:12px">
-        <button class="btn" onclick="acceptRide('${r.id}')">Accept</button>
-        <button class="btn ghost" onclick="declineRide('${r.id}')">Pass</button>
-      </div>
-    </div>`).join('');
-}
-
 window.declineRide = async (id) => {
   try {
     await api(`/api/driver/rides/${id}/decline`, { method: 'POST' });
@@ -989,14 +1124,91 @@ function jobCard(job) {
   </div>`;
 }
 
-function historySection() {
+/* ---------------- Earnings tab ---------------- */
+
+function earningsView() {
+  const d = state.driver;
+  const owes = d.commissionOwed > 0;
+  return `
+  <div class="section-title">Earnings 💰</div>
+  ${owes ? `
+  <div class="card" style="border-color:${d.mustSettle ? '#b91c1c' : 'rgba(251,191,36,0.4)'}">
+    <div class="row">
+      <div>
+        <div class="muted small">Cash commission owed</div>
+        <div style="font-size:28px;font-weight:900;color:#fca5a5">–${money(d.commissionOwed)}</div>
+      </div>
+      <div style="text-align:right">
+        <div class="muted small">Trips</div>
+        <div style="font-size:28px;font-weight:900">${d.tripsCompleted}</div>
+      </div>
+    </div>
+    <div class="muted small" style="margin-top:10px;line-height:1.6">
+      On cash trips you keep the whole fare in hand, so SewaGo's commission
+      builds up here. Settle it in cash at any SewaGo point${d.mustSettle
+        ? ' — <b style="color:#fca5a5">you are over the limit and offline until you do</b>.'
+        : ' before it hits the limit.'}
+    </div>
+  </div>` : `
+  <div class="card">
+    <div class="row">
+      <div>
+        <div class="muted small">Balance <span title="You keep 80% of each fare">(80% of fares)</span></div>
+        <div style="font-size:28px;font-weight:900;color:var(--accent)">${money(d.earnings)}</div>
+      </div>
+      <div style="text-align:right">
+        <div class="muted small">Trips</div>
+        <div style="font-size:28px;font-weight:900">${d.tripsCompleted}</div>
+      </div>
+    </div>
+    ${state.showWithdraw ? `
+    <div class="inline-form">
+      <span>Rs 10 payout fee · paid out after SewaGo approves it (usually same day).</span>
+      <input id="wd-amount" type="number" placeholder="Amount (Rs)" min="100" />
+      <select id="wd-channel">
+        <option value="esewa">eSewa</option>
+        <option value="khalti">Khalti</option>
+        <option value="bank">Bank transfer</option>
+      </select>
+      <input id="wd-account" placeholder="Account / wallet ID" />
+      <button class="btn" onclick="driverWithdraw()">Request payout</button>
+      <button class="btn ghost" onclick="toggleWithdraw()">Cancel</button>
+    </div>` : `
+    <button class="btn ghost" style="margin-top:12px" onclick="toggleWithdraw()">🏦 Withdraw earnings</button>`}
+  </div>`}
+  ${payoutFeed()}`;
+}
+
+// Compact money-in feed (the Activity tab has the full trip cards).
+function payoutFeed() {
   if (state.history.length === 0) return '';
-  return `<div class="section-title">Recent trips 🧾</div>` + state.history.map((h) => `
+  return `<div class="section-title">Recent trip payouts 🧾</div>
+  <div class="card">
+    ${state.history.map((h, i) => `
+    <div class="row" style="padding:8px 0;${i === state.history.length - 1 ? '' : 'border-bottom:1px solid var(--border)'}">
+      <div class="grow">
+        <div style="font-weight:700;font-size:13px">${esc(h.pickup)} → ${esc(h.dropoff)}</div>
+        <div class="muted small">${when(h.completedAt)} · fare ${money(h.fare)}</div>
+      </div>
+      <div style="color:var(--accent);font-weight:900">+${money(h.payout)}</div>
+    </div>`).join('')}
+  </div>`;
+}
+
+/* ---------------- Activity tab ---------------- */
+
+function activityView() {
+  if (state.history.length === 0) {
+    return `<div class="section-title">Your trips 🧾</div>
+    <div class="empty"><div class="big">🧾</div>No completed trips yet.<br/>
+      <span class="small">Finished rides, parcels and deliveries land here.</span></div>`;
+  }
+  return `<div class="section-title">Your trips 🧾</div>` + state.history.map((h) => `
     <div class="card">
       <div class="row">
         <div>
           <div><b>${esc(h.pickup)} → ${esc(h.dropoff)}</b></div>
-          <div class="muted small">${new Date(h.completedAt).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}${h.rating ? ' · ' + '⭐'.repeat(h.rating) : ''}</div>
+          <div class="muted small">${when(h.completedAt)}${h.rating ? ' · ' + '⭐'.repeat(h.rating) : ''}</div>
         </div>
         <div style="text-align:right">
           <div style="color:var(--accent);font-weight:900">+${money(h.payout)}</div>
@@ -1004,6 +1216,97 @@ function historySection() {
         </div>
       </div>
     </div>`).join('');
+}
+
+/* ---------------- Profile tab ---------------- */
+
+function kycCard(d) {
+  // Fully verified drivers don't need this card at all — the dashboard badges
+  // already say it. It only reappears to change the number or fix a rejection.
+  const showPhoneForm = !d.phoneVerified || state.showPhoneEdit;
+  if (!showPhoneForm && d.licenseVerified && !d.kycNote) {
+    return `
+  <div class="card">
+    <div class="row">
+      <div>
+        <div style="font-weight:900">Driver verification</div>
+        <div class="muted small">📱 ${esc(d.phone)} — verified · license approved. You're all set.</div>
+      </div>
+      <span class="badge">APPROVED</span>
+    </div>
+    <button class="btn ghost compact" style="margin-top:12px" onclick="togglePhoneEdit(true)">Change phone number</button>
+  </div>`;
+  }
+  return `
+  <div class="card">
+    <div class="row">
+      <div>
+        <div style="font-weight:900">Driver verification</div>
+        <div class="muted small">License, phone and GPS are required before going online.</div>
+      </div>
+      <span class="badge ${d.kycStatus === 'approved' ? '' : 'amber'}">${esc((d.kycStatus || 'pending').toUpperCase())}</span>
+    </div>
+    <div class="status-grid" style="margin-top:12px">
+      ${verificationBadge(d)}
+      ${phoneBadge(d)}
+      <span class="badge ${locationFresh(d) ? '' : 'amber'}">${locationFresh(d) ? '📍 GPS LIVE' : '📍 GPS NEEDED'}</span>
+    </div>
+    ${d.kycNote ? `<div class="muted small" style="color:var(--danger);margin-top:8px">${esc(d.kycNote)}</div>` : ''}
+    ${showPhoneForm ? `
+    <label class="field" style="margin-top:12px"><span>Phone</span>
+      <input id="driver-phone" value="${esc(d.phone || '')}" placeholder="e.g. 9841000000" />
+    </label>
+    <div class="grid2">
+      <button class="btn ghost" onclick="driverRequestOtp()">Send OTP</button>
+      <label class="field"><span>OTP code</span><input id="driver-otp" placeholder="123456" /></label>
+    </div>
+    <button class="btn" onclick="driverVerifyOtp()">Verify phone</button>
+    ${state.showPhoneEdit ? `<button class="btn ghost" style="margin-top:8px" onclick="togglePhoneEdit(false)">Cancel</button>` : ''}` : `
+    <div class="muted small" style="margin-top:12px">📱 ${esc(d.phone)} — verified. <button class="link" onclick="togglePhoneEdit(true)">Change</button></div>`}
+  </div>`;
+}
+
+window.togglePhoneEdit = (show) => {
+  state.showPhoneEdit = show;
+  render();
+};
+
+function profileView() {
+  const d = state.driver;
+  return `
+  <div class="section-title">Profile 👤</div>
+  <div class="card">
+    <div class="row">
+      <div>
+        <div style="font-size:18px;font-weight:900">${TIER_META[d.tier].icon} ${esc(d.name)}</div>
+        <div class="muted small">${esc(d.vehicle)} · ${esc(d.plate)} · ★ ${d.rating}</div>
+      </div>
+      <span class="badge ${d.online ? '' : 'gray'}">${d.online ? '🟢 ONLINE' : '⚫ OFFLINE'}</span>
+    </div>
+    <div class="status-grid" style="margin-top:12px">
+      ${verificationBadge(d)}
+      ${phoneBadge(d)}
+    </div>
+    <div class="muted small" style="margin-top:8px">${esc(d.email)}</div>
+  </div>
+  ${kycCard(d)}
+  <button class="btn ghost" style="margin-top:8px" onclick="doLogout()">Log out</button>
+  <div class="card" style="margin-top:14px;border-color:#7f1d1d">
+    <div style="font-weight:800">Delete account</div>
+    <div class="muted small" style="margin:6px 0 10px;line-height:1.6">
+      Removes your personal data permanently. Withdraw your earnings and finish any
+      active trip first. <a href="/privacy" target="_blank" class="link">Privacy policy</a>
+    </div>
+    ${state.showDeleteAccount ? `
+    <label class="field"><span>Confirm with your password</span>
+      <input id="del-password" type="password" placeholder="Your password" />
+    </label>
+    <div class="grid2">
+      <button class="btn danger" onclick="driverDeleteAccount()">Delete forever</button>
+      <button class="btn ghost" onclick="toggleDeleteAccount(false)">Keep my account</button>
+    </div>` : `
+    <button class="btn ghost" style="border-color:#7f1d1d;color:#f87171" onclick="toggleDeleteAccount(true)">Delete my account…</button>`}
+  </div>`;
 }
 
 /* ---------------- actions ---------------- */
@@ -1103,27 +1406,6 @@ window.updateGps = async () => {
   }
 };
 
-window.toggleOnline = async () => {
-  try {
-    if (!state.driver.online) {
-      await ensureLocation();
-      startLocationWatch(true);
-    }
-    const data = await api('/api/driver/online', { method: 'POST', body: { online: !state.driver.online } });
-    state.driver = data.driver;
-    if (data.driver.online) acquireWakeLock();
-    else {
-      stopLocationWatch();
-      releaseWakeLock();
-    }
-    toast(data.driver.online ? 'You are online — waiting for requests 🟢 Keep this screen on.' : 'You are offline.');
-    await refresh();
-    render();
-  } catch (e) {
-    toast(e.message, true);
-  }
-};
-
 window.acceptRide = async (id) => {
   try {
     const data = await api(`/api/driver/rides/${id}/accept`, { method: 'POST' });
@@ -1192,7 +1474,14 @@ function connectEvents() {
   if (!state.token || typeof EventSource === 'undefined') return;
   disconnectEvents();
   sseSource = new EventSource('/api/events?role=driver&token=' + encodeURIComponent(state.token));
-  sseSource.onmessage = () => { syncDriverUI().catch(() => {}); };
+  sseSource.onmessage = (ev) => {
+    let msg = {};
+    try { msg = JSON.parse(ev.data); } catch (e) { /* bare nudge — still refresh */ }
+    // A fresh batch-run offer must surface instantly (its window is ~50s):
+    // un-hide the offer sheet even if the driver dismissed an earlier set.
+    if (msg.topic === 'run_offer') state.offersHiddenKey = null;
+    syncDriverUI().catch(() => {});
+  };
 }
 function disconnectEvents() {
   if (sseSource) { sseSource.close(); sseSource = null; }
@@ -1204,9 +1493,9 @@ let idleTicks = 0;
 setInterval(() => {
   if (!state.driver) return;
   // Active trip/delivery: fast tick for smooth animation. A visible offer also
-  // ticks fast — it expires in ~15s, so the card must clear promptly if it
-  // moves to the next driver.
-  if (state.job || state.delivery || state.requests.length) {
+  // ticks fast — ride offers expire in ~15s and run offers in ~50s, so the
+  // sheet must clear promptly if the offer moves to the next driver.
+  if (state.job || state.delivery || state.requests.length || (state.run && state.runOffered)) {
     idleTicks = 0;
     syncDriverUI().catch(() => {});
   } else if (++idleTicks >= 10) {
@@ -1218,6 +1507,7 @@ setInterval(() => {
 /* ---------------- boot ---------------- */
 
 (async function boot() {
+  if (!TABS.some((t) => t.id === state.tab)) state.tab = 'drive';
   if (state.token) {
     try {
       await refresh();
@@ -1267,25 +1557,40 @@ function runStopLine(s, isNext) {
   </div>`;
 }
 
+// Offer-sheet card for a batch run: total payout up top, then the whole
+// stop list as P1 P2 … D1 D2 pills so the rider can judge the loop.
 function runOfferCard(run) {
+  let pickups = 0;
+  let drops = 0;
+  const stops = run.stops.map((s) => {
+    const tag = s.type === 'pickup' ? 'P' + (++pickups) : 'D' + (++drops);
+    return `
+    <div class="stop">
+      <span class="stop-tag${s.type === 'pickup' ? '' : ' drop'}">${tag}</span>
+      <span class="grow">${esc(s.name)}</span>
+      <span class="muted small">${s.type === 'pickup'
+        ? `${s.orders} order${s.orders > 1 ? 's' : ''}`
+        : (s.cash ? `${money(s.cash)} cash` : 'deliver')}</span>
+    </div>`;
+  }).join('');
   return `
-  <div class="section-title">Delivery run offered 🛵</div>
   <div class="card" style="border-color:var(--accent)">
     <div class="row">
       <div class="grow">
-        <div style="font-weight:900;font-size:17px">${run.orders} orders · ${run.stops.length} stops</div>
-        <div class="muted small">${run.pickups} shop${run.pickups > 1 ? 's' : ''} → ${run.dropoffs} customer${run.dropoffs > 1 ? 's' : ''} · ${run.distanceKm} km</div>
+        <div class="offer-fare"><em>${money(run.payout)}</em></div>
+        <div class="offer-meta">
+          <span><b>${run.orders}</b> orders</span>
+          <span><b>${run.stops.length}</b> stops</span>
+          <span><b>${run.distanceKm} km</b></span>
+        </div>
       </div>
-      <div style="text-align:right">
-        <div style="font-size:20px;font-weight:900;color:var(--accent)">${money(run.payout)}</div>
-        ${run.expiresInSec != null ? `<div class="muted small">${run.expiresInSec}s to decide</div>` : ''}
-      </div>
+      ${run.expiresInSec != null ? ringTimer('run-' + run.id, run.expiresInSec) : ''}
     </div>
-    ${run.cashToCollect ? `<div class="muted small" style="margin-top:8px;color:#fbbf24">💵 You will collect ${money(run.cashToCollect)} in cash across this run.</div>` : ''}
-    <div class="divider"></div>
-    ${run.stops.map((s) => runStopLine(s, false)).join('')}
+    <div class="muted small" style="margin-top:6px">${run.pickups} shop${run.pickups > 1 ? 's' : ''} → ${run.dropoffs} customer${run.dropoffs > 1 ? 's' : ''}</div>
+    ${run.cashToCollect ? `<div class="small" style="margin-top:6px;color:#fbbf24;font-weight:800">💵 You will collect ${money(run.cashToCollect)} in cash across this run.</div>` : ''}
+    <div class="offer-stops">${stops}</div>
     <button class="btn" style="margin-top:12px" onclick="acceptRun('${run.id}')">Accept run · ${money(run.payout)}</button>
-    <button class="btn ghost" style="margin-top:8px" onclick="declineRun('${run.id}')">Pass</button>
+    <button class="link offer-pass" onclick="declineRun('${run.id}')">Pass — it goes to another rider</button>
   </div>`;
 }
 

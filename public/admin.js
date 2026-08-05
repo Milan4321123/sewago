@@ -1,16 +1,37 @@
-/* SewaGo Admin — platform control room: live ops, reviews, payments, partners */
+/* SewaGo Admin — platform control room: overview, live ops, approvals, money, people */
 
 const $ = (sel) => document.querySelector(sel);
+
+const TABS = [
+  { id: 'overview', label: 'Overview', ico: '📊' },
+  { id: 'live', label: 'Live', ico: '🗺️' },
+  { id: 'approvals', label: 'Approvals', ico: '✅' },
+  { id: 'money', label: 'Money', ico: '💸' },
+  { id: 'people', label: 'People', ico: '👥' }
+];
+
+// Old pill-row tab ids may still be sitting in localStorage from before the
+// restructure — map them onto the tab that absorbed them.
+const LEGACY_TABS = { reviews: 'approvals', payments: 'money', partners: 'approvals' };
+
+function normalizeTab(t) {
+  t = LEGACY_TABS[t] || t;
+  return TABS.some((x) => x.id === t) ? t : 'live';
+}
 
 const state = {
   token: localStorage.getItem('sewago_admin_token'),
   loggedIn: false,
-  tab: localStorage.getItem('sewago_admin_tab') || 'live',
+  tab: normalizeTab(localStorage.getItem('sewago_admin_tab')),
   stats: null,
   live: null,
-  queue: { restaurants: [], hotels: [] },
+  queue: { restaurants: [], hotels: [], stores: [] },
   partners: [],
+  pendingDrivers: [],
   payments: { pendingWithdrawals: [], stats: {}, revenue: {}, ledger: [] },
+  approvalOpen: null, // 'kind:id' of the expanded approvals-inbox row
+  inlineOpen: null,   // key of the one open .inline-form on the People tab
+  ledgerShown: 15,    // Money tab ledger rows currently visible ("show more")
   liveTimer: null
 };
 
@@ -47,7 +68,8 @@ function money(n) {
 function ago(sec) {
   if (sec < 60) return sec + 's';
   if (sec < 3600) return Math.floor(sec / 60) + 'm ' + (sec % 60) + 's';
-  return Math.floor(sec / 3600) + 'h ' + Math.floor((sec % 3600) / 60) + 'm';
+  if (sec < 172800) return Math.floor(sec / 3600) + 'h ' + Math.floor((sec % 3600) / 60) + 'm';
+  return Math.floor(sec / 86400) + 'd ' + Math.floor((sec % 86400) / 3600) + 'h';
 }
 
 function fmtTime(ts) {
@@ -65,26 +87,44 @@ function toast(msg, isError = false) {
 
 /* ---------------- data ---------------- */
 
-// Core data behind badges + the Overview/Reviews/Payments/Partners tabs.
+// Core data behind badges + the Overview/Approvals/Money tabs.
 async function loadCore() {
-  const [o, q, p, pay] = await Promise.all([
+  const [o, q, p, pay, ppl] = await Promise.all([
     api('/api/admin/overview'),
     api('/api/admin/queue'),
     api('/api/admin/partners'),
-    api('/api/admin/payments')
+    api('/api/admin/payments'),
+    api('/api/admin/people?q=') // newest signups → pending driver licenses for the inbox
   ]);
   state.stats = o.stats;
   state.revenueTrend = o.revenueTrend || [];
   state.reconciliation = o.reconciliation || null;
-  state.queue = q;
+  state.queue = {
+    restaurants: q.restaurants || [],
+    hotels: q.hotels || [],
+    stores: q.stores || []
+  };
   state.partners = p.partners;
   state.payments = pay;
+  // Licenses awaiting a manual decision (drivers self-verify at signup, so
+  // these are the rare flagged/rejected-and-resubmitted cases).
+  state.pendingDrivers = (ppl.drivers || []).filter((d) => d.verificationStatus === 'pending');
+  // Seed the People tab with the newest-signups feed so a persisted 'people'
+  // tab never boots blank (a search replaces it with the queried result).
+  if (!state.people && !state.peopleQuery) state.people = ppl;
   state.loggedIn = true;
 }
 
 async function loadLive() {
   state.live = await api('/api/admin/live');
   state.loggedIn = true;
+}
+
+// Any approve/reject touches data shown on several tabs (inbox badge, people
+// rows, payout pipeline) — refresh both feeds so whichever tab is open is true.
+async function reloadAfterAction() {
+  await Promise.all([loadCore(), loadPeople(state.peopleQuery || '')]);
+  renderMain();
 }
 
 /* ---------------- live ops ---------------- */
@@ -294,8 +334,8 @@ function refreshLiveDom() {
   if (lists) lists.innerHTML = liveListsHtml(data);
   const upd = document.getElementById('live-updated');
   if (upd) upd.textContent = 'Auto-refreshing · updated ' + fmtTime(Date.parse(data.serverTime));
-  const tabs = document.getElementById('admin-tabs-slot');
-  if (tabs) tabs.innerHTML = tabsBar();
+  const tabs = document.getElementById('admin-tabbar');
+  if (tabs) tabs.innerHTML = tabbarButtons();
   updateLiveMap(data);
 }
 
@@ -398,143 +438,61 @@ function overviewView() {
   </div>`;
 }
 
-/* ---------------- people (customers + drivers) ---------------- */
+/* ---------------- approvals inbox ---------------- */
+/* One queue for everything that waits on a human decision: listing reviews
+   (restaurants, hotels, kirana shops), partner business KYC, driver license
+   verifications and payout approvals. Oldest first, expandable in place. */
 
-async function loadPeople(q) {
-  state.people = await api('/api/admin/people?q=' + encodeURIComponent(q || ''));
-  state.loggedIn = true;
+function pendingKycPartners() {
+  return state.partners.filter((p) =>
+    (p.businessKycStatus || 'pending') === 'pending' &&
+    p.businessKycDocumentRef && p.businessKycDocumentRef !== '—');
 }
 
-function userRow(u) {
-  return `
-  <div class="card" style="margin-top:10px">
-    <div class="list-row" style="border:none;padding:0">
-      <div>
-        <b>${esc(u.name)}</b> ${u.suspended ? '<span class="tab-badge" style="background:#b91c1c">SUSPENDED</span>' : ''}
-        <div class="muted small">📧 ${esc(u.email)} · 📞 ${esc(u.phone)} ${u.phoneVerified ? '✓' : '⚠️'}</div>
-      </div>
-      <div class="rt"><b>${money(u.wallet)}</b><div class="muted small">wallet</div></div>
-    </div>
-    <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
-      <button class="btn ghost compact" onclick="adjustWallet('${u.id}', 1)">➕ Credit</button>
-      <button class="btn ghost compact" onclick="adjustWallet('${u.id}', -1)">➖ Debit</button>
-      ${u.suspended
-        ? `<button class="btn ghost compact" onclick="suspendPerson('users','${u.id}','unsuspend')">✓ Reinstate</button>`
-        : `<button class="btn ghost compact danger" onclick="suspendPerson('users','${u.id}','suspend')">⛔ Suspend</button>`}
-    </div>
-  </div>`;
+// Flatten every pending decision into one age-sorted list. Rows whose source
+// doesn't expose a submission time (KYC, licenses) sink to the bottom.
+function approvalItems() {
+  const items = [];
+  state.queue.restaurants.forEach((r) => items.push({
+    kind: 'restaurants', id: r.id, emoji: r.icon || '🍽️', title: esc(r.name),
+    sub: `Restaurant · ${esc(r.cuisine)} · ${r.menu.length} menu item${r.menu.length === 1 ? '' : 's'}`,
+    at: r.submittedAt || 0, data: r
+  }));
+  state.queue.hotels.forEach((h) => items.push({
+    kind: 'hotels', id: h.id, emoji: h.icon || '🏨', title: esc(h.name),
+    sub: `Hotel · ${esc(h.area)}${h.area ? ', ' : ''}${esc(h.city)} · ${h.rooms.length} room type${h.rooms.length === 1 ? '' : 's'}`,
+    at: h.submittedAt || 0, data: h
+  }));
+  state.queue.stores.forEach((s) => items.push({
+    kind: 'stores', id: s.id, emoji: s.icon || '🏪', title: esc(s.name),
+    sub: `Kirana shop · ${esc(s.area || '—')} · ${s.itemCount} item${s.itemCount === 1 ? '' : 's'} listed`,
+    at: s.submittedAt || 0, data: s
+  }));
+  pendingKycPartners().forEach((p) => items.push({
+    kind: 'kyc', id: p.id, emoji: '🧾', title: esc(p.name),
+    sub: `Business KYC · Reg/PAN ${esc(p.regNo)}`,
+    at: 0, data: p
+  }));
+  state.pendingDrivers.forEach((d) => items.push({
+    kind: 'license', id: d.id, emoji: '🪪', title: esc(d.name),
+    sub: `Driver license · ${esc(d.tier)} · ${esc(d.plate || '—')}`,
+    at: 0, data: d
+  }));
+  state.payments.pendingWithdrawals.forEach((w) => items.push({
+    kind: 'payout', id: w.id, emoji: '🏦', title: esc(w.ownerName),
+    sub: `Payout · ${money(w.amount)} + ${money(w.fee)} fee → ${esc(w.channelLabel)}`,
+    at: w.createdAt || 0, data: w
+  }));
+  return items.sort((a, b) => (a.at || Infinity) - (b.at || Infinity));
 }
 
-function driverRow(d) {
-  const ver = d.verificationStatus;
-  return `
-  <div class="card" style="margin-top:10px">
-    <div class="list-row" style="border:none;padding:0">
-      <div>
-        <b>${esc(d.name)}</b>
-        <span class="muted small">· ${esc(d.tier)} · ${esc(d.vehicle || '—')} · ${esc(d.plate || '—')}</span>
-        ${d.suspended ? '<span class="tab-badge" style="background:#b91c1c">SUSPENDED</span>' : ''}
-        <div class="muted small">
-          ${d.online ? '🟢 online' : '⚪ offline'}${d.online && !d.locationFresh ? ' (GPS stale)' : ''}
-          · ⭐ ${d.rating || '—'} · ${d.tripsCompleted} trips
-          · license: <b style="color:${ver === 'verified' ? 'var(--accent)' : ver === 'rejected' ? '#f87171' : '#fbbf24'}">${esc(ver.toUpperCase())}</b>
-        </div>
-      </div>
-      <div class="rt">
-        ${d.commissionOwed > 0
-          ? `<b style="color:#f87171">–${money(d.commissionOwed)}</b><div class="muted small">owes SewaGo</div>`
-          : `<b>${money(d.earnings)}</b><div class="muted small">earnings</div>`}
-      </div>
-    </div>
-    <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
-      ${d.commissionOwed > 0 ? `<button class="btn compact" onclick="settleDriverCash('${d.id}', ${d.commissionOwed})">💵 Record cash settlement</button>` : ''}
-      ${ver !== 'verified' ? `<button class="btn ghost compact" onclick="decideDriverVerification('${d.id}','approve')">✓ Approve license</button>` : ''}
-      ${ver !== 'rejected' ? `<button class="btn ghost compact danger" onclick="decideDriverVerification('${d.id}','reject')">✕ Reject license</button>` : ''}
-      ${d.suspended
-        ? `<button class="btn ghost compact" onclick="suspendPerson('drivers','${d.id}','unsuspend')">✓ Reinstate</button>`
-        : `<button class="btn ghost compact danger" onclick="suspendPerson('drivers','${d.id}','suspend')">⛔ Suspend</button>`}
-    </div>
-  </div>`;
+// Age chip that heats up as an item sits unhandled: amber after 6h, red after 24h.
+function ageChip(ts) {
+  if (!ts) return '<span class="age">—</span>';
+  const sec = Math.max(0, Math.round((Date.now() - ts) / 1000));
+  const cls = sec >= 24 * 3600 ? ' late' : sec >= 6 * 3600 ? ' warn' : '';
+  return `<span class="age${cls}">${ago(sec)}</span>`;
 }
-
-function peopleView() {
-  const p = state.people;
-  return `
-  <div class="section-title" style="margin-top:0">People 👥</div>
-  <div class="card">
-    <label class="field" style="margin:0"><span>Search customers & drivers (name, email, phone, plate)</span>
-      <input id="people-q" value="${esc(state.peopleQuery || '')}" placeholder="e.g. 98… or aarav"
-        onkeydown="if(event.key==='Enter')searchPeople()" />
-    </label>
-    <button class="btn compact" style="margin-top:10px" onclick="searchPeople()">Search</button>
-  </div>
-  ${!p ? `<div class="empty"><div class="big">👥</div>Loading…</div>` : `
-    <div class="section-title">Customers (${p.users.length}${state.peopleQuery ? ' matching' : ' newest'})</div>
-    ${p.users.length ? p.users.map(userRow).join('') : `<div class="empty">No customers found.</div>`}
-    <div class="section-title">Drivers (${p.drivers.length}${state.peopleQuery ? ' matching' : ' newest'})</div>
-    ${p.drivers.length ? p.drivers.map(driverRow).join('') : `<div class="empty">No drivers found.</div>`}
-  `}`;
-}
-
-window.searchPeople = async () => {
-  state.peopleQuery = ($('#people-q') || { value: '' }).value.trim();
-  try {
-    await loadPeople(state.peopleQuery);
-    renderMain();
-  } catch (e) { toast(e.message, true); }
-};
-
-window.suspendPerson = async (kind, id, action) => {
-  let note = '';
-  if (action === 'suspend') {
-    note = prompt('Reason for suspension (kept on the audit trail):') || '';
-    if (!note.trim()) return toast('Suspension needs a reason.', true);
-  }
-  try {
-    await api(`/api/admin/${kind}/${id}/${action}`, { method: 'POST', body: { note } });
-    toast(action === 'suspend' ? 'Account suspended ⛔' : 'Account reinstated ✓');
-    await loadPeople(state.peopleQuery || '');
-    renderMain();
-  } catch (e) { toast(e.message, true); }
-};
-
-window.settleDriverCash = async (id, owed) => {
-  const raw = prompt(`Cash collected from the driver (they owe ${money(owed)}). Enter amount, or leave blank to settle the full ${money(owed)}:`);
-  if (raw === null) return;
-  const body = raw.trim() ? { amount: Math.round(Number(raw)) } : {};
-  try {
-    const res = await api(`/api/admin/drivers/${id}/settle-cash`, { method: 'POST', body });
-    toast(`Recorded ${money(res.settled)} cash settlement ✓`);
-    await loadPeople(state.peopleQuery || '');
-    renderMain();
-  } catch (e) { toast(e.message, true); }
-};
-
-window.decideDriverVerification = async (id, action) => {
-  const note = action === 'reject' ? (prompt('Rejection note for the driver:') || '') : '';
-  if (action === 'reject' && !note.trim()) return toast('Rejection needs a note.', true);
-  try {
-    await api(`/api/admin/drivers/${id}/verification/${action}`, { method: 'POST', body: { note } });
-    toast(action === 'approve' ? 'Driver license approved ✓' : 'Driver license rejected.');
-    await loadPeople(state.peopleQuery || '');
-    renderMain();
-  } catch (e) { toast(e.message, true); }
-};
-
-window.adjustWallet = async (userId, sign) => {
-  const raw = prompt(sign > 0 ? 'Credit amount (Rs):' : 'Debit amount (Rs):');
-  if (raw === null) return;
-  const amount = Math.round(Number(raw)) * sign;
-  const reason = prompt('Reason (min 5 chars — goes on the audit trail and the customer\'s receipt):') || '';
-  try {
-    await api('/api/admin/wallet-adjust', { method: 'POST', body: { userId, amount, reason } });
-    toast('Wallet adjusted — the customer sees it as a receipt line ✓');
-    await loadPeople(state.peopleQuery || '');
-    renderMain();
-  } catch (e) { toast(e.message, true); }
-};
-
-/* ---------------- reviews ---------------- */
 
 function partnerBlock(p) {
   return `
@@ -557,47 +515,123 @@ function reviewActions(kind, id) {
   </div>`;
 }
 
-function reviewsView() {
-  const { restaurants, hotels } = state.queue;
-  if (restaurants.length === 0 && hotels.length === 0) {
-    return `<div class="section-title" style="margin-top:0">Review queue 🔍</div>
-      <div class="empty"><div class="big">✅</div>Review queue is empty — nothing waiting.</div>`;
-  }
+function kycDetail(p) {
   return `
-  <div class="section-title" style="margin-top:0">Review queue 🔍 <span class="badge amber">${restaurants.length + hotels.length} waiting</span></div>
-  ${restaurants.map((r) => `
-    <div class="card">
-      <div class="row"><div>
-        <div style="font-weight:900">${r.icon} ${esc(r.name)} <span class="badge amber">RESTAURANT · PENDING</span></div>
-        <div class="muted small">${esc(r.cuisine)} · ${r.etaMinutes} min · delivery ${money(r.deliveryFee)}</div>
-      </div></div>
-      <div class="muted small" style="margin-top:8px">
-        Menu (${r.menu.length} item${r.menu.length === 1 ? '' : 's'}): ${r.menu.length ? r.menu.map((m) => `${esc(m.name)} ${money(m.price)}`).join(' · ') : '⚠️ empty — consider rejecting'}
-      </div>
-      ${partnerBlock(r.partner)}
-      ${reviewActions('restaurants', r.id)}
-    </div>`).join('')}
-  ${hotels.map((h) => `
-    <div class="card">
-      <div class="row"><div>
-        <div style="font-weight:900">${h.icon} ${esc(h.name)} <span class="badge amber">HOTEL · PENDING</span></div>
-        <div class="muted small">${esc(h.area)}${h.area ? ', ' : ''}${esc(h.city)}${h.desc ? ' · ' + esc(h.desc) : ''}</div>
-      </div></div>
-      <div class="muted small" style="margin-top:8px">
-        Rooms (${h.rooms.length}): ${h.rooms.length ? h.rooms.map((room) => `${esc(room.type)} ${money(room.pricePerNight)}/n ×${room.count}`).join(' · ') : '⚠️ none — consider rejecting'}
-      </div>
-      ${partnerBlock(h.partner)}
-      ${reviewActions('hotels', h.id)}
-    </div>`).join('')}`;
+  <div class="muted small">📧 ${esc(p.email)} · 📞 ${esc(p.phone)} ${p.phoneVerified ? '✓' : '⚠️ unverified'} · 🧾 Reg/PAN: ${esc(p.regNo)}</div>
+  <div class="muted small">Doc: ${esc(p.businessKycDocumentRef || '—')} · ${p.restaurants} restaurant${p.restaurants === 1 ? '' : 's'}, ${p.hotels} hotel${p.hotels === 1 ? '' : 's'}</div>
+  ${p.businessKycNote ? `<div class="muted small" style="color:var(--danger);margin-top:4px">${esc(p.businessKycNote)}</div>` : ''}
+  ${p.phoneVerified ? '' : `<div class="muted small" style="color:var(--amber);margin-top:4px">Phone must be verified before KYC can be approved.</div>`}
+  <div class="muted small" style="margin-top:4px">Call the partner and check the registration number before approving.</div>
+  <label class="field" style="margin-top:12px"><span>KYC rejection note</span>
+    <input id="pnote-${p.id}" placeholder="e.g. certificate photo is unreadable" />
+  </label>
+  <div class="grid2">
+    <button class="btn" onclick="reviewPartnerKyc('${p.id}','approve')" ${p.phoneVerified ? '' : 'disabled'}>✓ Approve KYC</button>
+    <button class="btn danger" onclick="reviewPartnerKyc('${p.id}','reject')">✕ Reject KYC</button>
+  </div>`;
 }
 
-/* ---------------- payments ---------------- */
+function licenseDetail(d) {
+  return `
+  <div class="muted small">${esc(d.tier)} · ${esc(d.vehicle || '—')} · ${esc(d.plate || '—')} · 📞 ${esc(d.phone)}</div>
+  <div class="muted small">⭐ ${d.rating || '—'} · ${d.tripsCompleted} trips${d.runNoShows ? ` · ⚠️ ${d.runNoShows} run no-show${d.runNoShows === 1 ? '' : 's'}` : ''}</div>
+  <label class="field" style="margin-top:12px"><span>Rejection note (sent to the driver)</span>
+    <input id="dnote-${d.id}" placeholder="e.g. license photo unreadable" />
+  </label>
+  <div class="grid2">
+    <button class="btn" onclick="decideDriverVerification('${d.id}','approve')">✓ Approve license</button>
+    <button class="btn danger" onclick="decideDriverVerification('${d.id}','reject')">✕ Reject</button>
+  </div>`;
+}
 
-function paymentsView() {
+function payoutDetail(w) {
+  return `
+  <div class="muted small">${w.ownerKind.toUpperCase()} · ${money(w.amount)} + ${money(w.fee)} fee → ${esc(w.channelLabel)} · ${esc(w.account)}</div>
+  <label class="field" style="margin-top:12px"><span>Transfer reference (required to mark paid)</span>
+    <input id="wref-${w.id}" placeholder="e.g. eSewa ref 8817-…" />
+  </label>
+  <label class="field"><span>Rejection note</span>
+    <input id="wnote-${w.id}" placeholder="e.g. account name mismatch" />
+  </label>
+  <div class="grid2">
+    <button class="btn" onclick="reviewWithdrawal('${w.id}','approve')">✓ Mark paid</button>
+    <button class="btn danger" onclick="reviewWithdrawal('${w.id}','reject')">✕ Reject & refund</button>
+  </div>`;
+}
+
+function approvalDetail(item) {
+  const d = item.data;
+  if (item.kind === 'restaurants') {
+    return `
+    <div class="muted small">${esc(d.cuisine)} · ${d.etaMinutes} min · delivery ${money(d.deliveryFee)}</div>
+    <div class="muted small" style="margin-top:6px">
+      Menu (${d.menu.length} item${d.menu.length === 1 ? '' : 's'}): ${d.menu.length ? d.menu.map((m) => `${esc(m.name)} ${money(m.price)}`).join(' · ') : '⚠️ empty — consider rejecting'}
+    </div>
+    ${partnerBlock(d.partner)}
+    ${reviewActions('restaurants', d.id)}`;
+  }
+  if (item.kind === 'hotels') {
+    return `
+    <div class="muted small">${esc(d.area)}${d.area ? ', ' : ''}${esc(d.city)}${d.desc ? ' · ' + esc(d.desc) : ''}</div>
+    <div class="muted small" style="margin-top:6px">
+      Rooms (${d.rooms.length}): ${d.rooms.length ? d.rooms.map((room) => `${esc(room.type)} ${money(room.pricePerNight)}/n ×${room.count}`).join(' · ') : '⚠️ none — consider rejecting'}
+    </div>
+    ${partnerBlock(d.partner)}
+    ${reviewActions('hotels', d.id)}`;
+  }
+  if (item.kind === 'stores') {
+    return `
+    <div class="muted small">${esc(d.area || '—')} · ${d.itemCount} item${d.itemCount === 1 ? '' : 's'} listed${d.itemCount ? '' : ' · ⚠️ empty — consider rejecting'}</div>
+    ${partnerBlock(d.partner)}
+    ${reviewActions('stores', d.id)}`;
+  }
+  if (item.kind === 'kyc') return kycDetail(d);
+  if (item.kind === 'license') return licenseDetail(d);
+  return payoutDetail(d);
+}
+
+function queueRowHtml(item) {
+  const key = item.kind + ':' + item.id;
+  const open = state.approvalOpen === key;
+  return `
+  <div class="queue-row" onclick="toggleApproval('${key}')">
+    <div class="emoji">${item.emoji}</div>
+    <div><h4>${item.title}</h4><div class="sub">${item.sub}</div></div>
+    ${ageChip(item.at)}
+  </div>
+  ${open ? `<div class="queue-detail">${approvalDetail(item)}</div>` : ''}`;
+}
+
+function approvalsView() {
+  const items = approvalItems();
+  if (!items.length) {
+    return `<div class="section-title" style="margin-top:0">Approvals ✅</div>
+      <div class="empty"><div class="big">✅</div>Inbox zero — nothing is waiting on a decision.</div>`;
+  }
+  return `
+  <div class="section-title" style="margin-top:0">Approvals ✅ <span class="badge amber">${items.length} waiting</span></div>
+  <div class="muted small" style="margin:0 2px 10px">Listings, KYC, licenses and payouts — oldest first. Tap a row to review in place.</div>
+  <div class="card">${items.map(queueRowHtml).join('')}</div>`;
+}
+
+window.toggleApproval = (key) => {
+  state.approvalOpen = state.approvalOpen === key ? null : key;
+  renderMain();
+};
+
+/* ---------------- money ---------------- */
+/* Payment KPIs + payout pipeline + the revenue ledger. Approvals happen in the
+   inbox; this tab is for reading the money, not mutating it. */
+
+const LEDGER_PAGE = 20;
+
+function moneyView() {
   const pay = state.payments;
   const pending = pay.pendingWithdrawals;
+  const ledger = pay.ledger || [];
+  const shown = Math.min(state.ledgerShown, ledger.length);
   return `
-  <div class="section-title" style="margin-top:0">Payments 💳</div>
+  <div class="section-title" style="margin-top:0">Money 💸</div>
   <div class="kpi-grid">
     ${statTile('Top-ups collected', money(pay.stats.topupVolume))}
     ${statTile('Top-up count', pay.stats.topupCount || 0)}
@@ -605,58 +639,248 @@ function paymentsView() {
     <div class="kpi accent"><div class="v">${money(pay.stats.withdrawalFees)}</div><div class="l">Payout fees earned</div></div>
   </div>
 
-  <div class="section-title">Payout approvals 🏦 ${pending.length ? `<span class="badge amber">${pending.length} waiting</span>` : ''}</div>
+  <div class="section-title">Payout pipeline 🏦 ${pending.length ? `<span class="badge amber">${pending.length} waiting</span>` : ''}</div>
   ${pending.length === 0
     ? `<div class="empty"><div class="big">🏦</div>No payouts waiting for approval.</div>`
-    : pending.map((w) => `
-    <div class="card">
-      <div class="row"><div>
-        <div><b>${esc(w.ownerName)}</b> <span class="badge gray">${w.ownerKind.toUpperCase()}</span></div>
-        <div class="muted small">${money(w.amount)} + ${money(w.fee)} fee → ${esc(w.channelLabel)} · ${esc(w.account)}</div>
-      </div><span class="badge amber">PROCESSING</span></div>
-      <label class="field" style="margin-top:12px"><span>Rejection note (optional)</span>
-        <input id="wnote-${w.id}" placeholder="e.g. account name mismatch" />
-      </label>
-      <div class="grid2">
-        <button class="btn" onclick="reviewWithdrawal('${w.id}','approve')">✓ Mark paid</button>
-        <button class="btn danger" onclick="reviewWithdrawal('${w.id}','reject')">✕ Reject & refund</button>
-      </div>
-    </div>`).join('')}
+    : `<div class="card">
+      ${pending.map((w) => `
+        <div class="list-row">
+          <div>
+            <div><b>${esc(w.ownerName)}</b> <span class="badge gray">${w.ownerKind.toUpperCase()}</span></div>
+            <div class="muted small">${money(w.amount)} + ${money(w.fee)} fee → ${esc(w.channelLabel)} · ${esc(w.account)}</div>
+          </div>
+          <span class="badge amber">PROCESSING</span>
+        </div>`).join('')}
+      <button class="btn ghost" style="margin-top:10px" onclick="setTab('approvals')">Approve or reject in the ✅ Approvals inbox →</button>
+    </div>`}
 
   <div class="section-title">Revenue ledger 🧾</div>
-  ${(pay.ledger && pay.ledger.length) ? `<div class="card">
-    ${pay.ledger.slice(0, 30).map((e) => `
+  ${ledger.length ? `<div class="card">
+    ${ledger.slice(0, shown).map((e) => `
       <div class="list-row">
         <div><div>${esc(e.label)}</div><div class="muted small">${esc(e.source)} · ${fmtTime(e.createdAt || e.at)}</div></div>
         <div class="rt"><b style="color:${e.amount < 0 ? 'var(--danger)' : 'var(--accent)'}">${money(e.amount)}</b></div>
       </div>`).join('')}
+    ${shown < ledger.length
+      ? `<button class="btn ghost" style="margin-top:10px" onclick="showMoreLedger()">Show ${Math.min(LEDGER_PAGE, ledger.length - shown)} more (${ledger.length - shown} hidden)</button>`
+      : ''}
   </div>` : `<div class="muted small">No revenue entries yet.</div>`}`;
 }
 
-/* ---------------- partners ---------------- */
+window.showMoreLedger = () => {
+  state.ledgerShown += LEDGER_PAGE;
+  renderMain();
+};
 
-function partnersView() {
-  if (state.partners.length === 0) {
-    return `<div class="section-title" style="margin-top:0">Partners 🏪</div>
-      <div class="empty"><div class="big">🤝</div>No partners registered yet.</div>`;
-  }
-  return `
-  <div class="section-title" style="margin-top:0">Partners 🏪 <span class="badge gray">${state.partners.length}</span></div>
-  ${state.partners.map((p) => `
-    <div class="card">
-      <div><b>${esc(p.name)}</b> <span class="muted small">· ${p.restaurants} restaurant${p.restaurants === 1 ? '' : 's'}, ${p.hotels} hotel${p.hotels === 1 ? '' : 's'}</span></div>
-      <div class="muted small">📧 ${esc(p.email)} · 📞 ${esc(p.phone)} ${p.phoneVerified ? '✓ verified' : '⚠️ unverified'} · 🧾 ${esc(p.regNo)}</div>
-      <div class="muted small">KYC: <b style="color:var(--text)">${esc((p.businessKycStatus || 'pending').toUpperCase())}</b> · Doc: ${esc(p.businessKycDocumentRef || '—')}</div>
-      ${p.businessKycNote ? `<div class="muted small" style="color:var(--danger);margin-top:4px">${esc(p.businessKycNote)}</div>` : ''}
-      <label class="field" style="margin-top:12px"><span>KYC rejection note</span>
-        <input id="pnote-${p.id}" placeholder="e.g. certificate photo is unreadable" />
-      </label>
-      <div class="grid2">
-        <button class="btn" onclick="reviewPartnerKyc('${p.id}','approve')" ${p.phoneVerified ? '' : 'disabled'}>✓ Approve KYC</button>
-        <button class="btn danger" onclick="reviewPartnerKyc('${p.id}','reject')">✕ Reject KYC</button>
-      </div>
-    </div>`).join('')}`;
+/* ---------------- people (customers + drivers + partner directory) ---------------- */
+
+async function loadPeople(q) {
+  state.people = await api('/api/admin/people?q=' + encodeURIComponent(q || ''));
+  state.loggedIn = true;
 }
+
+/* One .inline-form is open at a time (state.inlineOpen). Each caller renders
+   its own inputs; Confirm calls a submit handler that reads them by id. */
+function inlineFormHtml(label, inner, confirmCall, confirmLabel) {
+  return `<div class="inline-form">
+    <span>${label}</span>
+    ${inner}
+    <button class="btn compact" onclick="${confirmCall}">${confirmLabel}</button>
+    <button class="btn ghost compact" onclick="closeInline()">Cancel</button>
+  </div>`;
+}
+
+window.openInline = (key) => {
+  state.inlineOpen = state.inlineOpen === key ? null : key;
+  renderMain();
+};
+
+window.closeInline = () => {
+  state.inlineOpen = null;
+  renderMain();
+};
+
+function userRow(u) {
+  const creditKey = 'wallet+:' + u.id;
+  const debitKey = 'wallet-:' + u.id;
+  const susKey = 'suspend-users:' + u.id;
+  return `
+  <div class="card" style="margin-top:10px">
+    <div class="list-row" style="border:none;padding:0">
+      <div>
+        <b>${esc(u.name)}</b> ${u.suspended ? '<span class="badge red">SUSPENDED</span>' : ''}
+        <div class="muted small">📧 ${esc(u.email)} · 📞 ${esc(u.phone)} ${u.phoneVerified ? '✓' : '⚠️'}</div>
+      </div>
+      <div class="rt"><b>${money(u.wallet)}</b><div class="muted small">wallet</div></div>
+    </div>
+    <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
+      <button class="btn ghost compact" onclick="openInline('${creditKey}')">➕ Credit</button>
+      <button class="btn ghost compact" onclick="openInline('${debitKey}')">➖ Debit</button>
+      ${u.suspended
+        ? `<button class="btn ghost compact" onclick="suspendPerson('users','${u.id}','unsuspend')">✓ Reinstate</button>`
+        : `<button class="btn ghost compact danger" onclick="openInline('${susKey}')">⛔ Suspend</button>`}
+    </div>
+    ${state.inlineOpen === creditKey ? inlineFormHtml(
+      'Goodwill credit — amount and reason go on the audit trail and the customer\'s receipt',
+      `<input id="inf-amount" type="number" placeholder="Rs" /><input id="inf-reason" placeholder="Reason (min 5 chars)" />`,
+      `submitWalletAdjust('${u.id}',1)`, '➕ Credit') : ''}
+    ${state.inlineOpen === debitKey ? inlineFormHtml(
+      'Correction debit — amount and reason go on the audit trail and the customer\'s receipt',
+      `<input id="inf-amount" type="number" placeholder="Rs" /><input id="inf-reason" placeholder="Reason (min 5 chars)" />`,
+      `submitWalletAdjust('${u.id}',-1)`, '➖ Debit') : ''}
+    ${state.inlineOpen === susKey ? inlineFormHtml(
+      'Suspension reason (kept on the audit trail)',
+      `<input id="inf-reason" placeholder="e.g. repeated chargebacks" />`,
+      `suspendPerson('users','${u.id}','suspend')`, '⛔ Suspend') : ''}
+  </div>`;
+}
+
+function driverRow(d) {
+  const ver = d.verificationStatus;
+  const settleKey = 'settle:' + d.id;
+  const dlKey = 'dl-reject:' + d.id;
+  const susKey = 'suspend-drivers:' + d.id;
+  return `
+  <div class="card" style="margin-top:10px">
+    <div class="list-row" style="border:none;padding:0">
+      <div>
+        <b>${esc(d.name)}</b>
+        <span class="muted small">· ${esc(d.tier)} · ${esc(d.vehicle || '—')} · ${esc(d.plate || '—')}</span>
+        ${d.suspended ? '<span class="badge red">SUSPENDED</span>' : ''}
+        <div class="muted small">
+          ${d.online ? '🟢 online' : '⚪ offline'}${d.online && !d.locationFresh ? ' (GPS stale)' : ''}
+          · ⭐ ${d.rating || '—'} · ${d.tripsCompleted} trips
+          · license: <b style="color:${ver === 'verified' ? 'var(--accent)' : ver === 'rejected' ? '#f87171' : '#fbbf24'}">${esc(ver.toUpperCase())}</b>
+        </div>
+      </div>
+      <div class="rt">
+        ${d.commissionOwed > 0
+          ? `<b style="color:#f87171">–${money(d.commissionOwed)}</b><div class="muted small">owes SewaGo</div>`
+          : `<b>${money(d.earnings)}</b><div class="muted small">earnings</div>`}
+      </div>
+    </div>
+    <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
+      ${d.commissionOwed > 0 ? `<button class="btn compact" onclick="openInline('${settleKey}')">💵 Record cash settlement</button>` : ''}
+      ${ver !== 'verified' ? `<button class="btn ghost compact" onclick="decideDriverVerification('${d.id}','approve')">✓ Approve license</button>` : ''}
+      ${ver !== 'rejected' ? `<button class="btn ghost compact danger" onclick="openInline('${dlKey}')">✕ Reject license</button>` : ''}
+      ${d.suspended
+        ? `<button class="btn ghost compact" onclick="suspendPerson('drivers','${d.id}','unsuspend')">✓ Reinstate</button>`
+        : `<button class="btn ghost compact danger" onclick="openInline('${susKey}')">⛔ Suspend</button>`}
+    </div>
+    ${state.inlineOpen === settleKey ? inlineFormHtml(
+      `Cash collected at the SewaGo point (owes ${money(d.commissionOwed)}) — leave blank to settle it all`,
+      `<input id="inf-amount" type="number" placeholder="${d.commissionOwed}" />`,
+      `submitSettleCash('${d.id}')`, '💵 Record') : ''}
+    ${state.inlineOpen === dlKey ? inlineFormHtml(
+      'Rejection note (sent to the driver)',
+      `<input id="dnote-${d.id}" placeholder="e.g. license photo unreadable" />`,
+      `decideDriverVerification('${d.id}','reject')`, '✕ Reject') : ''}
+    ${state.inlineOpen === susKey ? inlineFormHtml(
+      'Suspension reason (kept on the audit trail)',
+      `<input id="inf-reason" placeholder="e.g. rider complaints" />`,
+      `suspendPerson('drivers','${d.id}','suspend')`, '⛔ Suspend') : ''}
+  </div>`;
+}
+
+// Compact partner directory card. KYC decisions live in the Approvals inbox;
+// this is the reference view (contact, status, listing counts).
+function partnerCard(p) {
+  return `
+  <div class="card" style="margin-top:10px">
+    <div><b>${esc(p.name)}</b> <span class="muted small">· ${p.restaurants} restaurant${p.restaurants === 1 ? '' : 's'}, ${p.hotels} hotel${p.hotels === 1 ? '' : 's'}</span></div>
+    <div class="muted small">📧 ${esc(p.email)} · 📞 ${esc(p.phone)} ${p.phoneVerified ? '✓ verified' : '⚠️ unverified'} · 🧾 ${esc(p.regNo)}</div>
+    <div class="muted small">KYC: <b style="color:var(--text)">${esc((p.businessKycStatus || 'pending').toUpperCase())}</b> · Doc: ${esc(p.businessKycDocumentRef || '—')}</div>
+    ${p.businessKycNote ? `<div class="muted small" style="color:var(--danger);margin-top:4px">${esc(p.businessKycNote)}</div>` : ''}
+  </div>`;
+}
+
+// Partners come from the core feed, so filter them client-side with the same
+// search box that drives the server-side customer/driver lookup.
+function filteredPartners() {
+  const q = (state.peopleQuery || '').trim().toLowerCase();
+  if (!q) return state.partners;
+  return state.partners.filter((p) =>
+    [p.name, p.email, p.phone, p.regNo].some((f) => f && String(f).toLowerCase().includes(q)));
+}
+
+function peopleView() {
+  const p = state.people;
+  const partners = filteredPartners();
+  return `
+  <div class="section-title" style="margin-top:0">People 👥</div>
+  <div class="card">
+    <label class="field" style="margin:0"><span>Search customers, drivers & partners (name, email, phone, plate)</span>
+      <input id="people-q" value="${esc(state.peopleQuery || '')}" placeholder="e.g. 98… or aarav"
+        onkeydown="if(event.key==='Enter')searchPeople()" />
+    </label>
+    <button class="btn compact" style="margin-top:10px" onclick="searchPeople()">Search</button>
+  </div>
+  ${!p ? `<div class="empty"><div class="big">👥</div>Loading…</div>` : `
+    <div class="section-title">Customers (${p.users.length}${state.peopleQuery ? ' matching' : ' newest'})</div>
+    ${p.users.length ? p.users.map(userRow).join('') : `<div class="empty">No customers found.</div>`}
+    <div class="section-title">Drivers (${p.drivers.length}${state.peopleQuery ? ' matching' : ' newest'})</div>
+    ${p.drivers.length ? p.drivers.map(driverRow).join('') : `<div class="empty">No drivers found.</div>`}
+    <div class="section-title">Partners (${partners.length}${state.peopleQuery ? ' matching' : ''})</div>
+    ${partners.length ? partners.map(partnerCard).join('') : `<div class="empty">No partners found.</div>`}
+    <div class="muted small" style="margin:8px 2px 0">Pending business KYC is reviewed in the ✅ Approvals inbox.</div>
+  `}`;
+}
+
+window.searchPeople = async () => {
+  state.peopleQuery = ($('#people-q') || { value: '' }).value.trim();
+  try {
+    await loadPeople(state.peopleQuery);
+    renderMain();
+  } catch (e) { toast(e.message, true); }
+};
+
+window.suspendPerson = async (kind, id, action) => {
+  const note = action === 'suspend' ? (($('#inf-reason') || { value: '' }).value || '').trim() : '';
+  if (action === 'suspend' && !note) return toast('Suspension needs a reason.', true);
+  try {
+    await api(`/api/admin/${kind}/${id}/${action}`, { method: 'POST', body: { note } });
+    toast(action === 'suspend' ? 'Account suspended ⛔' : 'Account reinstated ✓');
+    state.inlineOpen = null;
+    await reloadAfterAction();
+  } catch (e) { toast(e.message, true); }
+};
+
+window.submitSettleCash = async (id) => {
+  const raw = (($('#inf-amount') || { value: '' }).value || '').trim();
+  const body = raw ? { amount: Math.round(Number(raw)) } : {};
+  try {
+    const res = await api(`/api/admin/drivers/${id}/settle-cash`, { method: 'POST', body });
+    toast(`Recorded ${money(res.settled)} cash settlement ✓`);
+    state.inlineOpen = null;
+    await reloadAfterAction();
+  } catch (e) { toast(e.message, true); }
+};
+
+// Shared by the Approvals inbox and the People tab — both render the
+// rejection note into #dnote-<id>, so one reader covers both surfaces.
+window.decideDriverVerification = async (id, action) => {
+  const noteEl = $(`#dnote-${id}`);
+  const note = noteEl ? noteEl.value.trim() : '';
+  if (action === 'reject' && !note) return toast('Rejection needs a note for the driver.', true);
+  try {
+    await api(`/api/admin/drivers/${id}/verification/${action}`, { method: 'POST', body: { note } });
+    toast(action === 'approve' ? 'Driver license approved ✓' : 'Driver license rejected.');
+    state.inlineOpen = null;
+    state.approvalOpen = null;
+    await reloadAfterAction();
+  } catch (e) { toast(e.message, true); }
+};
+
+window.submitWalletAdjust = async (userId, sign) => {
+  const amount = Math.round(Number((($('#inf-amount') || { value: '' }).value || '').trim())) * sign;
+  const reason = (($('#inf-reason') || { value: '' }).value || '').trim();
+  try {
+    await api('/api/admin/wallet-adjust', { method: 'POST', body: { userId, amount, reason } });
+    toast('Wallet adjusted — the customer sees it as a receipt line ✓');
+    state.inlineOpen = null;
+    await reloadAfterAction();
+  } catch (e) { toast(e.message, true); }
+};
 
 /* ---------------- shell ---------------- */
 
@@ -666,7 +890,7 @@ function loginView() {
     <div class="auth-hero">
       <div class="logo">🛡️</div>
       <h1>Sewa<em>Go</em> Admin</h1>
-      <p>Platform control room — live ops, reviews, payments.</p>
+      <p>Platform control room — live ops, approvals, money.</p>
     </div>
     <div class="card">
       <label class="field"><span>Admin email</span>
@@ -683,37 +907,26 @@ function loginView() {
   </div>`;
 }
 
-const TABS = [
-  ['live', 'Live ops'],
-  ['overview', 'Overview'],
-  ['reviews', 'Reviews'],
-  ['payments', 'Payments'],
-  ['partners', 'Partners'],
-  ['people', 'People']
-];
-
 function tabBadge(tab) {
-  if (tab === 'reviews') return state.queue.restaurants.length + state.queue.hotels.length;
-  if (tab === 'payments') return state.payments.pendingWithdrawals.length;
+  if (tab === 'approvals') return approvalItems().length;
   if (tab === 'live') return state.live ? state.live.kpis.activeRides : 0;
   return 0;
 }
 
-function tabsBar() {
-  return `<div class="admin-tabs">
-    ${TABS.map(([id, label]) => {
-      const n = tabBadge(id);
-      return `<button class="${state.tab === id ? 'active' : ''}" onclick="setTab('${id}')">${label}${n ? `<span class="tab-badge">${n}</span>` : ''}</button>`;
-    }).join('')}
-  </div>`;
+function tabbarButtons() {
+  return TABS.map((t) => {
+    const n = tabBadge(t.id);
+    return `<button class="${state.tab === t.id ? 'active' : ''}" onclick="setTab('${t.id}')">
+      <span class="ico">${t.ico}${n ? `<span class="tab-badge">${n}</span>` : ''}</span>${t.label}
+    </button>`;
+  }).join('');
 }
 
 function mainContent() {
   switch (state.tab) {
     case 'overview': return overviewView();
-    case 'reviews': return reviewsView();
-    case 'payments': return paymentsView();
-    case 'partners': return partnersView();
+    case 'approvals': return approvalsView();
+    case 'money': return moneyView();
     case 'people': return peopleView();
     default: return liveView();
   }
@@ -721,9 +934,19 @@ function mainContent() {
 
 function renderMain() {
   const m = $('#admin-main');
-  if (m) m.innerHTML = mainContent();
-  const t = $('#admin-tabs-slot');
-  if (t) t.innerHTML = tabsBar();
+  if (m) {
+    m.innerHTML = mainContent();
+    // Glide-in only on real tab changes — background re-renders from polling,
+    // SSE or row toggles must not replay the animation.
+    m.classList.remove('page-enter');
+    if (state._pageAnim) {
+      void m.offsetWidth; // restart the CSS animation on the same element
+      m.classList.add('page-enter');
+      state._pageAnim = false;
+    }
+  }
+  const t = $('#admin-tabbar');
+  if (t) t.innerHTML = tabbarButtons();
   afterRender();
 }
 
@@ -741,10 +964,8 @@ function render() {
         <button class="btn danger compact" onclick="doLogout()">Log out</button>
       </div>
     </header>
-    <main>
-      <div id="admin-tabs-slot">${tabsBar()}</div>
-      <div id="admin-main">${mainContent()}</div>
-    </main>`;
+    <main id="admin-main">${mainContent()}</main>
+    <nav class="tabbar" id="admin-tabbar">${tabbarButtons()}</nav>`;
   afterRender();
 }
 
@@ -788,6 +1009,7 @@ function disconnectEvents() {
 /* ---------------- actions ---------------- */
 
 window.setTab = async (tab) => {
+  state._pageAnim = state.tab !== tab;
   state.tab = tab;
   localStorage.setItem('sewago_admin_tab', tab);
   renderMain();
@@ -817,6 +1039,7 @@ window.submitLogin = async () => {
   }
 };
 
+// Listing reviews (restaurants / hotels / stores) from the Approvals inbox.
 window.review = async (kind, id, action) => {
   try {
     const note = $(`#note-${id}`) ? $(`#note-${id}`).value.trim() : '';
@@ -825,9 +1048,9 @@ window.review = async (kind, id, action) => {
       return;
     }
     await api(`/api/admin/${kind}/${id}/${action}`, { method: 'POST', body: { note } });
-    await loadCore();
+    state.approvalOpen = null;
     toast(action === 'approve' ? 'Approved — it is now live in the app ✅' : 'Rejected — the partner has been notified.');
-    renderMain();
+    await reloadAfterAction();
   } catch (e) {
     toast(e.message, true);
   }
@@ -835,11 +1058,25 @@ window.review = async (kind, id, action) => {
 
 window.reviewWithdrawal = async (id, action) => {
   try {
-    const note = $(`#wnote-${id}`) ? $(`#wnote-${id}`).value.trim() : '';
-    await api(`/api/admin/withdrawals/${id}/${action}`, { method: 'POST', body: { note } });
-    await loadCore();
+    const ref = ($(`#wref-${id}`) || { value: '' }).value.trim();
+    const note = ($(`#wnote-${id}`) || { value: '' }).value.trim();
+    // Money actions need a paper trail both ways: a transfer reference to mark
+    // paid, a note to reject.
+    if (action === 'approve' && !ref) {
+      toast('Enter the transfer reference — it proves the money actually moved.', true);
+      return;
+    }
+    if (action === 'reject' && !note) {
+      toast('Add a rejection note for the requester.', true);
+      return;
+    }
+    await api(`/api/admin/withdrawals/${id}/${action}`, {
+      method: 'POST',
+      body: action === 'approve' ? { payoutRef: ref } : { note }
+    });
+    state.approvalOpen = null;
     toast(action === 'approve' ? 'Payout marked as paid ✅' : 'Payout rejected — amount refunded.');
-    renderMain();
+    await reloadAfterAction();
   } catch (e) {
     toast(e.message, true);
   }
@@ -853,9 +1090,9 @@ window.reviewPartnerKyc = async (id, action) => {
       return;
     }
     await api(`/api/admin/partners/${id}/kyc/${action}`, { method: 'POST', body: { note } });
-    await loadCore();
+    state.approvalOpen = null;
     toast(action === 'approve' ? 'Partner KYC approved.' : 'Partner KYC rejected.');
-    renderMain();
+    await reloadAfterAction();
   } catch (e) {
     toast(e.message, true);
   }
@@ -863,7 +1100,7 @@ window.reviewPartnerKyc = async (id, action) => {
 
 window.refresh = async () => {
   try {
-    await Promise.all([loadCore(), loadLive()]);
+    await Promise.all([loadCore(), loadLive(), loadPeople(state.peopleQuery || '')]);
     renderMain();
     toast('Refreshed.');
   } catch (e) {

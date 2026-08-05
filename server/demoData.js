@@ -46,6 +46,11 @@ function removeDemoData() {
       (s) => !String(s.id || '').startsWith('demo-') && !demoStoreRef(s) && !String(s.userId || '').startsWith('demo-')
     );
   }
+  if (Array.isArray(db.subscriptionRequests)) {
+    db.subscriptionRequests = db.subscriptionRequests.filter(
+      (r) => !String(r.id || '').startsWith('demo-') && !demoStoreRef(r) && !String(r.userId || '').startsWith('demo-')
+    );
+  }
   if (Array.isArray(db.deliveryRuns)) {
     db.deliveryRuns = db.deliveryRuns.filter((r) => !String(r.id || '').startsWith('demo-') && !demoStoreRef(r));
   }
@@ -692,6 +697,17 @@ function addDemoStores(users, hospitalityPartner) {
       itemId: eggs.id, itemName: eggs.name,
       everyDays: 7, price: eggs.subscribePrice, listPrice: eggs.price,
       status: 'active', createdAt: now() - 6 * 86400000, nextDueAt: now() + 86400000
+    });
+  }
+
+  // A customer asking for a subscriber price the shop has not answered yet —
+  // gives the partner app's Subscriptions inbox something real to decide on.
+  const dhau = flagship.items.find((i) => i.name === 'Juju Dhau 200ml');
+  if (dhau && !dhau.subscribePrice) {
+    db.subscriptionRequests.push({
+      id: demoId('subreq', 'kabir-dhau'), userId: users.kabir.id, userName: users.kabir.name,
+      storeId: flagship.id, itemId: dhau.id, itemName: dhau.name,
+      status: 'pending', createdAt: now() - 2 * 3600000
     });
   }
 
