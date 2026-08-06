@@ -15,23 +15,34 @@ for a real production launch — money correctness and trust are the product.
 - `npm run demo:seed` for demo marketplace data (only touches `demo-` ids).
 
 ## Backlog (ranked)
-1. Security pass on the recent feature commits (shop maps/store management, pickup-order
-   review, regional matching) — attacker mindset: authz on every new endpoint (e.g. store
-   PATCH/inventory/helper routes), input validation on money paths, IDOR between partners.
-   Started nowhere; nothing known-broken, purely an audit.
+1. Finish the security audit: store routes are done (3 fixes shipped 2026-08-06); still
+   unread with attacker eyes: photo upload/gallery pipeline (galleryFrom ownership of
+   /uploads paths), reviews-gated-to-real-visits (e37c56a), rides/tasks input paths,
+   regional matching. SSE /api/events checked — clean (audiences derive from validated
+   tokens).
 2. Customer-experience pass on the paying flows as a first-time phone user (empty states,
    error toasts, loading, mobile layout) — run the app, click through ride/food/shop/stay,
    fix what feels broken or embarrassing.
 3. Single-blob JSON/Supabase persistence is the #1 scaling bottleneck for launch (every
    write rewrites the whole state). Needs owner decision — see Decisions.
-4. Small residue from the ghost-run fix: a run in the 'offered' state (≤25 s window) is not
+4. Known rare flake under full-suite CPU load: delivery-recovery's later tests run against
+   a 3 s pickup deadline (DELIVERY_RUN_PICKUP_DEADLINE_MIN=0.05 suite-wide, needed only by
+   test 1); contention can let recovery cancel a run mid-test. Seen once in ~6 full runs
+   on 2026-08-06, passes in isolation. Fix idea: raise the deadline and make only test 1
+   wait longer, or gate tests 2/3 on their own shop like waitForRunFrom.
+5. Small residue from the ghost-run fix: a run in the 'offered' state (≤25 s window) is not
    re-pruned if one of its orders is handed over mid-offer; the money is safe (handover
    stamps moneySettledAt) but the rider could still ride to one hollow stop. Low value,
    fix only if touching the sweep anyway.
-5. Food-side courier no-show has no bench: a courier who abandons a FOOD delivery is billed
+6. Food-side courier no-show has no bench: a courier who abandons a FOOD delivery is billed
    but not benched (runNoShowUntil only gates shop runs). Consider a shared cooldown.
 
 ## Shipped log
+- 2026-08-06 — Security pass on the shop surface: helper-join 6-digit codes get a
+  brute-force lock (8 tries → 15 min, audited); /stores/voice/parse validates the session
+  token instead of accepting any Authorization header; /store-orders rejects fractional
+  quantities that put fractional rupees into wallet/pending/ledger. 3 regression tests in
+  test/stores.test.js. (commit 7e3888e)
 - 2026-08-06 — Courier-abandoned shop runs no longer strand money: collected orders
   auto-resolve (customer refunded without restock, shop income honoured, vanished rider
   billed on the COD-debt ledger), still-ready orders release back to pool and counter,
