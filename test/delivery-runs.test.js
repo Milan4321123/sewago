@@ -33,6 +33,12 @@ async function api(pathname, { method = 'GET', token = null, body = null } = {})
   return { status: res.status, data };
 }
 
+// The customer API hides the platform↔shop split, so tests recompute it from
+// the receipt fields it does show (suite runs with STORE_COMMISSION_PCT=8).
+function partnerCutOf(o) {
+  return o.subtotal + o.deliveryFee - Math.round(o.subtotal * 0.08);
+}
+
 async function registerUser(name) {
   const email = `${name}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}@test.local`;
   const { data } = await api('/auth/register', { method: 'POST', body: { name, email, password: 'secret1' } });
@@ -312,7 +318,7 @@ test('an order settled by shopkeeper handover never double-debits the courier wh
     'the courier is debited the cash they actually took, exactly once');
 
   const settled = await api('/partner/me', { token: shop.token });
-  assert.equal(settled.data.partner.earnings, placed.data.order.partnerCut,
+  assert.equal(settled.data.partner.earnings, partnerCutOf(placed.data.order),
     'the shop is paid once, at the door — not when it declared the bag gone');
 });
 

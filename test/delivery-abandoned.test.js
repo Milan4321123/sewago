@@ -37,6 +37,12 @@ async function api(pathname, { method = 'GET', token = null, body = null } = {})
   return { status: res.status, data };
 }
 
+// The customer API hides the platform↔shop split, so tests recompute it from
+// the receipt fields it does show (suite runs with STORE_COMMISSION_PCT=8).
+function partnerCutOf(o) {
+  return o.subtotal + o.deliveryFee - Math.round(o.subtotal * 0.08);
+}
+
 async function registerUser(name) {
   const email = `${name}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}@test.local`;
   const { data } = await api('/auth/register', { method: 'POST', body: { name, email, password: 'secret1' } });
@@ -198,7 +204,7 @@ test('a half-collected run resolves the taken order and releases the untouched o
 
   const shop = await api('/partner/me', { token: shopA.token });
   assert.equal(shop.data.partner.pendingEarnings, 0, 'nothing is frozen in pending');
-  assert.equal(shop.data.partner.earnings, orderA.partnerCut, 'the shop keeps the sale — it handed real goods to our courier');
+  assert.equal(shop.data.partner.earnings, partnerCutOf(orderA), 'the shop keeps the sale — it handed real goods to our courier');
 
   // The goods left the shop in the rider's bag, so the shelf must NOT grow them back.
   const inv = await api(`/partner/stores/${shopA.storeId}/inventory`, { token: shopA.token });
@@ -265,7 +271,7 @@ test('a collected cash order bills the vanished rider and pays the shop', async 
   assert.equal(cust.data.user.wallet, 5000, 'nothing was charged, so nothing is refunded');
 
   const shopView = await api('/partner/me', { token: shop.token });
-  assert.equal(shopView.data.partner.earnings, order.partnerCut, 'the shop is paid for goods it handed over');
+  assert.equal(shopView.data.partner.earnings, partnerCutOf(order), 'the shop is paid for goods it handed over');
   assert.equal(shopView.data.partner.pendingEarnings, 0);
 
   const riderView = await api('/driver/me', { token: rider.token });
