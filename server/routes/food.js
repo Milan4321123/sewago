@@ -312,10 +312,21 @@ router.post('/orders/:id/rate', authRequired, (req, res) => {
 // (discounted) share at that moment, all-or-nothing.
 
 const GROUP_MAX_MEMBERS = 12;
+function envNum(name, fallback, min, max) {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) && n >= min && n <= max ? n : fallback;
+}
 // A group needs runway for friends to join, and the same one-week horizon as
-// any scheduled order.
-const GROUP_MIN_LEAD_MS = 30 * 60 * 1000;
+// any scheduled order. Lead time is tunable so the "slot already passed" guard
+// on place can be exercised in seconds.
+const GROUP_MIN_LEAD_MS = envNum('GROUP_MIN_LEAD_MIN', 30, 0.01, 720) * 60 * 1000;
 const GROUP_MAX_LEAD_MS = SCHEDULE_MAX_AHEAD_MS;
+// A confirmation is a promise to pay a specific amount, made against the menu
+// and head count at that moment. Past this window the host must not be able to
+// quietly debit a member who has long moved on — they re-confirm at the current
+// price. Generous by default so same-day groups are never nagged; tunable low
+// for tests.
+const GROUP_CONFIRM_TTL_MS = envNum('GROUP_CONFIRM_TTL_MIN', 24 * 60, 0.01, 14 * 24 * 60) * 60 * 1000;
 
 // 6-digit join code, unique among OPEN groups so a code always finds one lobby.
 function groupCode() {
@@ -373,6 +384,12 @@ function groupView(group, userId) {
     : 0;
   const me = group.members.find((m) => m.userId === userId);
   const order = group.orderId ? db.orders.find((o) => o.id === group.orderId) : null;
+  // The counter code is the whole order's settlement key, so it reaches only the
+  // people with money in it — the host and everyone who paid a share. A lobby
+  // member who never confirmed must not be able to collect (and walk off with)
+  // food they did not pay for.
+  const mayCollect = !!order && !!order.group
+    && (userId === group.hostUserId || order.group.perMember.some((p) => p.userId === userId));
   return {
     id: group.id,
     code: group.code,
@@ -401,7 +418,7 @@ function groupView(group, userId) {
       ? {
         id: order.id,
         status: withStatus(order).status,
-        collectCode: order.collectCode,
+        collectCode: mayCollect ? order.collectCode : null,
         total: order.total,
         scheduledFor: order.scheduledFor
       }
@@ -516,6 +533,8 @@ router.post('/group-orders/:id/items', authRequired, (req, res) => {
   const me = group.members.find((m) => m.userId === req.user.id);
   me.items = lines;
   me.confirmed = false;
+  me.confirmedSubtotal = null;
+  me.confirmedAt = null;
   save();
   publishGroup(group);
   res.json({ group: groupView(group, req.user.id) });
@@ -528,10 +547,22 @@ router.post('/group-orders/:id/:action(confirm|unconfirm)', authRequired, (req, 
   if (!group) return;
   if (group.status !== 'open') return res.status(400).json({ error: 'This group order is closed.' });
   const me = group.members.find((m) => m.userId === req.user.id);
-  if (req.params.action === 'confirm' && me.items.length === 0) {
-    return res.status(400).json({ error: 'Pick at least one item before confirming your part.' });
+  if (req.params.action === 'confirm') {
+    if (me.items.length === 0) {
+      return res.status(400).json({ error: 'Pick at least one item before confirming your part.' });
+    }
+    const restaurant = db.restaurants.find((r) => r.id === group.restaurantId);
+    // Freeze exactly what this member is agreeing to pay for. place() refuses to
+    // charge more than this, so a menu price bumped after they confirmed cannot
+    // ride through on the host's tap.
+    me.confirmed = true;
+    me.confirmedSubtotal = memberSubtotal(restaurant, me);
+    me.confirmedAt = Date.now();
+  } else {
+    me.confirmed = false;
+    me.confirmedSubtotal = null;
+    me.confirmedAt = null;
   }
-  me.confirmed = req.params.action === 'confirm';
   save();
   publishGroup(group);
   res.json({ group: groupView(group, req.user.id) });
@@ -547,6 +578,38 @@ router.post('/group-orders/:id/place', authRequired, (req, res) => {
   if (group.status !== 'open') return res.status(400).json({ error: 'This group order is closed.' });
   const restaurant = db.restaurants.find((r) => r.id === group.restaurantId && orderable(r));
   if (!restaurant || !restaurant.ownerId) return res.status(404).json({ error: 'Restaurant not found.' });
+
+  // The meal slot itself has passed — there is nothing left to place.
+  if (Date.now() > group.scheduledFor) {
+    return res.status(400).json({ error: "This group's time has passed — start a new one." });
+  }
+
+  // A confirmation is a promise to pay a specific amount. Before any wallet is
+  // touched, re-check every confirmed member against what they actually agreed:
+  // the same plate price (a menu bump since is not theirs to swallow) and a
+  // recent enough confirmation (not one they made and forgot). Anyone who no
+  // longer matches is un-confirmed and the place is refused, so the host nudges
+  // them to look again instead of money moving behind their back.
+  const now = Date.now();
+  const needReconfirm = [];
+  for (const m of group.members) {
+    if (!m.confirmed || m.items.length === 0) continue;
+    const priceMoved = memberSubtotal(restaurant, m) !== m.confirmedSubtotal;
+    const tooOld = !m.confirmedAt || now - m.confirmedAt > GROUP_CONFIRM_TTL_MS;
+    if (priceMoved || tooOld) {
+      m.confirmed = false;
+      m.confirmedSubtotal = null;
+      m.confirmedAt = null;
+      needReconfirm.push(m.name);
+    }
+  }
+  if (needReconfirm.length) {
+    save();
+    publishGroup(group);
+    return res.status(409).json({
+      error: `Prices or plans changed for ${needReconfirm.join(', ')} — they need to confirm again before you place.`
+    });
+  }
 
   const participants = group.members.filter((m) => m.confirmed && m.items.length > 0);
   const shares = participants

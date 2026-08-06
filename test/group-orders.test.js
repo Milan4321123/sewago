@@ -299,3 +299,74 @@ test('lobby rules: bad codes, leaving, host cancel, closed groups', async () => 
   const gone = await api('/group-orders', { token: friend.token });
   assert.ok(!gone.data.groups.some((g) => g.id === group.id), 'cancelled groups leave the active list');
 });
+
+test('a plate whose price drifts after confirm is refused, not silently charged', async () => {
+  const shop = await onboardGroupRestaurant({ price: 400, pct: 10, minPeople: 2 });
+  const host = await registerUser('drift-host');
+  const friend = await registerUser('drift-friend');
+  // A second dish we can pull off the menu out from under a confirmed member.
+  const extra = await api(`/partner/restaurants/${shop.restaurantId}/menu`, {
+    method: 'POST', token: shop.token, body: { name: 'Momo', price: 300, desc: 't' }
+  });
+  const momoId = extra.data.restaurant.menu.find((m) => m.name === 'Momo').id;
+
+  const when = Date.now() + 2 * 60 * 60 * 1000;
+  const group = (await api('/group-orders', {
+    method: 'POST', token: host.token, body: { restaurantId: shop.restaurantId, mode: 'pickup', scheduledFor: when }
+  })).data.group;
+  await api('/group-orders/join', { method: 'POST', token: friend.token, body: { code: group.code } });
+  await api(`/group-orders/${group.id}/items`, { method: 'POST', token: host.token, body: { items: [{ id: shop.menuItemId, qty: 1 }] } });
+  await api(`/group-orders/${group.id}/items`, { method: 'POST', token: friend.token, body: { items: [{ id: momoId, qty: 1 }] } });
+  await api(`/group-orders/${group.id}/confirm`, { method: 'POST', token: host.token });
+  await api(`/group-orders/${group.id}/confirm`, { method: 'POST', token: friend.token });
+
+  const hostBefore = await wallet(host.token);
+  const friendBefore = await wallet(friend.token);
+
+  // The restaurant pulls the momo after the friend locked it in.
+  await api(`/partner/restaurants/${shop.restaurantId}/menu/${momoId}`, { method: 'DELETE', token: shop.token });
+
+  const placed = await api(`/group-orders/${group.id}/place`, { method: 'POST', token: host.token });
+  assert.equal(placed.status, 409, JSON.stringify(placed.data));
+  assert.match(placed.data.error, /confirm again/i);
+  assert.equal(await wallet(host.token), hostBefore, 'no wallet is touched when a plate drifted');
+  assert.equal(await wallet(friend.token), friendBefore);
+
+  // The drifted member is un-confirmed and must look again; the other is untouched.
+  const members = (await api('/group-orders', { token: host.token })).data.groups.find((g) => g.id === group.id).members;
+  assert.equal(members.find((m) => m.name === 'drift-friend').confirmed, false, 'friend must reconfirm at the new plate');
+  assert.equal(members.find((m) => m.name === 'drift-host').confirmed, true, 'host, unaffected, stays confirmed');
+});
+
+test('the counter code reaches only the host and members who paid', async () => {
+  const shop = await onboardGroupRestaurant({ price: 400, pct: 10, minPeople: 2 });
+  const host = await registerUser('code-host');
+  const payer = await registerUser('code-payer');
+  const freeloader = await registerUser('code-freeloader');
+
+  const when = Date.now() + 2 * 60 * 60 * 1000;
+  const group = (await api('/group-orders', {
+    method: 'POST', token: host.token, body: { restaurantId: shop.restaurantId, mode: 'pickup', scheduledFor: when }
+  })).data.group;
+  await api('/group-orders/join', { method: 'POST', token: payer.token, body: { code: group.code } });
+  await api('/group-orders/join', { method: 'POST', token: freeloader.token, body: { code: group.code } });
+
+  // Host and payer order and confirm; the freeloader just lurks in the lobby.
+  await api(`/group-orders/${group.id}/items`, { method: 'POST', token: host.token, body: { items: [{ id: shop.menuItemId, qty: 1 }] } });
+  await api(`/group-orders/${group.id}/items`, { method: 'POST', token: payer.token, body: { items: [{ id: shop.menuItemId, qty: 1 }] } });
+  await api(`/group-orders/${group.id}/confirm`, { method: 'POST', token: host.token });
+  await api(`/group-orders/${group.id}/confirm`, { method: 'POST', token: payer.token });
+
+  const placed = await api(`/group-orders/${group.id}/place`, { method: 'POST', token: host.token });
+  assert.equal(placed.status, 200, JSON.stringify(placed.data));
+  const realCode = placed.data.order.collectCode;
+  assert.match(realCode, /^\d{4}$/);
+
+  const codeFor = async (tok) => {
+    const g = (await api('/group-orders', { token: tok })).data.groups.find((x) => x.id === group.id);
+    return g.order.collectCode;
+  };
+  assert.equal(await codeFor(host.token), realCode, 'the host can show the code');
+  assert.equal(await codeFor(payer.token), realCode, 'a paying member can show the code');
+  assert.equal(await codeFor(freeloader.token), null, 'a lobby member who paid nothing cannot collect the food');
+});
