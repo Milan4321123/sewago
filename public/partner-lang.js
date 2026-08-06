@@ -323,7 +323,7 @@ window.SEWAGO_NE = {
   'Could not get your location — allow it in your browser.': 'लोकेसन पाइएन — ब्राउजरमा अनुमति दिनुहोस्।',
 
   /* ---- insights ---- */
-  "Today's sales": 'आजको आम्दानी',
+  "Today's sales": 'आजको बिक्री',
   '{n} at the counter': 'पसलमै {n}',
   '{n} app orders': 'एपबाट {n} अर्डर',
   'When things sold today': 'आज कुन बेला बिक्यो',
