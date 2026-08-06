@@ -653,18 +653,6 @@ function approvalDetail(item) {
   return payoutDetail(d);
 }
 
-window.resolveAttention = async (id) => {
-  try {
-    const note = ($(`#anote-${id}`) || { value: '' }).value.trim();
-    await api(`/api/admin/orders/${id}/attention/resolve`, { method: 'POST', body: { note } });
-    state.approvalOpen = null;
-    toast('Incident cleared ✓');
-    await reloadAfterAction();
-  } catch (e) {
-    toast(e.message, true);
-  }
-};
-
 function queueRowHtml(item) {
   const key = item.kind + ':' + item.id;
   const open = state.approvalOpen === key;
