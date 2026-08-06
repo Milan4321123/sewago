@@ -214,10 +214,18 @@ test('a half-collected run resolves the taken order and releases the untouched o
   assert.equal(b.status, 'ready', 'the untouched order is packed and waiting again');
   assert.ok(!b.courierId, 'the vanished rider is no longer pinned to it');
 
-  // ...so the shopkeeper can hand the bag to the customer at the counter.
+  // ...but a prepaid DELIVERY order still never settles on the shop's word —
+  // only a courier dropoff (or the customer's own pickup code) proves arrival.
   const handover = await api(`/partner/store-orders/${orderB.id}/handover`, { method: 'POST', token: shopB.token });
-  assert.equal(handover.status, 200, JSON.stringify(handover.data));
-  assert.equal(handover.data.order.status, 'delivered');
+  assert.equal(handover.status, 409, 'counter handover of a delivery order stays forbidden');
+
+  // The documented exit when no rider is around: reject and refund. The order
+  // is not stranded — the customer gets every rupee back.
+  const bWalletBefore = (await api('/auth/me', { token: cB.token })).data.user.wallet;
+  const rejected = await api(`/partner/store-orders/${orderB.id}/reject`, { method: 'POST', token: shopB.token });
+  assert.equal(rejected.status, 200, JSON.stringify(rejected.data));
+  const bWalletAfter = (await api('/auth/me', { token: cB.token })).data.user.wallet;
+  assert.equal(bWalletAfter, bWalletBefore + orderB.total, 'reject refunds the released order in full');
 
   // The incident is queued for staff, naming the rider — and only the incident:
   // the released order needs nobody.

@@ -486,9 +486,9 @@ function recoverAbandonedRuns() {
         } else {
           // Still 'ready' on a shop counter the rider never reached: nothing
           // moved and no money settled, so release it exactly like a no-show.
-          // Clearing the courier lets the sweep re-batch it AND lets the
-          // shopkeeper hand it over at the counter — the partner app hides
-          // "Handed over" while any courierId is pinned to the order.
+          // Clearing the courier lets the sweep re-batch it to another rider;
+          // if none appears, the shop's exit is reject-and-refund — a prepaid
+          // delivery order never settles at the counter on the shop's word.
           order.courierId = null;
           order.courier = null;
         }
