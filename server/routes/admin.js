@@ -89,19 +89,37 @@ router.get('/admin/overview', authAdmin, (req, res) => {
   // Independent cross-check recomputed from the booking rows. It should track
   // the ledger; any gap means a money path wrote one but not the other, so the
   // drift is surfaced to staff instead of silently corrupting the books.
+  // A courier-abandoned order keeps its booked revenue even though its status
+  // is 'cancelled' — the vanished rider's debit funds it — so those orders
+  // count alongside 'delivered' ones.
+  const foodCounts = (o) => o.status === 'delivered' || o.cancelReason === 'courier_abandoned';
   const derivedTotal =
     completedRides.reduce((sum, r) => sum + (r.fare - (r.payout ?? payoutFor(r))), 0) +
     db.tasks.filter((t) => t.status === 'completed').reduce((sum, t) => sum + t.fee, 0) +
     db.withdrawals.filter((w) => w.status !== 'rejected').reduce((sum, w) => sum + w.fee, 0) +
     db.orders
-      .filter((o) => o.partnerCut && o.status === 'delivered')
+      .filter((o) => o.partnerCut && foodCounts(o))
       .reduce((sum, o) => sum + (o.total - o.partnerCut - (o.serviceFee || 0) - (o.courierPayout || 0)), 0) +
     db.bookings
       .filter((b) => b.partnerCut && b.status !== 'cancelled')
       .reduce((sum, b) => sum + (b.total - b.partnerCut), 0) +
     db.rides.filter((r) => r.status !== 'cancelled').reduce((sum, r) => sum + (r.serviceFee || 0), 0) +
-    db.orders.filter((o) => o.status === 'delivered').reduce((sum, o) => sum + (o.serviceFee || 0), 0) +
+    db.orders.filter(foodCounts).reduce((sum, o) => sum + (o.serviceFee || 0), 0) +
     db.rides.reduce((sum, r) => sum + (r.cancelFeePlatform || 0), 0) +
+    // Shop orders. Wallet income (commission + service fee) books at placement
+    // and is reversed only by an unwind — so every wallet order that was not
+    // unwound counts, whatever state it is in now. Cash income books only when
+    // the order settles (counter handover, courier drop, or abandoned billing).
+    (db.storeOrders || [])
+      .filter((o) => o.payment !== 'cash' && (o.status !== 'cancelled' || o.cancelReason === 'courier_abandoned'))
+      .reduce((sum, o) => sum + (o.commission || 0) + (o.serviceFee || 0), 0) +
+    (db.storeOrders || [])
+      .filter((o) => o.payment === 'cash' && o.partnerSettled)
+      .reduce((sum, o) => sum + (o.commission || 0), 0) -
+    // Courier run payouts are a cost, booked per completed run.
+    (db.deliveryRuns || [])
+      .filter((r) => r.status === 'completed')
+      .reduce((sum, r) => sum + (r.payout || 0), 0) +
     promotionFees;
 
   const count = (arr, fn) => arr.filter(fn).length;
@@ -373,6 +391,69 @@ router.get('/admin/queue', authAdmin, (req, res) => {
       partner: partnerInfo(s.ownerId)
     }));
   res.json({ restaurants, hotels, stores });
+});
+
+// Orders a courier collected and then vanished with — shop bags and food alike.
+// The money already auto-resolved when the abandonment was recovered (customer
+// refunded, partner income honoured, rider billed the order total) — this queue
+// is where staff review the incident, chase the rider and the goods, and
+// dismiss the flag once the case is truly dealt with.
+router.get('/admin/attention', authAdmin, (req, res) => {
+  const view = (o, kind, name) => {
+    const run = kind === 'store'
+      ? (db.deliveryRuns || []).find((r) => r.abandonedAt && r.orderIds.includes(o.id))
+      : null;
+    const rider = db.drivers.find((d) => d.id === (o.abandonedBy || o.courierId || (run && run.abandonedBy)));
+    const customer = db.users.find((u) => u.id === o.userId);
+    return {
+      id: o.id,
+      kind,
+      reason: o.needsAttention,
+      name,
+      items: (o.items || []).map((l) => `${l.qty}× ${l.name}`).join(', '),
+      total: o.total,
+      payment: o.payment,
+      refunded: o.payment !== 'cash',
+      abandonedAt: o.abandonedAt || (run && run.abandonedAt) || o.cancelledAt || null,
+      customer: customer ? { name: customer.name, phone: customer.phone || '—' } : null,
+      courier: rider
+        ? {
+          id: rider.id,
+          name: rider.name,
+          phone: rider.phone || '—',
+          owes: Math.max(0, -(rider.earnings || 0)),
+          suspended: !!rider.suspended
+        }
+        : null
+    };
+  };
+  const orders = [
+    ...(db.storeOrders || []).filter((o) => o.needsAttention).map((o) => view(o, 'store', o.storeName)),
+    ...(db.orders || []).filter((o) => o.needsAttention).map((o) => view(o, 'food', o.restaurantName))
+  ].sort((a, b) => (b.abandonedAt || 0) - (a.abandonedAt || 0));
+  res.json({ orders });
+});
+
+// Staff dealt with the incident. Clearing the flag only empties the queue —
+// the order stays cancelled and every ledger line stays put; any further
+// compensation goes through the existing wallet-adjust / settle-cash tools.
+router.post('/admin/attention/:id/resolve', authAdmin, (req, res) => {
+  const order = (db.storeOrders || []).find((o) => o.id === req.params.id)
+    || (db.orders || []).find((o) => o.id === req.params.id);
+  if (!order) return res.status(404).json({ error: 'Order not found.' });
+  if (!order.needsAttention) return res.status(400).json({ error: 'This order is not flagged for attention.' });
+  order.needsAttention = null;
+  order.attentionResolvedAt = Date.now();
+  save();
+  logAudit({
+    actor: adminActor(),
+    action: 'order_attention_resolved',
+    targetType: 'order',
+    targetId: order.id,
+    meta: { note: String((req.body || {}).note || '').trim().slice(0, 300) },
+    ip: req.ip
+  });
+  res.json({ order: { id: order.id, needsAttention: null } });
 });
 
 router.get('/admin/partners', authAdmin, (req, res) => {

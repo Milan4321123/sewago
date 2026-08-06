@@ -850,11 +850,14 @@ router.post('/store-orders', authRequired, (req, res) => {
     return res.status(400).json({ error: `An order can contain at most ${MAX_ORDER_LINES} different items.` });
   }
 
-  // Aggregate duplicates so the per-line checks actually bind.
+  // Aggregate duplicates so the per-line checks actually bind. Quantities must
+  // be whole numbers — the app only ever sends integers, and a hand-rolled
+  // qty of 0.5 would put fractional rupees into the wallet debit, the shop's
+  // pending income and the platform ledger (the food route enforces the same).
   const wanted = new Map();
   for (const line of items) {
     const qty = Number(line && line.qty);
-    if (!line || !line.itemId || !Number.isFinite(qty) || qty <= 0 || qty > 1000) {
+    if (!line || !line.itemId || !Number.isInteger(qty) || qty <= 0 || qty > 1000) {
       return res.status(400).json({ error: 'Invalid item in your basket.' });
     }
     wanted.set(line.itemId, (wanted.get(line.itemId) || 0) + qty);
@@ -1176,6 +1179,11 @@ router.post('/partner/store-orders/:orderId/:action(accept|reject|ready|handover
         });
       }
       order.partnerSettled = true;
+      // Handover IS the settlement moment. Stamp it, or a run formed around
+      // this order before the counter handover can still be worked by a rider
+      // afterwards — and its dropoff tick, gated only on moneySettledAt, would
+      // "settle" the order again, debiting that rider for cash they never held.
+      order.moneySettledAt = Date.now();
     }
   }
   save();

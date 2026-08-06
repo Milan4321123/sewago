@@ -333,8 +333,11 @@ const { sweepDeliveryRuns, recoverAbandonedRuns } = require('./deliveryRuns');
 setInterval(() => {
   try {
     // Recover abandoned runs first so their orders are back in the pool before
-    // this same pass tries to batch and offer.
-    if (recoverAbandonedRuns() + sweepDeliveryRuns()) save();
+    // this same pass tries to batch and offer. Abandoned food deliveries ride
+    // the same cadence — they used to sit in the hourly housekeeping sweep,
+    // which left a vanished courier's order (and the customer's refund) waiting
+    // up to an hour past its deadline.
+    if (recoverAbandonedDeliveries() + recoverAbandonedRuns() + sweepDeliveryRuns()) save();
   } catch (e) { logger.error('delivery_sweep_failed', { err: e.message }); }
 }, 5000).unref();
 
@@ -383,10 +386,9 @@ setInterval(() => {
   });
   dirty += beforeGroups - db.groupOrders.length;
   // Move stay-booking income from pending to withdrawable once check-in passes.
+  // (Abandoned-delivery recovery moved to the 5s courier sweep above — an
+  // hourly cadence made customers wait up to an hour past the deadline.)
   dirty += settleDueBookings();
-  // Re-offer deliveries a courier accepted but never collected, and flag ones
-  // where the food was picked up and never delivered.
-  dirty += recoverAbandonedDeliveries();
   if (dirty) save();
 }, 60 * 60 * 1000).unref();
 

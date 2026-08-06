@@ -1,6 +1,6 @@
 const { db, uid } = require('./db');
 const { haversineKm } = require('./places');
-const { driverIsAvailable, cashJobFitsFloat, ROAD_FACTOR } = require('./rideLogic');
+const { driverIsAvailable, cashJobFitsFloat, driverOwesTooMuch, ROAD_FACTOR } = require('./rideLogic');
 const events = require('./events');
 
 // Batched multi-stop courier runs.
@@ -219,6 +219,35 @@ function eligibleCouriers(runCash, near) {
     .sort((a, b) => a.km - b.km);
 }
 
+// An order can leave a run before any rider accepts it: handed over at the
+// counter while the run was still forming, cancelled, or released from an
+// abandoned run and then handed over at the till. Left alone, the run still
+// lists it — a rider gets dispatched to collect a bag that no longer exists
+// and is paid per stop for ticking hollow stops. Prune dead orders and
+// re-plan the route; a run with nothing left to carry is cancelled outright.
+// Only 'forming' runs are pruned: they have no rider and no ticked stops, so
+// rewriting the plan is safe, and every offered run cycles back through
+// 'forming' whenever an offer lapses or is declined.
+function pruneDeadOrders(run) {
+  const orders = run.orderIds
+    .map((id) => (db.storeOrders || []).find((o) => o.id === id))
+    .filter((o) => o && o.status !== 'delivered' && o.status !== 'cancelled');
+  if (orders.length === run.orderIds.length) return 0;
+  if (!orders.length) {
+    run.status = 'cancelled';
+    run.cancelledAt = Date.now();
+    run.cancelReason = 'nothing_left_to_carry';
+    return 1;
+  }
+  const from = pickupLocOf(orders[0]);
+  run.orderIds = orders.map((o) => o.id);
+  run.stops = planStops(orders, from);
+  run.distanceKm = routeDistanceKm(run.stops, from);
+  run.payout = payoutFor(run.stops, run.distanceKm);
+  run.cashToCollect = cashTotal(orders);
+  return 1;
+}
+
 /**
  * The batching sweep. Forms runs from ready orders and offers each to the
  * nearest suitable courier, cycling to the next when an offer lapses.
@@ -278,8 +307,11 @@ function sweepDeliveryRuns() {
   }
 
   // 3. Offer every run that is waiting for a courier, including the ones just
-  //    formed above.
+  //    formed above. Prune first: never dispatch a rider for orders that were
+  //    handed over or cancelled while the run sat in the pool.
   for (const run of db.deliveryRuns || []) {
+    if (run.status !== 'forming') continue;
+    changed += pruneDeadOrders(run);
     if (run.status !== 'forming') continue;
     const declined = new Set((run.offer && run.offer.declined) || []);
     const passed = (run.offer && run.offer.passed) || {};
@@ -337,6 +369,70 @@ function lastActivityAt(run) {
   return done.length ? Math.max(...done.map((s) => s.doneAt)) : (run.acceptedAt || run.createdAt);
 }
 
+// Money for a collected order whose rider vanished with the bag. This must NOT
+// be unwindStoreOrder: that restocks, and these goods physically left the shop.
+// Instead each party lands where the handshake says it should — the customer is
+// made whole (they got nothing), the shop keeps the sale (it genuinely handed
+// the goods over), and the rider absorbs the loss as a debt on their earnings
+// ledger, the same ledger COD debts live on, so staff collect it through the
+// existing cash-settlement flow. For a prepaid order the platform's commission
+// and service fee stay booked from placement: the rider's debit is what funds
+// the refund.
+function settleAbandonedOrder(order, courier) {
+  // Lazy require to avoid a circular import at module load time.
+  const { recordTxn, recordPlatformRevenue } = require('./payments');
+  const owner = (db.partners || []).find((p) => p.id === order.partnerId);
+  if (order.payment !== 'cash') {
+    const user = (db.users || []).find((u) => u.id === order.userId);
+    if (user) {
+      user.wallet += order.total;
+      recordTxn('user', user, {
+        type: 'store_refund',
+        label: `Courier failed to deliver — refund: ${order.storeName}`,
+        amount: order.total, sign: 1, refId: order.id
+      });
+    }
+    if (owner && !order.partnerSettled) {
+      owner.pendingEarnings = (owner.pendingEarnings || 0) - order.partnerCut;
+      owner.earnings = (owner.earnings || 0) + order.partnerCut;
+      recordTxn('partner', owner, {
+        type: 'store_income',
+        label: `Courier lost the delivery — income honoured: ${order.storeName}`,
+        amount: order.partnerCut, sign: 1, refId: order.id
+      });
+    }
+  } else if (owner && !order.partnerSettled) {
+    // Cash: the customer never paid, so there is nothing to refund — but the
+    // shop still handed over real goods. Billing the rider the order total
+    // below funds the shop's cut and the platform's commission, exactly as if
+    // the rider had collected at the customer's door.
+    owner.earnings = (owner.earnings || 0) + order.partnerCut;
+    recordTxn('partner', owner, {
+      type: 'store_income',
+      label: `Courier lost the delivery — income honoured: ${order.storeName}`,
+      amount: order.partnerCut, sign: 1, refId: order.id
+    });
+    recordPlatformRevenue({
+      source: 'store_commission',
+      label: `Store commission (courier abandoned): ${order.storeName}`,
+      amount: order.commission, refId: order.id
+    });
+  }
+  if (courier) {
+    courier.earnings = (courier.earnings || 0) - order.total;
+    recordTxn('driver', courier, {
+      type: 'abandoned_goods',
+      label: `Undelivered goods on abandoned run: ${order.storeName}`,
+      amount: order.total, sign: -1, refId: order.id
+    });
+    // Same rule as collecting cash at a door: too deep in debt means no more
+    // jobs of any kind until they settle up with staff.
+    if (driverOwesTooMuch(courier)) courier.online = false;
+  }
+  order.partnerSettled = true;
+  order.moneySettledAt = Date.now();
+}
+
 function recoverAbandonedRuns() {
   const now = Date.now();
   let changed = 0;
@@ -365,19 +461,36 @@ function recoverAbandonedRuns() {
     }
 
     if (!nothingCollected && idleFor > RUN_DROPOFF_DEADLINE_MS && !run.abandonedAt) {
-      // Goods have left the shop. Only a human can resolve where they went, so
-      // flag it for staff — but unpin the rider and release any order still
-      // undelivered, so the rest of the system is not held hostage.
+      // Goods have left the shop with a rider who went dark. Every resolution
+      // endpoint is status-gated away from 'collected', so waiting for a human
+      // to act first would strand the money indefinitely — resolve it NOW
+      // (refund, shop income, rider debt) and flag the incident for staff to
+      // review after the fact via the needs-attention queue.
       run.abandonedAt = now;
       run.abandonedBy = run.courierId;
       run.status = 'cancelled';
       run.cancelledAt = now;
       run.cancelReason = 'courier_abandoned';
       benchNoShow(run.courierId);
+      const courier = (db.drivers || []).find((d) => d.id === run.courierId);
       for (const orderId of run.orderIds) {
         const order = (db.storeOrders || []).find((o) => o.id === orderId);
-        if (order && order.status !== 'delivered' && order.status !== 'cancelled') {
+        if (!order || order.status === 'delivered' || order.status === 'cancelled') continue;
+        if (order.status === 'collected') {
+          // The bag is in the vanished rider's boot — terminal for this order.
+          settleAbandonedOrder(order, courier);
+          order.status = 'cancelled';
+          order.cancelledAt = now;
+          order.cancelReason = 'courier_abandoned';
           order.needsAttention = 'courier_abandoned';
+        } else {
+          // Still 'ready' on a shop counter the rider never reached: nothing
+          // moved and no money settled, so release it exactly like a no-show.
+          // Clearing the courier lets the sweep re-batch it AND lets the
+          // shopkeeper hand it over at the counter — the partner app hides
+          // "Handed over" while any courierId is pinned to the order.
+          order.courierId = null;
+          order.courier = null;
         }
       }
       changed += 1;
