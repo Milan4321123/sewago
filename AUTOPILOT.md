@@ -18,28 +18,24 @@ over → partner credited, courier paid, platform cut recorded.
 ## Backlog (ranked)
 1. **storeOrders unbounded growth** — `db.storeOrders` has no cap or pruning;
    insights (polled) and other endpoints scan the full array. Mirror the
-   stockMoves cap or resolve refIds from the tail. (Review finding, deferred.)
+   stockMoves cap or resolve refIds from the tail. (Blocked on the retention
+   decision below.)
 2. **Single-blob persistence bottleneck** — the known #1 scaling risk: whole
    DB serialized as one JSON blob (also on Supabase store). Split hot
    collections or move to per-collection persistence.
-3. **Customer receipt screen** — partners can print bills now; customers still
-   have no order-detail/receipt view in app.js, and delivered orders vanish
-   from their list. Natural trust win, reuses the invoice layout.
-4. **Customer order API over-shares** — `GET /store-orders` returns raw order
-   objects including `commission`, `partnerCut`, `partnerSettled`. Trim to a
-   customer view. (Small, privacy.)
-5. **Server error strings are English** — a Nepali-UI partner sees English
+3. **Server error strings are English** — a Nepali-UI partner sees English
    errors from the API (`data.error` passthrough). Either error codes with
    client-side translation, or an Accept-Language switch.
-6. **UTC day buckets vs shop-local midnight** — `salesDaily` keys are UTC, so
+4. **UTC day buckets vs shop-local midnight** — `salesDaily` keys are UTC, so
    the reports' "today" bar can lag the move-based totals until 05:45 NPT.
    Accepted approximation, documented in `salesInsights`; revisit if partners
    report confusion.
-7. **Re-run the interrupted review** — the adversarial review workflow lost
+5. **Re-run the interrupted review** — the adversarial review workflow lost
    its `js-correctness` and `ui-visual` finders to a session usage limit; only
    i18n and server-insights dimensions completed (all their findings fixed).
-8. **Terminology nit** — "Today's sales" renders as 'आजको आम्दानी' (income)
-   while sibling strings use 'बिक्री'; unify next time partner-lang is open.
+6. **Customer app localization** — the partner portal is Nepali-first; the
+   customer app (app.js, ~2900 lines) is still English-only. Reuse the t() +
+   dictionary + guard pattern; sizable but mechanical.
 
 ## Shipped log
 - 2026-08-06: Delivery runs prune dead (counter-handed/cancelled) orders before
@@ -55,6 +51,12 @@ over → partner credited, courier paid, platform cut recorded.
   (871eec6)
 - 2026-08-06: Three silent-English i18n fixes, 38 dead keys pruned, and a
   dictionary drift guard wired into `npm run verify`. (0f47428)
+- 2026-08-06: Customer order API stops leaking commission/partnerCut/internal
+  flags; contract locked by test. (aa83c1b)
+- 2026-08-06: Customer receipt screen + past-orders history in the shops tab,
+  printable via the shared invoice styles. (6f116cd)
+- 2026-08-06: Sales terminology unified in partner-lang (आम्दानी → बिक्री).
+  (448b0f6)
 
 ## Decisions needed (owner)
 - **Nepali as the default language** for every partner device (English is one
