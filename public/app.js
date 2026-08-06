@@ -2686,7 +2686,9 @@ function shopDetailView() {
   </div>
   ${s.items.length ? s.items.map((i) => shopItemRow(i, cart[i.id] || 0)).join('')
     : `<div class="empty"><div class="big">📦</div>This shop has not added items yet.</div>`}
-  <div style="height:${lines.length ? 190 : state.basket ? 140 : 70}px"></div>
+  <!-- Clearance for the fixed cart bar (~210px in pickup mode, taller with the
+       delivery address field) so the last rows can scroll above it. -->
+  <div style="height:${lines.length ? (fulfil === 'delivery' ? 300 : 240) : state.basket ? 140 : 70}px"></div>
   ${lines.length ? `
   <div class="cartbar">
     ${canDeliver ? `

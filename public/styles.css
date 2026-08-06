@@ -403,6 +403,9 @@ a.link { text-decoration: none; }
 }
 
 /* ---------- cart bar ---------- */
+/* Same glass chrome as the tabbar: the shop checkout stacks a fulfilment
+   toggle, an address field and ghost buttons in here, and without an opaque
+   backdrop the item list scrolls straight through the gaps. */
 .cartbar {
   position: fixed;
   bottom: calc(88px + env(safe-area-inset-bottom, 0px));
@@ -411,6 +414,13 @@ a.link { text-decoration: none; }
   width: calc(100% - 36px);
   max-width: 444px;
   z-index: 9;
+  background: var(--glass-chrome);
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  backdrop-filter: blur(24px) saturate(180%);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 22px;
+  padding: 10px;
+  box-shadow: var(--glass-hi), 0 12px 32px rgba(0, 0, 0, 0.5);
 }
 
 .qty { display: flex; align-items: center; gap: 10px; }
