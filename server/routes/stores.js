@@ -70,8 +70,15 @@ function ownerOf(store) {
 // Shared by the shopkeeper and helper flows: speech text in, item fields out.
 // Never writes anything — the client always confirms before saving.
 router.post('/stores/voice/parse', (req, res, next) => {
-  // Either a partner or a customer (helper) may be speaking.
-  if (req.headers.authorization) return next();
+  // Either a partner or a customer (helper) may be speaking — but it must be a
+  // real session, not merely any Authorization header. The old check accepted
+  // any non-empty header, which made this free anonymous compute.
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  const sessionTokens = require('../sessionTokens');
+  if (token && (sessionTokens.tokenOwner(db.tokens, token) || sessionTokens.tokenOwner(db.partnerTokens, token))) {
+    return next();
+  }
   res.status(401).json({ error: 'Please log in again.' });
 }, (req, res) => {
   const { text, lines } = req.body || {};
@@ -422,11 +429,40 @@ router.delete('/partner/stores/:id/helpers/:code', authPartner, (req, res) => {
 
 // A helper joins with the code the shopkeeper read out to them, using their own
 // customer account — so their counting work is attributed to them by name.
+//
+// A six-digit code is guessable if guessing is free — and a guess here is
+// matched against EVERY store's open invites at once, so unlimited tries would
+// eventually land an attacker inside somebody's stock room with count-editing
+// rights. Same discipline as the pickup code: a handful of tries, then a
+// cooldown. Eight covers a shopkeeper mumbling over a bad line; a brute force
+// needs ~65,000 fifteen-minute windows per expected hit.
+const HELPER_JOIN_MAX_TRIES = 8;
+const HELPER_JOIN_LOCK_MS = 15 * 60 * 1000;
+
 router.post('/stores/helper/join', authRequired, (req, res) => {
   const code = String((req.body || {}).code || '').trim();
   if (!/^\d{6}$/.test(code)) return res.status(400).json({ error: 'Enter the 6-digit code from the shopkeeper.' });
+  if ((req.user.helperJoinLockUntil || 0) > Date.now()) {
+    return res.status(429).json({ error: 'Too many wrong codes — wait a few minutes, then ask the shopkeeper to read the code again.' });
+  }
   const store = db.stores.find((s) => !s.removedAt && (s.helpers || []).some((h) => h.code === code && h.status === 'invited'));
-  if (!store) return res.status(404).json({ error: 'That code is not valid any more.' });
+  if (!store) {
+    req.user.helperJoinTries = (req.user.helperJoinTries || 0) + 1;
+    if (req.user.helperJoinTries >= HELPER_JOIN_MAX_TRIES) {
+      req.user.helperJoinTries = 0;
+      req.user.helperJoinLockUntil = Date.now() + HELPER_JOIN_LOCK_MS;
+      logAudit({
+        actor: { role: 'user', id: req.user.id, email: req.user.email },
+        action: 'store.helper.join_locked',
+        targetType: 'user',
+        targetId: req.user.id,
+        meta: { tries: HELPER_JOIN_MAX_TRIES }
+      });
+    }
+    save();
+    return res.status(404).json({ error: 'That code is not valid any more.' });
+  }
+  req.user.helperJoinTries = 0;
   const helper = store.helpers.find((h) => h.code === code);
   helper.status = 'active';
   helper.userId = req.user.id;
@@ -618,11 +654,14 @@ router.post('/store-orders', authRequired, (req, res) => {
     return res.status(400).json({ error: `An order can contain at most ${MAX_ORDER_LINES} different items.` });
   }
 
-  // Aggregate duplicates so the per-line checks actually bind.
+  // Aggregate duplicates so the per-line checks actually bind. Quantities must
+  // be whole numbers — the app only ever sends integers, and a hand-rolled
+  // qty of 0.5 would put fractional rupees into the wallet debit, the shop's
+  // pending income and the platform ledger (the food route enforces the same).
   const wanted = new Map();
   for (const line of items) {
     const qty = Number(line && line.qty);
-    if (!line || !line.itemId || !Number.isFinite(qty) || qty <= 0 || qty > 1000) {
+    if (!line || !line.itemId || !Number.isInteger(qty) || qty <= 0 || qty > 1000) {
       return res.status(400).json({ error: 'Invalid item in your basket.' });
     }
     wanted.set(line.itemId, (wanted.get(line.itemId) || 0) + qty);

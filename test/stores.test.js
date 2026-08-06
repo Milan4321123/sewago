@@ -718,3 +718,72 @@ test('a shop awaiting review is invisible to customers until it is approved', as
   const after = await api(`/store-search?q=secret masala&lat=${THAMEL.lat}&lng=${THAMEL.lng}&radiusKm=2`, { token: cust });
   assert.equal(after.data.results.length, 1, 'approval puts the shop into search immediately');
 });
+
+/* --- adversarial-security regressions ---------------------------------- */
+
+test('helper-join codes cannot be brute-forced', async () => {
+  // A 6-digit invite code is checked against EVERY store's open invites at
+  // once, so free guessing would eventually put an attacker inside somebody's
+  // stock room with count-editing rights. Wrong guesses now lock the account
+  // for a cooldown, the same discipline as pickup codes.
+  const shop = await openShop('Bruteforce Kirana');
+  const invite = await api(`/partner/stores/${shop.storeId}/helpers`, {
+    method: 'POST', token: shop.token, body: { name: 'Real Helper' }
+  });
+  const realCode = invite.data.invite.code;
+  const attacker = await registerUser('guesser');
+
+  const guesses = [];
+  for (let n = 111111; guesses.length < 8; n += 1) {
+    const c = String(n);
+    if (c !== realCode) guesses.push(c);
+  }
+  for (const g of guesses) {
+    const r = await api('/stores/helper/join', { method: 'POST', token: attacker.token, body: { code: g } });
+    assert.equal(r.status, 404, 'a wrong code reads as invalid');
+  }
+  const blocked = await api('/stores/helper/join', { method: 'POST', token: attacker.token, body: { code: realCode } });
+  assert.equal(blocked.status, 429, 'after too many wrong guesses even the right code must wait');
+
+  // The invited helper, on their own account, still joins normally.
+  const helper = await registerUser('legit-helper');
+  const joined = await api('/stores/helper/join', { method: 'POST', token: helper.token, body: { code: realCode } });
+  assert.equal(joined.status, 200, JSON.stringify(joined.data));
+});
+
+test('the voice parser only answers real sessions', async () => {
+  // Regression: it accepted ANY non-empty Authorization header — free
+  // anonymous compute behind a fake token.
+  const fake = await api('/stores/voice/parse', {
+    method: 'POST', token: 'not-a-real-token', body: { text: '2 kg sugar 100' }
+  });
+  assert.equal(fake.status, 401, 'a made-up token must be rejected');
+
+  const { token } = await registerUser('speaker');
+  const real = await api('/stores/voice/parse', { method: 'POST', token, body: { text: '2 kg sugar 100' } });
+  assert.equal(real.status, 200, 'a real customer (helper) session parses fine');
+});
+
+test('order quantities must be whole numbers — no fractional rupees in the books', async () => {
+  // The app only sends integers; a hand-rolled qty of 0.5 used to put
+  // fractional rupees into the wallet debit, the shop's pending income and
+  // the platform ledger (the food route already enforced this).
+  const shop = await openShop('Fraction Kirana');
+  const created = await api(`/partner/stores/${shop.storeId}/items`, {
+    method: 'POST', token: shop.token, body: { name: 'Dal', unit: 'kg', price: 101, stock: 10 }
+  });
+  const itemId = created.data.item.id;
+  const { token: cust } = await registerUser('fraction');
+
+  for (const qty of [0.5, 1.5, 0.0001]) {
+    const r = await api('/store-orders', {
+      method: 'POST', token: cust, body: { storeId: shop.storeId, items: [{ itemId, qty }], payment: 'wallet' }
+    });
+    assert.equal(r.status, 400, `qty ${qty} must be refused`);
+  }
+  const ok = await api('/store-orders', {
+    method: 'POST', token: cust, body: { storeId: shop.storeId, items: [{ itemId, qty: 2 }], payment: 'wallet' }
+  });
+  assert.equal(ok.status, 200, JSON.stringify(ok.data));
+  assert.equal(ok.data.order.total, 101 * 2 + 30 + 5, 'whole-rupee total: 2×101 + delivery 30 + service 5');
+});
