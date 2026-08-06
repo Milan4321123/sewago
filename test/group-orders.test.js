@@ -370,3 +370,23 @@ test('the counter code reaches only the host and members who paid', async () => 
   assert.equal(await codeFor(payer.token), realCode, 'a paying member can show the code');
   assert.equal(await codeFor(freeloader.token), null, 'a lobby member who paid nothing cannot collect the food');
 });
+
+test('a host cannot hoard open lobbies past the cap', async () => {
+  const shop = await onboardGroupRestaurant({ price: 400, pct: 10, minPeople: 2 });
+  const host = await registerUser('hoarder');
+  const when = Date.now() + 2 * 60 * 60 * 1000;
+  const open = () => api('/group-orders', {
+    method: 'POST', token: host.token, body: { restaurantId: shop.restaurantId, mode: 'pickup', scheduledFor: when }
+  });
+  for (let i = 0; i < 5; i += 1) {
+    assert.equal((await open()).status, 200, `lobby ${i + 1} opens (default cap is 5)`);
+  }
+  const sixth = await open();
+  assert.equal(sixth.status, 429, 'the sixth open lobby is refused');
+  assert.match(sixth.data.error, /place or cancel one/i);
+
+  // Cancelling one frees a slot — the cap is on LIVE lobbies, not lifetime.
+  const mine = (await api('/group-orders', { token: host.token })).data.groups.filter((g) => g.status === 'open');
+  await api(`/group-orders/${mine[0].id}/cancel`, { method: 'POST', token: host.token });
+  assert.equal((await open()).status, 200, 'a freed slot lets a new lobby open');
+});

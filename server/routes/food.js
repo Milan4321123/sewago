@@ -327,6 +327,10 @@ const GROUP_MAX_LEAD_MS = SCHEDULE_MAX_AHEAD_MS;
 // price. Generous by default so same-day groups are never nagged; tunable low
 // for tests.
 const GROUP_CONFIRM_TTL_MS = envNum('GROUP_CONFIRM_TTL_MIN', 24 * 60, 0.01, 14 * 24 * 60) * 60 * 1000;
+// One account opening lobbies without limit grows the (blob-persisted) state
+// until it is unusable. A host rarely runs more than a couple of live lobbies
+// at once, so this ceiling is invisible to real use and fatal to a flood.
+const GROUP_MAX_OPEN_PER_USER = envNum('GROUP_MAX_OPEN_PER_USER', 5, 1, 100);
 
 // 6-digit join code, unique among OPEN groups so a code always finds one lobby.
 function groupCode() {
@@ -445,6 +449,14 @@ router.post('/group-orders', authRequired, (req, res) => {
   const when = Math.round(Number(scheduledFor));
   if (!Number.isFinite(when) || when < Date.now() + GROUP_MIN_LEAD_MS || when > Date.now() + GROUP_MAX_LEAD_MS) {
     return res.status(400).json({ error: 'Pick a time at least 30 minutes from now (and within a week) so everyone can join.' });
+  }
+  // Only live lobbies count — a slot that has already passed is dead weight, not
+  // a lobby anyone can still use, so it never blocks opening a fresh one.
+  const liveHosted = db.groupOrders.filter(
+    (g) => g.hostUserId === req.user.id && g.status === 'open' && g.scheduledFor > Date.now()
+  ).length;
+  if (liveHosted >= GROUP_MAX_OPEN_PER_USER) {
+    return res.status(429).json({ error: `You already have ${GROUP_MAX_OPEN_PER_USER} open group orders — place or cancel one before starting another.` });
   }
   const group = {
     id: uid(),

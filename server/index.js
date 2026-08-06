@@ -363,6 +363,25 @@ setInterval(() => {
       dirty += 1;
     }
   }
+  // Group lobbies: an open one whose slot has passed is dead — place() already
+  // refuses it — so mark it expired; then drop cancelled/expired lobbies once
+  // they are a day old, so the blob-persisted state never grows without bound.
+  // (Placed lobbies are left to their order's own lifecycle.)
+  for (const g of db.groupOrders) {
+    if (g.status === 'open' && g.scheduledFor < now) {
+      g.status = 'expired';
+      g.expiredAt = now;
+      dirty += 1;
+    }
+  }
+  const beforeGroups = db.groupOrders.length;
+  db.groupOrders = db.groupOrders.filter((g) => {
+    if (g.status === 'cancelled' || g.status === 'expired') {
+      return now - (g.expiredAt || g.cancelledAt || g.createdAt) < 24 * 60 * 60 * 1000;
+    }
+    return true;
+  });
+  dirty += beforeGroups - db.groupOrders.length;
   // Move stay-booking income from pending to withdrawable once check-in passes.
   dirty += settleDueBookings();
   // Re-offer deliveries a courier accepted but never collected, and flag ones
