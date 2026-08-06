@@ -70,7 +70,8 @@ before(async () => {
   server = spawn(process.execPath, [path.join(__dirname, '..', 'server', 'index.js')], {
     env: {
       ...process.env, EXIT_WHEN_STDIN_CLOSES: '1', NODE_ENV: 'development', PORT: String(PORT), DATA_STORE: 'json', DATA_DIR: dataDir,
-      ADMIN_EMAIL, ADMIN_PASSWORD, OTP_PROVIDER: 'sandbox', EMAIL_PROVIDER: 'sandbox',
+      ADMIN_EMAIL, ADMIN_PASSWORD, OTP_PROVIDER: 'sandbox',
+      RATE_LIMIT_API_PER_MIN: '100000', EMAIL_PROVIDER: 'sandbox',
       STORE_COMMISSION_PCT: '8', STORE_SERVICE_FEE: '5', LOG_LEVEL: 'error',
       // The suite drives one server from one IP; the default strict budget
       // (60 per 10 min across auth+money paths) would trip as tests grow.
@@ -183,6 +184,105 @@ test('counter sales and restocks keep the number on screen matching the shelf', 
   assert.ok(reasons.includes('initial_count'));
 });
 
+test("a customer's order view carries the receipt, never the shop's economics", async () => {
+  const shop = await openShop();
+  const created = await api(`/partner/stores/${shop.storeId}/items`, {
+    method: 'POST', token: shop.token, body: { name: 'Ghee', unit: 'kg', price: 900, stock: 10 }
+  });
+  const { token: cust } = await registerUser('receipt-shopper');
+  const placed = await api('/store-orders', {
+    method: 'POST', token: cust,
+    body: { storeId: shop.storeId, items: [{ itemId: created.data.item.id, qty: 2 }], payment: 'wallet', fulfilment: 'pickup' }
+  });
+  assert.equal(placed.status, 200, JSON.stringify(placed.data));
+
+  const list = await api('/store-orders', { token: cust });
+  for (const [label, o] of [['creation response', placed.data.order], ['list response', list.data.orders[0]]]) {
+    // Everything a receipt needs…
+    assert.ok(o.items[0].price === 900 && o.items[0].qty === 2, `${label} keeps itemised lines`);
+    assert.ok(o.subtotal === 1800 && o.total > 0 && o.payment === 'wallet', `${label} keeps the money breakdown`);
+    assert.ok(o.pickupCode, `${label} keeps the customer's own pickup code`);
+    // …and none of the platform↔shop split or internal bookkeeping.
+    for (const secret of ['commission', 'partnerCut', 'partnerSettled', 'codeTries', 'partnerId', 'courierId']) {
+      assert.ok(!(secret in o), `${label} must not expose ${secret}`);
+    }
+  }
+});
+
+test('insights add up: walk-ins at current price, orders at charged price, cancels excluded', async () => {
+  const shop = await openShop();
+  const chiura = await api(`/partner/stores/${shop.storeId}/items`, {
+    method: 'POST', token: shop.token, body: { name: 'Chiura', unit: 'kg', price: 90, stock: 20 }
+  });
+  const waiwai = await api(`/partner/stores/${shop.storeId}/items`, {
+    method: 'POST', token: shop.token, body: { name: 'Wai Wai', unit: 'packet', price: 20, stock: 50 }
+  });
+
+  // Three sold at the counter, five sold through an app order…
+  await api(`/partner/stores/${shop.storeId}/items/${chiura.data.item.id}/sold`, {
+    method: 'POST', token: shop.token, body: { qty: 3 }
+  });
+  const { token: cust } = await registerUser('insight-shopper');
+  const order = await api('/store-orders', {
+    method: 'POST', token: cust,
+    body: { storeId: shop.storeId, items: [{ itemId: waiwai.data.item.id, qty: 5 }], payment: 'wallet' }
+  });
+  assert.equal(order.status, 200, JSON.stringify(order.data));
+
+  // …and two more that were ordered but cancelled — refunded money is not a sale.
+  const gone = await api('/store-orders', {
+    method: 'POST', token: cust,
+    body: { storeId: shop.storeId, items: [{ itemId: waiwai.data.item.id, qty: 2 }], payment: 'wallet' }
+  });
+  await api(`/store-orders/${gone.data.order.id}/cancel`, { method: 'POST', token: cust });
+
+  const since = Date.now() - 3600000; // "midnight" as far as this test day goes
+  const res = await api(`/partner/stores/${shop.storeId}/insights?since=${since}`, { token: shop.token });
+  assert.equal(res.status, 200, JSON.stringify(res.data));
+  const { totals, topItems, events, daily, items } = res.data;
+
+  assert.equal(totals.units, 8, 'three walk-in + five ordered; the cancelled two do not count');
+  assert.equal(totals.walkinUnits, 3);
+  assert.equal(totals.orderUnits, 5);
+  assert.equal(totals.orders, 1, 'the cancelled order is not an order');
+  // Walk-ins at the current price (3 × 90), the order at its charged line price
+  // (5 × 20) — fees are the platform's money, not the shop's sales.
+  assert.equal(totals.revenue, 3 * 90 + 5 * 20);
+
+  assert.equal(topItems.length, 2);
+  assert.equal(topItems[0].name, 'Chiura', 'ranked by revenue');
+  assert.equal(topItems[0].walkinQty, 3);
+  assert.equal(topItems[1].name, 'Wai Wai');
+  assert.equal(topItems[1].orderQty, 5);
+  assert.equal(topItems[1].revenue, 100);
+
+  // One event per sale, timestamped so the client can draw the day's rhythm.
+  assert.equal(events.length, 2);
+  assert.ok(events.every((e) => e.at >= since && e.qty > 0));
+
+  // The 30-day trend uses the daily counters, which deliberately stay gross of
+  // cancellations — so today shows all ten units that left the shelf. The
+  // buckets are UTC-dated, so allow the sale to land in "yesterday" when the
+  // suite happens to straddle a UTC midnight.
+  assert.equal(daily.length, 30);
+  assert.equal(daily[28].units + daily[29].units, 10);
+
+  // Per-item week/month totals, same gross convention, valued at the current
+  // shelf price — the shopkeeper's "what did rice earn this month".
+  const waiwaiRow = items.find((x) => x.name === 'Wai Wai');
+  assert.equal(waiwaiRow.qty7, 7, 'five ordered + two cancelled leave the daily counters at seven');
+  assert.equal(waiwaiRow.revenue7, 7 * 20);
+  assert.equal(waiwaiRow.qty30, 7);
+  const chiuraRow = items.find((x) => x.name === 'Chiura');
+  assert.equal(chiuraRow.qty7, 3);
+  assert.equal(chiuraRow.revenue30, 3 * 90);
+
+  // Another partner cannot read this shop's money.
+  const rival = await openShop();
+  const denied = await api(`/partner/stores/${shop.storeId}/insights`, { token: rival.token });
+  assert.equal(denied.status, 403);
+});
+
 test('a customer orders, stock is reserved, and cancelling puts it back', async () => {
   const shop = await openShop();
   const created = await api(`/partner/stores/${shop.storeId}/items`, {
@@ -289,8 +389,12 @@ test('a wallet order conserves money from customer to shopkeeper to platform', a
   const o = order.data.order;
   // 500 goods + 30 delivery + 5 service = 535; commission is 8% of goods = 40.
   assert.equal(o.total, 535);
-  assert.equal(o.commission, 40);
-  assert.equal(o.partnerCut, 490, 'shopkeeper keeps goods + delivery minus commission');
+  // The split is the shop's business, so it lives on the PARTNER's view of the
+  // order — the customer response deliberately no longer carries it.
+  const pview = await api(`/partner/stores/${shop.storeId}/orders`, { token: shop.token });
+  const po = pview.data.orders.find((x) => x.id === o.id);
+  assert.equal(po.commission, 40);
+  assert.equal(po.partnerCut, 490, 'shopkeeper keeps goods + delivery minus commission');
 
   const walletAfter = (await api('/auth/me', { token: cust })).data.user.wallet;
   assert.equal(walletBefore - walletAfter, 535, 'exactly the order total leaves the wallet');
@@ -314,7 +418,7 @@ test('a wallet order conserves money from customer to shopkeeper to platform', a
   assert.equal(stillPending.data.partner.pendingEarnings, 490, 'the income is still held');
 
   // Customer paid 535 = shopkeeper 490 + platform 45 (40 commission + 5 fee).
-  assert.equal(o.partnerCut + o.commission + o.serviceFee, o.total);
+  assert.equal(po.partnerCut + po.commission + po.serviceFee, o.total);
 });
 
 test('a shop cannot pocket a prepaid delivery order by declaring it handed over', async () => {

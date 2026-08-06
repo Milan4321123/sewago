@@ -2,6 +2,32 @@
 
 const $ = (sel) => document.querySelector(sel);
 
+/* ---------------- language ----------------
+   Nepali first: the shopkeeper this portal is built for reads नेपाली, so that
+   is the default; one button flips to English and the choice sticks. The
+   dictionary (partner-lang.js) is keyed by the English strings themselves, so
+   anything untranslated falls back to readable English — never a broken key. */
+const NE = window.SEWAGO_NE || {};
+let LANG = localStorage.getItem('sewago_partner_lang') || 'ne';
+document.documentElement.lang = LANG;
+
+function t(s, vars) {
+  let out = LANG === 'ne' && NE[s] ? NE[s] : s;
+  if (vars) for (const [k, v] of Object.entries(vars)) out = out.split(`{${k}}`).join(v);
+  return out;
+}
+
+window.toggleLang = () => {
+  LANG = LANG === 'ne' ? 'en' : 'ne';
+  localStorage.setItem('sewago_partner_lang', LANG);
+  document.documentElement.lang = LANG;
+  render();
+};
+
+function langButton() {
+  return `<button class="btn ghost compact no-print" onclick="toggleLang()">🌐 ${LANG === 'ne' ? 'English' : 'नेपाली'}</button>`;
+}
+
 const state = {
   token: localStorage.getItem('sewago_partner_token'),
   partner: null,
@@ -19,8 +45,10 @@ const state = {
   showPhoneEdit: false, // re-open the OTP form to change a verified phone
   photos: {}, // slot -> uploaded /uploads/ URL pending form submission
   photoBusy: '', // slot currently uploading (disables its button)
-  // Hub-and-spoke shell: Home launcher + full-screen pages (no bottom bar)
-  tab: localStorage.getItem('sewago_partner_tab') || 'home',
+  // Hub-and-spoke shell: Home launcher + full-screen pages (no bottom bar).
+  // Always boot on Home — reopening the app inside yesterday's page (Profile,
+  // Earnings…) disorients far more than one extra tap costs.
+  tab: 'home',
   _popNav: false, // current setTab was triggered by the browser back button
   pipeTab: 'new', // orders pipeline: new | progress | ready | done
   activeListing: null, // { kind:'restaurants'|'hotels', id } -> full-screen editor
@@ -34,8 +62,11 @@ const state = {
   activeStore: null, // store id -> opens the full-screen inventory manager
   inventory: null, // { items, stats, units, open, status }
   invSearch: '',
-  invTab: 'stock', // stock | reorder | subs
+  invTab: 'stock', // stock | reorder | subs | insights
   reorder: null,
+  insights: null, // today's sales, fetched when the insights tab opens
+  insightsPeriod: 'today', // today | week | month — the reports range switch
+  invoiceOrder: null, // store order rendered as a printable bill (full screen)
   storeOrders: [], // customer orders across ALL approved stores
   subReqs: {}, // storeId -> { requests, pendingByItem }
   subAccept: '', // subscription request id with the price inline-form open
@@ -48,8 +79,9 @@ const state = {
   voice: { listening: false, heard: '', error: '' }
 };
 
-// The old bottom bar persisted a combined 'listings' tab that no longer
-// exists — migrate those sessions (and any junk value) to Home.
+// The old shell persisted the last-open tab; that key is intentionally no
+// longer read (see state.tab above) and cleared so it never resurrects.
+localStorage.removeItem('sewago_partner_tab');
 const PAGES = ['home', 'orders', 'shops', 'restaurants', 'hotels', 'earnings', 'profile'];
 if (!PAGES.includes(state.tab)) state.tab = 'home';
 
@@ -74,10 +106,10 @@ async function api(path, opts = {}) {
   const data = await res.json().catch(() => ({}));
   if (res.status === 401 && state.partner) {
     logoutLocal();
-    throw new Error('Session expired — please log in again.');
+    throw new Error(t('Session expired — please log in again.'));
   }
   if (!res.ok) {
-    const err = new Error(data.error || 'Something went wrong');
+    const err = new Error(data.error || t('Something went wrong'));
     err.status = res.status; // callers branch on this (503 hides the AI card)
     throw err;
   }
@@ -96,9 +128,21 @@ function money(n) {
 
 function timeAgo(ts) {
   const min = Math.round((Date.now() - ts) / 60000);
-  if (min < 1) return 'just now';
-  if (min < 60) return `${min} min ago`;
-  return `${Math.round(min / 60)} h ago`;
+  if (min < 1) return t('just now');
+  if (min < 60) return t('{m} min ago', { m: min });
+  return t('{h} h ago', { h: Math.round(min / 60) });
+}
+
+// Mirrors the server's UNITS map so unit labels render even on screens where
+// the inventory (which carries it) has not been loaded — e.g. a bill opened
+// straight from the Orders page.
+const UNIT_LABELS = {
+  each: 'pcs', kg: 'kg', g: 'g', l: 'litre', ml: 'ml',
+  packet: 'packet', dozen: 'dozen', bottle: 'bottle', sack: 'bora'
+};
+function unitLabelOf(unit) {
+  const units = (state.inventory && state.inventory.units) || {};
+  return (units[unit] && units[unit].label) || UNIT_LABELS[unit] || unit || '';
 }
 
 let toastTimer;
@@ -125,11 +169,11 @@ function downscaleImage(file, maxSide = 1280, quality = 0.82) {
       canvas.width = Math.round(img.width * scale);
       canvas.height = Math.round(img.height * scale);
       canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
-      canvas.toBlob((blob) => (blob ? resolve(blob) : reject(new Error('Could not read that image.'))), 'image/jpeg', quality);
+      canvas.toBlob((blob) => (blob ? resolve(blob) : reject(new Error(t('Could not read that image.')))), 'image/jpeg', quality);
     };
     img.onerror = () => {
       URL.revokeObjectURL(url);
-      reject(new Error('That file is not an image.'));
+      reject(new Error(t('That file is not an image.')));
     };
     img.src = url;
   });
@@ -145,7 +189,7 @@ async function uploadPhotoBlob(blob) {
     body: blob
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || 'Photo upload failed.');
+  if (!res.ok) throw new Error(data.error || t('Photo upload failed.'));
   return data.url;
 }
 
@@ -158,7 +202,7 @@ function slotPhotos(slot) {
 
 // Reusable gallery field: up to 5 photos, tap ✕ on any to drop it. Uploaded
 // URLs park in state.photos[slot] until the form that owns the slot submits.
-function photoField(slot, label = '📷 Add photos') {
+function photoField(slot, label = '') {
   const urls = slotPhotos(slot);
   const busy = state.photoBusy === slot;
   return `
@@ -170,7 +214,7 @@ function photoField(slot, label = '📷 Add photos') {
       </span>`).join('')}
     ${urls.length < MAX_PHOTOS ? `
     <label class="btn ghost compact" style="margin:0">
-      ${busy ? 'Uploading…' : label}
+      ${busy ? t('Uploading…') : (label || t('📷 Add photos'))}
       <input type="file" accept="image/*" multiple style="display:none" ${busy ? 'disabled' : ''}
         onchange="pickPhoto(event, '${slot}')" />
     </label>` : ''}
@@ -201,13 +245,13 @@ window.pickPhoto = async (event, slot) => {
   try {
     for (const file of files) {
       if (urls.length >= MAX_PHOTOS) {
-        toast(`Up to ${MAX_PHOTOS} photos each.`, true);
+        toast(t('Up to {n} photos each.', { n: MAX_PHOTOS }), true);
         break;
       }
       const blob = await downscaleImage(file);
       urls.push(await uploadPhotoBlob(blob));
     }
-    toast(`${urls.length} photo${urls.length > 1 ? 's' : ''} ready 📷`);
+    toast(t('{n} ready 📷', { n: urls.length }));
   } catch (e) {
     toast(e.message, true);
   } finally {
@@ -237,7 +281,7 @@ function listingGallery(type, x) {
         <button class="photo-x" onclick="removeListingPhoto('${type}', '${x.id}', '${esc(url)}')">✕</button>
       </span>`).join('')}
     ${urls.length < MAX_PHOTOS ? `
-    <label class="btn ghost compact" style="margin:0">📷 Add photos
+    <label class="btn ghost compact" style="margin:0">${t('📷 Add photos')}
       <input type="file" accept="image/*" multiple style="display:none"
         onchange="addListingPhotos(event, '${type}', '${x.id}')" />
     </label>` : ''}
@@ -248,12 +292,12 @@ window.addListingPhotos = async (event, type, id) => {
   const files = Array.from(event.target.files || []);
   if (!files.length) return;
   try {
-    toast('Uploading…');
+    toast(t('Uploading…'));
     const list = type === 'restaurants' ? state.restaurants : state.hotels;
     const photos = photosOf(list.find((x) => x.id === id) || {});
     for (const file of files) {
       if (photos.length >= MAX_PHOTOS) {
-        toast(`Up to ${MAX_PHOTOS} photos each.`, true);
+        toast(t('Up to {n} photos each.', { n: MAX_PHOTOS }), true);
         break;
       }
       const blob = await downscaleImage(file);
@@ -261,7 +305,7 @@ window.addListingPhotos = async (event, type, id) => {
     }
     await api(`/api/partner/${type}/${id}/photo`, { method: 'POST', body: { photos } });
     await reload();
-    toast('Photos updated 📷');
+    toast(t('Photos updated 📷'));
     render();
   } catch (e) {
     toast(e.message, true);
@@ -274,7 +318,7 @@ window.removeListingPhoto = async (type, id, url) => {
     const photos = photosOf(list.find((x) => x.id === id) || {}).filter((u) => u !== url);
     await api(`/api/partner/${type}/${id}/photo`, { method: 'POST', body: { photos } });
     await reload();
-    toast('Photo removed.');
+    toast(t('Photo removed.'));
     render();
   } catch (e) {
     toast(e.message, true);
@@ -367,17 +411,17 @@ async function connectEvents() {
       await reload().catch(() => {});
       const status = state.partner && state.partner.businessKycStatus;
       if (status !== prev) {
-        if (status === 'approved') toast('🎉 Your business KYC was approved — you can now list and withdraw!');
-        else if (status === 'rejected') toast('Your business KYC was rejected — see the note in the KYC card.', true);
+        if (status === 'approved') toast(t('🎉 Your business KYC was approved — you can now list and withdraw!'));
+        else if (status === 'rejected') toast(t('Your business KYC was rejected — see the note in the KYC card.'), true);
       }
     } else if (msg.topic === 'wallet') {
       await reload().catch(() => {});
-      if (msg.event === 'withdrawal_paid') toast('🏦 Your payout was approved and sent.');
-      if (msg.event === 'withdrawal_rejected') toast('Your payout was rejected — the amount is back in your earnings.', true);
+      if (msg.event === 'withdrawal_paid') toast(t('🏦 Your payout was approved and sent.'));
+      if (msg.event === 'withdrawal_rejected') toast(t('Your payout was rejected — the amount is back in your earnings.'), true);
     } else if (msg.topic === 'subscribe_requests') {
       // Badge on the Shops home tile / the inventory Subscriptions tab, instantly.
       await loadSubscribeRequests().catch(() => {});
-      toast('🔁 A customer asked for a subscriber price — see your shop.');
+      toast(t('🔁 A customer asked for a subscriber price — see your shop.'));
     } else if (msg.topic === 'store_orders' || msg.topic === 'stores') {
       await Promise.all([loadStores(), loadStoreOrders()]).catch(() => {});
       if (state.activeStore) await loadInventory().catch(() => {});
@@ -412,100 +456,104 @@ setInterval(async () => {
 
 function authView() {
   const isLogin = state.authMode === 'login';
+  const langRow = `<div style="display:flex;justify-content:flex-end;margin-bottom:8px">${langButton()}</div>`;
   if (state.authMode === 'reset') {
     return `
     <div class="auth-wrap">
+      ${langRow}
       <div class="auth-hero">
         <div class="logo">🔐</div>
-        <h1>Partner password</h1>
-        <p>Reset your partner portal password.</p>
+        <h1>${t('Partner password')}</h1>
+        <p>${t('Reset your partner portal password.')}</p>
       </div>
       <div class="card">
-        <label class="field"><span>Email</span><input id="p-reset-email" type="email" placeholder="you@business.com" /></label>
-        <button class="btn" onclick="partnerRequestPasswordReset()">Send reset token</button>
-        ${state.resetToken ? `<div class="muted small" style="margin-top:10px">Sandbox token: <b style="color:var(--text)">${esc(state.resetToken)}</b></div>` : ''}
+        <label class="field"><span>${t('Email')}</span><input id="p-reset-email" type="email" placeholder="you@business.com" /></label>
+        <button class="btn" onclick="partnerRequestPasswordReset()">${t('Send reset token')}</button>
+        ${state.resetToken ? `<div class="muted small" style="margin-top:10px">${t('Sandbox token:')} <b style="color:var(--text)">${esc(state.resetToken)}</b></div>` : ''}
         <div class="divider"></div>
-        <label class="field"><span>Reset token</span><input id="p-reset-token" value="${esc(state.resetToken)}" placeholder="Paste token" /></label>
-        <label class="field"><span>New password</span><input id="p-reset-password" type="password" placeholder="At least 6 characters" /></label>
-        <button class="btn" onclick="partnerCompletePasswordReset()">Change password</button>
-        <button class="btn ghost" style="margin-top:8px" onclick="setAuthMode('login')">Back to login</button>
+        <label class="field"><span>${t('Reset token')}</span><input id="p-reset-token" value="${esc(state.resetToken)}" placeholder="${t('Paste token')}" /></label>
+        <label class="field"><span>${t('New password')}</span><input id="p-reset-password" type="password" placeholder="${t('At least 6 characters')}" /></label>
+        <button class="btn" onclick="partnerCompletePasswordReset()">${t('Change password')}</button>
+        <button class="btn ghost" style="margin-top:8px" onclick="setAuthMode('login')">${t('Back to login')}</button>
       </div>
     </div>`;
   }
   if (state.authMode === 'otp') {
     return `
     <div class="auth-wrap">
+      ${langRow}
       <div class="auth-hero">
         <div class="logo">📲</div>
-        <h1>Partner phone login</h1>
-        <p>Use the mobile number registered to your partner account.</p>
+        <h1>${t('Partner phone login')}</h1>
+        <p>${t('Use the mobile number registered to your partner account.')}</p>
       </div>
       <div class="card">
-        <label class="field"><span>Mobile number</span>
-          <input id="p-otp-phone" value="${esc(state.otpLogin.phone)}" placeholder="e.g. +9779841000000" autocomplete="tel" />
+        <label class="field"><span>${t('Mobile number')}</span>
+          <input id="p-otp-phone" value="${esc(state.otpLogin.phone)}" placeholder="${t('e.g.')} +9779841000000" autocomplete="tel" />
         </label>
-        <button class="btn" onclick="partnerRequestOtpLogin()">Send code</button>
-        ${state.otpLogin.devCode ? `<div class="muted small" style="margin-top:10px">Sandbox OTP: <b style="color:var(--text)">${esc(state.otpLogin.devCode)}</b></div>` : ''}
+        <button class="btn" onclick="partnerRequestOtpLogin()">${t('Send code')}</button>
+        ${state.otpLogin.devCode ? `<div class="muted small" style="margin-top:10px">${t('Sandbox OTP:')} <b style="color:var(--text)">${esc(state.otpLogin.devCode)}</b></div>` : ''}
         <div class="divider"></div>
-        <label class="field"><span>OTP code</span>
+        <label class="field"><span>${t('OTP code')}</span>
           <input id="p-otp-code" inputmode="numeric" placeholder="123456" autocomplete="one-time-code" />
         </label>
-        <button class="btn" onclick="partnerVerifyOtpLogin()">Continue</button>
-        <button class="btn ghost" style="margin-top:8px" onclick="setAuthMode('login')">Back to email login</button>
+        <button class="btn" onclick="partnerVerifyOtpLogin()">${t('Continue')}</button>
+        <button class="btn ghost" style="margin-top:8px" onclick="setAuthMode('login')">${t('Back to email login')}</button>
       </div>
     </div>`;
   }
   return `
   <div class="auth-wrap">
+    ${langRow}
     <div class="auth-hero">
       <img class="logo-img" src="/icon.svg" alt="SewaGo Partner" />
-      <h1>Sewa<em>Go</em> Partner</h1>
-      <p>List your restaurant or hotel once — customers see it in the app instantly.</p>
+      <h1>Sewa<em>Go</em> ${t('Partner')}</h1>
+      <p>${t('List your restaurant, hotel or shop once — customers see it in the app instantly.')}</p>
       <div class="auth-services">
-        <span>🍜 <b>Restaurants</b></span><span>🏨 <b>Hotels</b></span>
+        <span>🍜 <b>${t('Restaurants')}</b></span><span>🏨 <b>${t('Hotels')}</b></span><span>🏪 <b>${t('Shops')}</b></span>
       </div>
     </div>
     <div class="card">
       ${isLogin ? '' : `
-      <label class="field"><span>Business / owner name</span>
-        <input id="p-name" placeholder="e.g. Adhikari Hospitality" />
+      <label class="field"><span>${t('Business / owner name')}</span>
+        <input id="p-name" placeholder="${t('e.g.')} Adhikari Hospitality" />
       </label>`}
-      <label class="field"><span>Email</span>
+      <label class="field"><span>${t('Email')}</span>
         <input id="p-email" type="email" placeholder="you@business.com" />
       </label>
-      <label class="field"><span>Password</span>
-        <input id="p-password" type="password" placeholder="At least 6 characters" />
+      <label class="field"><span>${t('Password')}</span>
+        <input id="p-password" type="password" placeholder="${t('At least 6 characters')}" />
       </label>
       ${isLogin ? '' : `
       <div class="grid2">
-        <label class="field"><span>Phone (we call to verify)</span>
-          <input id="p-phone" placeholder="e.g. 9841000000" />
+        <label class="field"><span>${t('Phone (we call to verify)')}</span>
+          <input id="p-phone" placeholder="${t('e.g.')} 9841000000" />
         </label>
-        <label class="field"><span>Registration / PAN no.</span>
-          <input id="p-regno" placeholder="e.g. PAN-301234567" />
+        <label class="field"><span>${t('Registration / PAN no.')}</span>
+          <input id="p-regno" placeholder="${t('e.g.')} PAN-301234567" />
         </label>
       </div>
       <div class="muted small" style="margin-bottom:12px">
-        🛡️ Every listing is reviewed by the SewaGo team before it goes live. Keep your registration certificate handy — we verify the number and call you.
+        ${t('🛡️ Every listing is reviewed by the SewaGo team before it goes live. Keep your registration certificate handy — we verify the number and call you.')}
       </div>`}
-      <button class="btn" onclick="submitAuth()">${isLogin ? 'Log in' : 'Join as a partner'}</button>
-      ${isLogin ? `<button class="btn ghost" style="margin-top:8px" onclick="setAuthMode('otp')">Log in with phone OTP</button>` : ''}
+      <button class="btn" onclick="submitAuth()">${isLogin ? t('Log in') : t('Join as a partner')}</button>
+      ${isLogin ? `<button class="btn ghost" style="margin-top:8px" onclick="setAuthMode('otp')">${t('Log in with phone OTP')}</button>` : ''}
       <div style="text-align:center;margin-top:14px">
         <button class="link" onclick="toggleAuthMode()">
-          ${isLogin ? 'New partner? Create an account' : 'Already registered? Log in'}
+          ${isLogin ? t('New partner? Create an account') : t('Already registered? Log in')}
         </button>
       </div>
-      ${isLogin ? `<div style="text-align:center;margin-top:10px"><button class="link" onclick="setAuthMode('reset')">Forgot password?</button></div>` : ''}
+      ${isLogin ? `<div style="text-align:center;margin-top:10px"><button class="link" onclick="setAuthMode('reset')">${t('Forgot password?')}</button></div>` : ''}
     </div>
     ${isLogin ? `
     <div class="card">
       <div class="muted small" style="line-height:1.8">
-        <b style="color:var(--text)">Demo partner</b> (password: <b style="color:var(--text)">partner123</b>)<br/>
+        <b style="color:var(--text)">${t('Demo partner')}</b> (${t('password:')} <b style="color:var(--text)">partner123</b>)<br/>
         partner.demo@sewago.app · 🏪 shopkeeper.demo@sewago.app
       </div>
     </div>` : ''}
     <div style="text-align:center;margin-top:14px">
-      <a class="link" href="/">← Back to the customer app</a>
+      <a class="link" href="/">${t('← Back to the customer app')}</a>
     </div>
   </div>`;
 }
@@ -531,7 +579,7 @@ function completePartnerAuth(data) {
   state.hotels = data.hotels || [];
   state.otpLogin = { phone: '', devCode: '' };
   localStorage.setItem('sewago_partner_token', data.token);
-  toast(`Welcome, ${data.partner.name}! 🤝`);
+  toast(t('Welcome, {name}! 🤝', { name: data.partner.name }));
   connectEvents();
   // The login payload carries restaurants and hotels but not shops, so fetch
   // those before the first paint shows an empty "add your shop" prompt.
@@ -572,7 +620,7 @@ window.partnerRequestOtpLogin = async () => {
     const phone = $('#p-otp-phone').value.trim();
     const data = await api('/api/partner/otp/request', { method: 'POST', body: { phone } });
     state.otpLogin = { phone: data.phone || phone, devCode: data.devCode || '' };
-    toast(data.message || 'Verification code sent.');
+    toast(data.devCode ? t('Sandbox OTP: {code}', { code: data.devCode }) : t('Verification code sent.'));
     render();
   } catch (e) {
     toast(e.message, true);
@@ -601,7 +649,7 @@ window.partnerRequestPasswordReset = async () => {
       body: { email: $('#p-reset-email').value.trim() }
     });
     state.resetToken = data.devResetToken || '';
-    toast(data.message || 'If the account exists, reset instructions were sent.');
+    toast(data.devResetToken ? t('Sandbox reset token is filled in below.') : t('If the account exists, reset instructions were sent.'));
     render();
   } catch (e) {
     toast(e.message, true);
@@ -616,7 +664,7 @@ window.partnerCompletePasswordReset = async () => {
     });
     state.resetToken = '';
     state.authMode = 'login';
-    toast('Password changed. Log in with the new password.');
+    toast(t('Password changed. Log in with the new password.'));
     render();
   } catch (e) {
     toast(e.message, true);
@@ -647,6 +695,12 @@ function render() {
     app.innerHTML = authView();
     return;
   }
+  // A bill being shown (or printed) sits above everything — nothing else may
+  // leak onto the paper.
+  if (state.invoiceOrder) {
+    app.innerHTML = invoiceView();
+    return;
+  }
   // Full-screen takeovers: a shopkeeper working the shelves — or a partner
   // editing one menu — should not be scrolling past the rest of the dashboard.
   if (state.activeStore) {
@@ -659,9 +713,9 @@ function render() {
   }
   app.innerHTML = `
     <header class="topbar">
-      ${state.tab !== 'home' ? `<button class="back-chip" onclick="setTab('home')" aria-label="Back to Home">←</button>` : ''}
-      <div class="brand"><img class="brand-mark" src="/icon.svg" alt="" />Sewa<em>Go</em> <span class="muted" style="font-size:13px;font-weight:700">PARTNER</span></div>
-      <span class="badge">${esc(state.partner.name)}</span>
+      ${state.tab !== 'home' ? `<button class="back-chip" onclick="setTab('home')" aria-label="${t('Back to Home')}">←</button>` : ''}
+      <div class="brand"><img class="brand-mark" src="/icon.svg" alt="" />Sewa<em>Go</em> <span class="muted" style="font-size:13px;font-weight:700">${t('PARTNER')}</span></div>
+      <div style="display:flex;gap:8px;align-items:center">${langButton()}<span class="badge">${esc(state.partner.name)}</span></div>
     </header>
     <main id="view"></main>`;
   renderTab();
@@ -700,7 +754,6 @@ window.setTab = async (tab) => {
   }
   state._pageAnim = state.tab !== tab;
   state.tab = tab;
-  localStorage.setItem('sewago_partner_tab', tab);
   try {
     if (tab === 'home') {
       await Promise.all([reloadOrders(), loadStores()]);
@@ -722,6 +775,7 @@ window.setTab = async (tab) => {
 window.addEventListener('popstate', () => {
   if (!state.partner || state.tab === 'home') return;
   // Close whatever takeover sits on top first — back always lands on Home.
+  if (state.invoiceOrder) closeInvoice();
   if (state.activeStore) closeStore();
   if (state.activeListing) closeListing();
   state._popNav = true;
@@ -745,7 +799,7 @@ function homeTile(id, ico, label, hint, badge) {
 function homeTab() {
   const p = state.partner;
   const hour = new Date().getHours();
-  const hello = hour < 12 ? 'Good morning' : hour < 18 ? 'Namaste' : 'Good evening';
+  const hello = hour < 12 ? t('Good morning') : hour < 18 ? t('Namaste') : t('Good evening');
   const needAction = actionableOrderCount();
   const inFlight = state.orders.filter((o) => ['preparing', 'ready', 'out_for_delivery'].includes(o.status)).length
     + state.storeOrders.filter((o) => ['accepted', 'ready'].includes(o.status)).length;
@@ -760,25 +814,25 @@ function homeTab() {
   ${kycNotice()}
   ${!partnerReady() ? `
   <div class="card" style="border-color:var(--accent)">
-    <div style="font-weight:900">Finish setting up</div>
+    <div style="font-weight:900">${t('Finish setting up')}</div>
     <div class="muted small" style="margin:6px 0 10px">
-      ${!p.phoneVerified ? 'Verify your phone number' : 'Complete business KYC'} to unlock listings and withdrawals.
+      ${!p.phoneVerified ? t('Verify your phone number to unlock listings and withdrawals.') : t('Complete business KYC to unlock listings and withdrawals.')}
     </div>
-    <button class="btn" onclick="setTab('profile')">${!p.phoneVerified ? '📱 Verify phone' : '🛡️ Complete KYC'}</button>
+    <button class="btn" onclick="setTab('profile')">${!p.phoneVerified ? t('📱 Verify phone') : t('🛡️ Complete KYC')}</button>
   </div>` : ''}
   <div class="home-grid">
-    ${homeTile('orders', '🧾', 'Orders',
-      needAction ? `${needAction} need${needAction === 1 ? 's' : ''} your action`
-        : inFlight ? `${inFlight} in progress` : 'food & shop orders', needAction)}
-    ${homeTile('shops', '🏪', 'Shops',
-      `${state.stores.length || 'no'} shop${state.stores.length === 1 ? '' : 's'} · ${lowStock ? `⚠️ ${lowStock} low` : 'inventory & subs'}`, subPending)}
-    ${homeTile('restaurants', '🍜', 'Restaurants',
-      liveRest ? `${liveRest} live` : state.restaurants.length ? `${state.restaurants.length} in review` : 'list your kitchen', 0)}
-    ${homeTile('hotels', '🏨', 'Hotels',
-      liveHotels ? `${liveHotels} live` : state.hotels.length ? `${state.hotels.length} in review` : 'list your rooms', 0)}
-    ${homeTile('earnings', '💰', 'Earnings',
-      `${money(p.earnings || 0)}${revenueToday ? ` · ${money(revenueToday)} today` : ''}`, 0)}
-    ${homeTile('profile', '👤', 'Profile', 'KYC · phone · account', 0)}
+    ${homeTile('orders', '🧾', t('Orders'),
+      needAction ? t('{n} need your action', { n: needAction })
+        : inFlight ? t('{n} in progress', { n: inFlight }) : t('food & shop orders'), needAction)}
+    ${homeTile('shops', '🏪', t('Shops'),
+      `${t('{n} shops', { n: state.stores.length || 0 })} · ${lowStock ? `⚠️ ${t('{n} low', { n: lowStock })}` : t('inventory & subs')}`, subPending)}
+    ${homeTile('restaurants', '🍜', t('Restaurants'),
+      liveRest ? t('{n} live', { n: liveRest }) : state.restaurants.length ? t('{n} in review', { n: state.restaurants.length }) : t('list your kitchen'), 0)}
+    ${homeTile('hotels', '🏨', t('Hotels'),
+      liveHotels ? t('{n} live', { n: liveHotels }) : state.hotels.length ? t('{n} in review', { n: state.hotels.length }) : t('list your rooms'), 0)}
+    ${homeTile('earnings', '💰', t('Earnings'),
+      `${money(p.earnings || 0)}${revenueToday ? ` · ${money(revenueToday)} ${t('today')}` : ''}`, 0)}
+    ${homeTile('profile', '👤', t('Profile'), t('KYC · phone · account'), 0)}
   </div>`;
 }
 
@@ -840,17 +894,17 @@ function ordersTab() {
     });
   }
   buckets.done = buckets.done.slice(0, 12);
-  const t = buckets[state.pipeTab] ? state.pipeTab : 'new';
+  const cur = buckets[state.pipeTab] ? state.pipeTab : 'new';
   return `
-  <div class="section-title">Orders 🧾</div>
+  <div class="section-title">${t('Orders')} 🧾</div>
   <div class="pipe-tabs">
     ${['new', 'progress', 'ready', 'done'].map((k) => `
-    <button class="${t === k ? 'active' : ''}" onclick="setPipeTab('${k}')">${PIPE_LABELS[k]}${
+    <button class="${cur === k ? 'active' : ''}" onclick="setPipeTab('${k}')">${t(PIPE_LABELS[k])}${
       k !== 'done' && buckets[k].length ? ` <b class="tab-badge">${buckets[k].length}</b>` : ''}</button>`).join('')}
   </div>
-  ${buckets[t].length
-    ? buckets[t].map((o) => (o._kind === 'food' ? foodOrderCard(o) : storeOrderCard(o))).join('')
-    : `<div class="empty"><div class="big">🧾</div>${PIPE_EMPTY[t]}</div>`}`;
+  ${buckets[cur].length
+    ? buckets[cur].map((o) => (o._kind === 'food' ? foodOrderCard(o) : storeOrderCard(o))).join('')
+    : `<div class="empty"><div class="big">🧾</div>${t(PIPE_EMPTY[cur])}</div>`}`;
 }
 
 window.setPipeTab = (tab) => {
@@ -921,23 +975,23 @@ function foodOrderCard(o) {
       <div>
         <div><b>${esc(o.restaurantName)}</b> · ${esc(o.customerName)}</div>
         <div class="muted small">${o.items.map((l) => `${l.qty}× ${esc(l.name)}`).join(', ')}</div>
-        <div class="muted small">🍜 food order${o.deliveryLoc ? ` · 📍 ${esc(o.deliveryLoc.name)}` : ''}</div>
+        <div class="muted small">${t('🍜 food order')}${o.deliveryLoc ? ` · 📍 ${esc(o.deliveryLoc.name)}` : ''}</div>
       </div>
       <div class="rt">
         <b>${money(o.subtotal)}</b>
-        <div class="muted small">you earn ${money(o.partnerCut)}</div>
+        <div class="muted small">${t('you earn')} ${money(o.partnerCut)}</div>
         <span class="badge ${o.status === 'placed' ? 'amber' : 'gray'}">⏱ ${timeAgo(o.createdAt)}</span>
       </div>
     </div>
     ${orderChips(o)}
-    <div class="muted small" style="margin-top:8px">${line || esc(o.status)}${
+    <div class="muted small" style="margin-top:8px">${line ? t(line) : esc(o.status)}${
       o.courier ? ` · 🛵 ${esc(o.courier.name)} (${esc(o.courier.plate)})` : ''}</div>
     ${groupSplitBlock(o)}
     ${o.status === 'placed' ? (state.confirmReject === o.id ? `
     <div class="inline-form">
-      <span>Reject this order? The customer is refunded in full.</span>
-      <button class="btn danger" onclick="rejectOrder('${o.id}')">Reject & refund</button>
-      <button class="btn ghost" onclick="setConfirmReject('')">Back</button>
+      <span>${t('Reject this order? The customer is refunded in full.')}</span>
+      <button class="btn danger" onclick="rejectOrder('${o.id}')">${t('Reject & refund')}</button>
+      <button class="btn ghost" onclick="setConfirmReject('')">${t('Back')}</button>
     </div>` : `
     <button class="btn" style="margin-top:10px" onclick="acceptOrder('${o.id}')">✅ Accept — start cooking</button>
     <button class="btn ghost compact" style="margin-top:8px" onclick="setConfirmReject('${o.id}')">Reject…</button>`) : ''}
@@ -965,7 +1019,7 @@ function foodOrderCard(o) {
 window.acceptOrder = async (id) => {
   try {
     await api(`/api/partner/orders/${id}/accept`, { method: 'POST' });
-    toast('Order accepted — a courier is being arranged 🛵');
+    toast(t('Order accepted — a courier is being arranged 🛵'));
     await reloadOrders();
     render();
   } catch (e) {
@@ -977,7 +1031,7 @@ window.rejectOrder = async (id) => {
   try {
     await api(`/api/partner/orders/${id}/reject`, { method: 'POST', body: { note: '' } });
     state.confirmReject = '';
-    toast('Order rejected — customer refunded.');
+    toast(t('Order rejected — customer refunded.'));
     await reloadOrders();
     render();
   } catch (e) {
@@ -1048,37 +1102,39 @@ function storeOrderCard(o) {
   <div class="card" ${o.status === 'placed' ? 'style="border-color:var(--accent)"' : ''}>
     <div class="row">
       <div class="grow">
-        <div style="font-weight:800">${esc(o.customerName)} <span class="muted small">· ${store.icon || '🏪'} ${esc(store.name || 'your shop')}</span></div>
+        <div style="font-weight:800">${esc(o.customerName)} <span class="muted small">· ${store.icon || '🏪'} ${esc(store.name || t('your shop'))}</span></div>
         <div class="muted small">${o.items.map((l) => `${l.qty}× ${esc(l.name)}`).join(', ')}</div>
-        <div class="muted small">${o.payment === 'cash' ? '💵 cash on handover' : '👛 paid in app'}${
-          o.fulfilment === 'pickup' ? ' · 🏃 customer collects' : o.deliveryLoc ? ` · 📍 ${esc(o.deliveryLoc.name)}` : ''}</div>
+        <div class="muted small">${o.payment === 'cash' ? t('💵 cash on handover') : t('👛 paid in app')}${
+          o.fulfilment === 'pickup' ? ` · ${t('🏃 customer collects')}` : o.deliveryLoc ? ` · 📍 ${esc(o.deliveryLoc.name)}` : ''}</div>
       </div>
       <div class="rt">
         <b>${money(o.total)}</b>
-        <div class="muted small">you get ${money(o.partnerCut)}</div>
+        <div class="muted small">${t('you get')} ${money(o.partnerCut)}</div>
         <span class="badge ${o.status === 'placed' ? 'amber' : 'gray'}">⏱ ${timeAgo(o.createdAt)}</span>
       </div>
     </div>
     ${withCourier && o.status !== 'delivered' && o.status !== 'cancelled'
-      ? `<div class="muted small" style="margin-top:8px">🛵 With ${esc((o.courier && o.courier.name) || 'a courier')} — settles at the customer's door.</div>` : ''}
-    ${next && !needsCode ? `<button class="btn" style="margin-top:10px" onclick="decideStoreOrder('${o.id}','${next[0]}')">${next[1]}</button>` : ''}
+      ? `<div class="muted small" style="margin-top:8px">${t("🛵 With {name} — settles at the customer's door.", { name: esc((o.courier && o.courier.name) || t('a courier')) })}</div>` : ''}
+    ${next && !needsCode ? `<button class="btn" style="margin-top:10px" onclick="decideStoreOrder('${o.id}','${next[0]}')">${t(next[1])}</button>` : ''}
     ${needsCode ? (state.pickupFor === o.id ? `
     <div class="inline-form">
-      <span>Customer's 4-digit pickup code (in their app)</span>
+      <span>${t("Customer's 4-digit pickup code (in their app)")}</span>
       <input id="pickup-code-${o.id}" inputmode="numeric" placeholder="1234" />
-      <button class="btn" onclick="confirmHandover('${o.id}')">Confirm</button>
-      <button class="btn ghost" onclick="setPickupFor('')">Cancel</button>
+      <button class="btn" onclick="confirmHandover('${o.id}')">${t('Confirm')}</button>
+      <button class="btn ghost" onclick="setPickupFor('')">${t('Cancel')}</button>
     </div>` : `
-    <button class="btn" style="margin-top:10px" onclick="setPickupFor('${o.id}')">🤝 Handed over — enter code</button>`) : ''}
+    <button class="btn" style="margin-top:10px" onclick="setPickupFor('${o.id}')">${t('🤝 Handed over — enter code')}</button>`) : ''}
     ${canReject ? (state.confirmReject === o.id ? `
     <div class="inline-form">
-      <span>${rejectLabel}? The customer gets their money back.</span>
-      <button class="btn danger" onclick="decideStoreOrder('${o.id}','reject')">Refund</button>
-      <button class="btn ghost" onclick="setConfirmReject('')">Back</button>
+      <span>${rejectLabel}? ${t('The customer gets their money back.')}</span>
+      <button class="btn danger" onclick="decideStoreOrder('${o.id}','reject')">${t('Refund')}</button>
+      <button class="btn ghost" onclick="setConfirmReject('')">${t('Back')}</button>
     </div>` : `
     <button class="btn ghost compact" style="margin-top:8px" onclick="setConfirmReject('${o.id}')">${rejectLabel}…</button>`) : ''}
-    ${o.status === 'delivered' ? `<div class="muted small" style="margin-top:6px">✓ Done${o.fulfilment === 'pickup' ? ' — collected' : ' — delivered'}.</div>` : ''}
-    ${o.status === 'cancelled' ? `<div class="muted small" style="margin-top:6px">Cancelled — customer refunded.</div>` : ''}
+    ${o.status !== 'cancelled'
+      ? `<button class="btn ghost compact" style="margin-top:8px" onclick="openInvoice('${o.id}')">🧾 ${t('Bill')}</button>` : ''}
+    ${o.status === 'delivered' ? `<div class="muted small" style="margin-top:6px">${o.fulfilment === 'pickup' ? t('✓ Done — collected.') : t('✓ Done — delivered.')}</div>` : ''}
+    ${o.status === 'cancelled' ? `<div class="muted small" style="margin-top:6px">${t('Cancelled — customer refunded.')}</div>` : ''}
   </div>`;
 }
 
@@ -1089,7 +1145,7 @@ window.setPickupFor = (id) => {
 
 window.confirmHandover = (orderId) => {
   const code = (($(`#pickup-code-${orderId}`) || {}).value || '').trim();
-  if (!code) return toast("Enter the 4-digit code from the customer's app.", true);
+  if (!code) return toast(t("Enter the 4-digit code from the customer's app."), true);
   decideStoreOrder(orderId, 'handover', code);
 };
 
@@ -1100,7 +1156,7 @@ window.decideStoreOrder = async (orderId, action, code) => {
     state.confirmReject = '';
     await Promise.all([loadStoreOrders(), loadStores()]);
     if (state.activeStore) await loadInventory();
-    toast({ accept: 'Order accepted 👍', reject: 'Order rejected — customer refunded', ready: 'Marked ready', handover: 'Handed over — income settled 💰' }[action]);
+    toast(t({ accept: 'Order accepted 👍', reject: 'Order rejected — customer refunded', ready: 'Marked ready', handover: 'Handed over — income settled 💰' }[action]));
     render();
   } catch (e) { toast(e.message, true); }
 };
@@ -1111,50 +1167,50 @@ window.decideStoreOrder = async (orderId, action, code) => {
 function reviewIntro(where) {
   return `
   <div class="muted small" style="margin-bottom:14px">
-    New listings go to the <b style="color:var(--text)">SewaGo review team</b> first (we verify your documents and may call you). Once approved they appear in the customer app under <b style="color:var(--text)">${where}</b>.
+    ${t('New listings go to the SewaGo review team first (we verify your documents and may call you). Once approved they appear in the customer app under {where}.', { where: t(where) })}
   </div>`;
 }
 
 // The gate copy lives on the pages where the gated action is, not on Home.
 function lockedNote() {
   return partnerReady() ? ''
-    : `<div class="muted small" style="margin-bottom:12px">🔒 Verify your phone and finish business KYC (in Profile) before adding listings.</div>`;
+    : `<div class="muted small" style="margin-bottom:12px">${t('🔒 Verify your phone and finish business KYC (in Profile) before adding listings.')}</div>`;
 }
 
 function shopsPage() {
   const ready = partnerReady();
   return `
-  <div class="section-title">Your shops 🏪</div>
+  <div class="section-title">${t('Your shops')} 🏪</div>
   ${reviewIntro('Shops')}
   ${lockedNote()}
   <div class="muted small" style="margin-bottom:10px">
-    A general store: add your stock by speaking, tap <b style="color:var(--text)">Sold</b> as you sell, and customers nearby can order from you.
+    ${t('A general store: add your stock by speaking, tap Sold as you sell, and customers nearby can order from you.')}
   </div>
   ${state.stores.length ? state.stores.map(storeRow).join('')
-    : `<div class="empty"><div class="big">🏪</div>No shop yet — add yours below.</div>`}
-  ${ready ? (state.showStoreForm ? storeForm() : `<button class="btn ghost" onclick="toggleStoreForm()">+ Add a shop</button>`) : ''}`;
+    : `<div class="empty"><div class="big">🏪</div>${t('No shop yet — add yours below.')}</div>`}
+  ${ready ? (state.showStoreForm ? storeForm() : `<button class="btn ghost" onclick="toggleStoreForm()">${t('+ Add a shop')}</button>`) : ''}`;
 }
 
 function restaurantsPage() {
   const ready = partnerReady();
   return `
-  <div class="section-title">Your restaurants 🍜</div>
+  <div class="section-title">${t('Your restaurants')} 🍜</div>
   ${reviewIntro('Food')}
   ${lockedNote()}
   ${state.restaurants.length ? state.restaurants.map(restaurantRow).join('')
-    : `<div class="empty"><div class="big">🍳</div>No restaurants yet — add your first one below.</div>`}
-  ${ready ? (state.showRestForm ? restaurantForm() : `<button class="btn ghost" onclick="toggleRestForm()">+ Add a restaurant</button>`) : ''}`;
+    : `<div class="empty"><div class="big">🍳</div>${t('No restaurants yet — add your first one below.')}</div>`}
+  ${ready ? (state.showRestForm ? restaurantForm() : `<button class="btn ghost" onclick="toggleRestForm()">${t('+ Add a restaurant')}</button>`) : ''}`;
 }
 
 function hotelsPage() {
   const ready = partnerReady();
   return `
-  <div class="section-title">Your hotels 🏨</div>
+  <div class="section-title">${t('Your hotels')} 🏨</div>
   ${reviewIntro('Stays')}
   ${lockedNote()}
   ${state.hotels.length ? state.hotels.map(hotelRow).join('')
-    : `<div class="empty"><div class="big">🛎️</div>No hotels yet — add your first one below.</div>`}
-  ${ready ? (state.showHotelForm ? hotelForm() : `<button class="btn ghost" onclick="toggleHotelForm()">+ Add a hotel</button>`) : ''}`;
+    : `<div class="empty"><div class="big">🛎️</div>${t('No hotels yet — add your first one below.')}</div>`}
+  ${ready ? (state.showHotelForm ? hotelForm() : `<button class="btn ghost" onclick="toggleHotelForm()">${t('+ Add a hotel')}</button>`) : ''}`;
 }
 
 // Slim list rows — the heavy editors live in the full-screen takeovers.
@@ -1162,14 +1218,14 @@ function storeRow(s) {
   const st = s.stats || {};
   const subs = pendingSubCount(s.id);
   const badge = s.status === 'approved'
-    ? `<span class="badge ${s.open ? '' : 'gray'}">${s.open ? '🟢 OPEN' : '⚫ CLOSED'}</span>`
-    : s.status === 'pending' ? `<span class="badge amber">IN REVIEW</span>` : `<span class="badge red">REJECTED</span>`;
+    ? `<span class="badge ${s.open ? '' : 'gray'}">${s.open ? `🟢 ${t('OPEN')}` : `⚫ ${t('CLOSED')}`}</span>`
+    : s.status === 'pending' ? `<span class="badge amber">${t('IN REVIEW')}</span>` : `<span class="badge red">${t('REJECTED')}</span>`;
   return `
   <div class="tile" onclick="openStore('${s.id}')">
     <span class="emoji">${s.icon}</span>
     <div class="grow">
       <h3>${esc(s.name)}</h3>
-      <div class="sub">${st.items || 0} items · sold ${st.soldToday || 0} today${st.lowStock ? ` · ⚠️ ${st.lowStock} low` : ''}${subs ? ` · 🔁 ${subs} ask${subs > 1 ? 's' : ''}` : ''}</div>
+      <div class="sub">${t('{n} items', { n: st.items || 0 })} · ${t('sold {n} today', { n: st.soldToday || 0 })}${st.lowStock ? ` · ⚠️ ${t('{n} low', { n: st.lowStock })}` : ''}${subs ? ` · 🔁 ${t('{n} asks', { n: subs })}` : ''}</div>
       ${s.status === 'rejected' && s.reviewNote ? `<div class="sub" style="color:var(--danger)">${esc(s.reviewNote)}</div>` : ''}
     </div>
     <div class="right">${badge}</div>
@@ -1182,7 +1238,7 @@ function restaurantRow(r) {
     <span class="emoji">${r.icon}</span>
     <div class="grow">
       <h3>${esc(r.name)}</h3>
-      <div class="sub">${esc(r.cuisine)} · ${r.menu.length} menu item${r.menu.length === 1 ? '' : 's'}${r.promotedUntil > Date.now() ? ' · ⭐ featured' : ''}</div>
+      <div class="sub">${esc(r.cuisine)} · ${t('{n} menu items', { n: r.menu.length })}${r.promotedUntil > Date.now() ? ` · ⭐ ${t('featured')}` : ''}</div>
       ${r.status === 'rejected' && r.reviewNote ? `<div class="sub" style="color:var(--danger)">${esc(r.reviewNote)}</div>` : ''}
     </div>
     <div class="right">${reviewStatusBadge(r)}</div>
@@ -1195,7 +1251,7 @@ function hotelRow(h) {
     <span class="emoji">${h.icon}</span>
     <div class="grow">
       <h3>${esc(h.name)}</h3>
-      <div class="sub">${esc(h.area)}${h.area ? ', ' : ''}${esc(h.city)} · ${h.rooms.length} room type${h.rooms.length === 1 ? '' : 's'}${h.promotedUntil > Date.now() ? ' · ⭐ featured' : ''}</div>
+      <div class="sub">${esc(h.area)}${h.area ? ', ' : ''}${esc(h.city)} · ${t('{n} room types', { n: h.rooms.length })}${h.promotedUntil > Date.now() ? ` · ⭐ ${t('featured')}` : ''}</div>
       ${h.status === 'rejected' && h.reviewNote ? `<div class="sub" style="color:var(--danger)">${esc(h.reviewNote)}</div>` : ''}
     </div>
     <div class="right">${reviewStatusBadge(h)}</div>
@@ -1218,19 +1274,19 @@ window.closeListing = () => {
 // rows above stay slim (same pattern as the inventory manager).
 function listingDetailView() {
   const { kind, id } = state.activeListing;
-  const back = kind === 'restaurants' ? 'Restaurants' : 'Hotels';
+  const back = kind === 'restaurants' ? t('Restaurants') : t('Hotels');
   const x = (kind === 'restaurants' ? state.restaurants : state.hotels).find((i) => i.id === id);
   if (!x) {
     return `
     <header class="topbar">
       <button class="btn ghost compact" onclick="closeListing()">← ${back}</button>
     </header>
-    <main><div class="empty"><div class="big">🤔</div>That listing is gone.</div></main>`;
+    <main><div class="empty"><div class="big">🤔</div>${t('That listing is gone.')}</div></main>`;
   }
   return `
     <header class="topbar">
       <button class="btn ghost compact" onclick="closeListing()">← ${back}</button>
-      ${reviewStatusBadge(x)}
+      <div style="display:flex;gap:8px;align-items:center">${langButton()}${reviewStatusBadge(x)}</div>
     </header>
     <main>
       ${kind === 'restaurants' ? restaurantDetail(x) : hotelDetail(x)}
@@ -1249,12 +1305,12 @@ function removeListingBlock(x, label, handler) {
   if (state.confirmRemove === x.id) {
     return `
     <div class="inline-form">
-      <span>Remove ${esc(x.name)} from the app? Customers will no longer see it.</span>
-      <button class="btn danger" onclick="${handler}('${x.id}')">Remove</button>
-      <button class="btn ghost" onclick="setConfirmRemove('')">Keep</button>
+      <span>${t('Remove {name} from the app? Customers will no longer see it.', { name: esc(x.name) })}</span>
+      <button class="btn danger" onclick="${handler}('${x.id}')">${t('Remove')}</button>
+      <button class="btn ghost" onclick="setConfirmRemove('')">${t('Keep')}</button>
     </div>`;
   }
-  return `<button class="btn ghost compact" style="margin-top:10px;border-color:#7f1d1d;color:#f87171" onclick="setConfirmRemove('${x.id}')">${label}…</button>`;
+  return `<button class="btn ghost compact" style="margin-top:10px;border-color:#7f1d1d;color:#f87171" onclick="setConfirmRemove('${x.id}')">${t(label)}…</button>`;
 }
 
 window.toggleRestForm = () => { state.showRestForm = !state.showRestForm; render(); };
@@ -1265,21 +1321,21 @@ window.toggleHotelForm = () => { state.showHotelForm = !state.showHotelForm; ren
 function restaurantForm() {
   return `
   <div class="card">
-    <div style="font-weight:900;margin-bottom:12px">New restaurant</div>
-    <label class="field"><span>Name</span><input id="r-name" placeholder="e.g. Newa Kitchen" /></label>
-    <label class="field"><span>Cuisine</span><input id="r-cuisine" placeholder="e.g. Newari · Set meals" /></label>
-    <label class="field"><span>Area / neighbourhood (courier pickup point)</span><input id="r-area" placeholder="e.g. Thamel, Jawalakhel, New Baneshwor" /></label>
+    <div style="font-weight:900;margin-bottom:12px">${t('New restaurant')}</div>
+    <label class="field"><span>${t('Name')}</span><input id="r-name" placeholder="${t('e.g.')} Newa Kitchen" /></label>
+    <label class="field"><span>${t('Cuisine')}</span><input id="r-cuisine" placeholder="${t('e.g.')} Newari" /></label>
+    <label class="field"><span>${t('Area / neighbourhood (courier pickup point)')}</span><input id="r-area" placeholder="${t('e.g.')} Thamel, Jawalakhel" /></label>
     <div class="grid2">
-      <label class="field"><span>Prep time (min)</span><input id="r-eta" type="number" value="30" min="5" max="120" /></label>
-      <label class="field"><span>Delivery fee (Rs)</span><input id="r-fee" type="number" value="50" min="0" max="500" /></label>
+      <label class="field"><span>${t('Prep time (min)')}</span><input id="r-eta" type="number" value="30" min="5" max="120" /></label>
+      <label class="field"><span>${t('Delivery fee (Rs)')}</span><input id="r-fee" type="number" value="50" min="0" max="500" /></label>
     </div>
-    <label class="field"><span>Icon</span>
+    <label class="field"><span>${t('Icon')}</span>
       <select id="r-icon">${REST_ICONS.map((i) => `<option>${i}</option>`).join('')}</select>
     </label>
-    <div class="muted small" style="margin-bottom:6px">Cover photo — customers pick with their eyes 👀</div>
+    <div class="muted small" style="margin-bottom:6px">${t('Cover photo — customers pick with their eyes 👀')}</div>
     ${photoField('new-rest')}
-    <button class="btn" onclick="addRestaurant()">Create restaurant</button>
-    <button class="btn ghost" style="margin-top:8px" onclick="toggleRestForm()">Cancel</button>
+    <button class="btn" onclick="addRestaurant()">${t('Create restaurant')}</button>
+    <button class="btn ghost" style="margin-top:8px" onclick="toggleRestForm()">${t('Cancel')}</button>
   </div>`;
 }
 
@@ -1300,7 +1356,7 @@ window.addRestaurant = async () => {
     delete state.photos['new-rest'];
     state.showRestForm = false;
     await reload();
-    toast('Restaurant created — now add menu items so customers can order! 🎉');
+    toast(t('Restaurant created — now add menu items so customers can order! 🎉'));
     render();
   } catch (e) {
     toast(e.message, true);
@@ -1308,21 +1364,21 @@ window.addRestaurant = async () => {
 };
 
 function reviewStatusBadge(x) {
-  if (x.status === 'approved') return `<span class="badge">🟢 LIVE</span>`;
-  if (x.status === 'rejected') return `<span class="badge red">REJECTED</span>`;
-  return `<span class="badge amber">IN REVIEW</span>`;
+  if (x.status === 'approved') return `<span class="badge">🟢 ${t('LIVE')}</span>`;
+  if (x.status === 'rejected') return `<span class="badge red">${t('REJECTED')}</span>`;
+  return `<span class="badge amber">${t('IN REVIEW')}</span>`;
 }
 
 function reviewStatusLine(x, kind) {
   if (x.status === 'rejected') {
     return `
     <div class="muted small" style="margin:8px 0;color:var(--danger)">
-      ✕ Rejected by SewaGo: ${esc(x.reviewNote || 'no note')}
+      ✕ ${t('Rejected by SewaGo:')} ${esc(x.reviewNote || t('no note'))}
     </div>
-    <button class="btn ghost" style="margin-bottom:8px" onclick="resubmitListing('${kind}','${x.id}')">↻ Fix & resubmit for review</button>`;
+    <button class="btn ghost" style="margin-bottom:8px" onclick="resubmitListing('${kind}','${x.id}')">${t('↻ Fix & resubmit for review')}</button>`;
   }
   if (x.status === 'pending') {
-    return `<div class="muted small" style="margin:8px 0">⏳ Waiting for SewaGo review — we verify your documents and may call ${esc(state.partner.phone || 'you')}.</div>`;
+    return `<div class="muted small" style="margin:8px 0">${t('⏳ Waiting for SewaGo review — we verify your documents and may call {phone}.', { phone: esc(state.partner.phone || t('you')) })}</div>`;
   }
   return '';
 }
@@ -1333,9 +1389,9 @@ function promoBlock(type, x) {
   return `
     <div class="row" style="margin-top:10px">
       <div class="muted small">${active
-        ? `⭐ <b style="color:var(--text)">Featured</b> until ${new Date(x.promotedUntil).toLocaleDateString([], { month: 'short', day: 'numeric' })} — top of the customer list`
-        : 'Get seen first: featured listings sit at the top of the customer list.'}</div>
-      <button class="btn ghost compact" onclick="promoteListing('${type}','${x.id}')">${active ? '⭐ Extend' : '⭐ Promote'} · ${money(state.promoteWeekPrice || 500)}/wk</button>
+        ? t('⭐ Featured until {date} — top of the customer list', { date: new Date(x.promotedUntil).toLocaleDateString([], { month: 'short', day: 'numeric' }) })
+        : t('Get seen first: featured listings sit at the top of the customer list.')}</div>
+      <button class="btn ghost compact" onclick="promoteListing('${type}','${x.id}')">${active ? t('⭐ Extend') : t('⭐ Promote')} · ${money(state.promoteWeekPrice || 500)}/${t('wk')}</button>
     </div>`;
 }
 
@@ -1344,7 +1400,7 @@ window.promoteListing = async (type, id) => {
     const data = await api(`/api/partner/${type}/${id}/promote`, { method: 'POST' });
     state.partner = data.partner;
     await reload();
-    toast('Listing featured for 7 days ⭐');
+    toast(t('Listing featured for 7 days ⭐'));
     render();
   } catch (e) {
     toast(e.message, true);
@@ -1357,13 +1413,13 @@ function restaurantDetail(r) {
     ${r.photo ? `<img class="cover-img" src="${esc(r.photo)}" alt="${esc(r.name)}" />` : ''}
     <div>
       <div style="font-weight:900">${r.icon} ${esc(r.name)} ${reviewStatusBadge(r)}</div>
-      <div class="muted small">${esc(r.cuisine)} · ${r.etaMinutes} min · delivery ${money(r.deliveryFee)}</div>
+      <div class="muted small">${esc(r.cuisine)} · ${r.etaMinutes} ${t('min')} · ${t('delivery')} ${money(r.deliveryFee)}</div>
     </div>
     ${listingGallery('restaurants', r)}
     ${reviewStatusLine(r, 'restaurants')}
     ${promoBlock('restaurants', r)}
     <div class="divider"></div>
-    ${r.menu.length === 0 ? `<div class="muted small" style="margin-bottom:10px">⚠️ No menu items yet — customers can't order until you add some.</div>` : ''}
+    ${r.menu.length === 0 ? `<div class="muted small" style="margin-bottom:10px">${t("⚠️ No menu items yet — customers can't order until you add some.")}</div>` : ''}
     ${r.menu.map((m) => `
       <div class="row" style="margin-bottom:8px">
         ${m.photo ? `<img class="thumb" src="${esc(m.photo)}" alt="${esc(m.name)}" />` : ''}
@@ -1374,14 +1430,14 @@ function restaurantDetail(r) {
         <button class="btn ghost compact" onclick="deleteMenuItem('${r.id}','${m.id}')">✕</button>
       </div>`).join('')}
     <div class="divider"></div>
-    <div class="muted small" style="margin-bottom:8px;font-weight:700">Add menu item</div>
+    <div class="muted small" style="margin-bottom:8px;font-weight:700">${t('Add menu item')}</div>
     <div class="grid2">
-      <label class="field"><span>Item name</span><input id="mi-name-${r.id}" placeholder="e.g. Chatamari" /></label>
-      <label class="field"><span>Price (Rs)</span><input id="mi-price-${r.id}" type="number" placeholder="250" /></label>
+      <label class="field"><span>${t('Item name')}</span><input id="mi-name-${r.id}" placeholder="${t('e.g.')} Chatamari" /></label>
+      <label class="field"><span>${t('Price (Rs)')}</span><input id="mi-price-${r.id}" type="number" placeholder="250" /></label>
     </div>
-    <label class="field"><span>Description (optional)</span><input id="mi-desc-${r.id}" placeholder="e.g. Newari rice crepe with toppings" /></label>
-    ${photoField(`menu-${r.id}`, '📷 Add a dish photo')}
-    <button class="btn" onclick="addMenuItem('${r.id}')">Add item</button>
+    <label class="field"><span>${t('Description (optional)')}</span><input id="mi-desc-${r.id}" placeholder="${t('e.g.')} ${t('Newari rice crepe with toppings')}" /></label>
+    ${photoField(`menu-${r.id}`, t('📷 Add a dish photo'))}
+    <button class="btn" onclick="addMenuItem('${r.id}')">${t('Add item')}</button>
     ${removeListingBlock(r, 'Remove this restaurant', 'deleteRestaurant')}
   </div>
   ${groupDiscountCard(r)}`;
@@ -1446,7 +1502,7 @@ window.addMenuItem = async (rid) => {
     });
     delete state.photos[`menu-${rid}`];
     await reload();
-    toast('Menu item added ✅');
+    toast(t('Menu item added ✅'));
     render();
   } catch (e) {
     toast(e.message, true);
@@ -1469,7 +1525,7 @@ window.deleteRestaurant = async (rid) => {
     state.activeListing = null;
     state.confirmRemove = '';
     await reload();
-    toast('Restaurant removed from the app.');
+    toast(t('Restaurant removed from the app.'));
     render();
   } catch (e) {
     toast(e.message, true);
@@ -1481,20 +1537,20 @@ window.deleteRestaurant = async (rid) => {
 function hotelForm() {
   return `
   <div class="card">
-    <div style="font-weight:900;margin-bottom:12px">New hotel</div>
-    <label class="field"><span>Name</span><input id="h-name" placeholder="e.g. Himal View Resort" /></label>
+    <div style="font-weight:900;margin-bottom:12px">${t('New hotel')}</div>
+    <label class="field"><span>${t('Name')}</span><input id="h-name" placeholder="${t('e.g.')} Himal View Resort" /></label>
     <div class="grid2">
-      <label class="field"><span>City</span><input id="h-city" placeholder="e.g. Pokhara" /></label>
-      <label class="field"><span>Area</span><input id="h-area" placeholder="e.g. Lakeside" /></label>
+      <label class="field"><span>${t('City')}</span><input id="h-city" placeholder="${t('e.g.')} Pokhara" /></label>
+      <label class="field"><span>${t('Area')}</span><input id="h-area" placeholder="${t('e.g.')} Lakeside" /></label>
     </div>
-    <label class="field"><span>One-line description</span><input id="h-desc" placeholder="e.g. Mountain views from every room" /></label>
-    <label class="field"><span>Icon</span>
+    <label class="field"><span>${t('One-line description')}</span><input id="h-desc" placeholder="${t('e.g.')} ${t('Mountain views from every room')}" /></label>
+    <label class="field"><span>${t('Icon')}</span>
       <select id="h-icon">${HOTEL_ICONS.map((i) => `<option>${i}</option>`).join('')}</select>
     </label>
-    <div class="muted small" style="margin-bottom:6px">Cover photo — listings with photos get booked first 👀</div>
+    <div class="muted small" style="margin-bottom:6px">${t('Cover photo — listings with photos get booked first 👀')}</div>
     ${photoField('new-hotel')}
-    <button class="btn" onclick="addHotel()">Create hotel</button>
-    <button class="btn ghost" style="margin-top:8px" onclick="toggleHotelForm()">Cancel</button>
+    <button class="btn" onclick="addHotel()">${t('Create hotel')}</button>
+    <button class="btn ghost" style="margin-top:8px" onclick="toggleHotelForm()">${t('Cancel')}</button>
   </div>`;
 }
 
@@ -1514,7 +1570,7 @@ window.addHotel = async () => {
     delete state.photos['new-hotel'];
     state.showHotelForm = false;
     await reload();
-    toast('Hotel created — now add room types so customers can book! 🎉');
+    toast(t('Hotel created — now add room types so customers can book! 🎉'));
     render();
   } catch (e) {
     toast(e.message, true);
@@ -1533,29 +1589,29 @@ function hotelDetail(h) {
     ${reviewStatusLine(h, 'hotels')}
     ${promoBlock('hotels', h)}
     <div class="divider"></div>
-    ${h.rooms.length === 0 ? `<div class="muted small" style="margin-bottom:10px">⚠️ No room types yet — customers can't book until you add some.</div>` : ''}
+    ${h.rooms.length === 0 ? `<div class="muted small" style="margin-bottom:10px">${t("⚠️ No room types yet — customers can't book until you add some.")}</div>` : ''}
     ${h.rooms.map((room) => `
       <div class="row" style="margin-bottom:8px">
         ${room.photo ? `<img class="thumb" src="${esc(room.photo)}" alt="${esc(room.type)}" />` : ''}
         <div class="grow">
-          <div><b>${esc(room.type)}</b> · ${money(room.pricePerNight)}/night · ${room.count} room${room.count > 1 ? 's' : ''} · sleeps ${room.sleeps}</div>
+          <div><b>${esc(room.type)}</b> · ${money(room.pricePerNight)}/${t('night')} · ${t('{n} rooms', { n: room.count })} · ${t('sleeps')} ${room.sleeps}</div>
           ${room.amenities.length ? `<div style="margin-top:3px">${room.amenities.map((a) => `<span class="amenity">${esc(a)}</span>`).join('')}</div>` : ''}
         </div>
         <button class="btn ghost compact" onclick="deleteRoom('${h.id}','${room.id}')">✕</button>
       </div>`).join('')}
     <div class="divider"></div>
-    <div class="muted small" style="margin-bottom:8px;font-weight:700">Add room type</div>
+    <div class="muted small" style="margin-bottom:8px;font-weight:700">${t('Add room type')}</div>
     <div class="grid2">
-      <label class="field"><span>Type</span><input id="ro-type-${h.id}" placeholder="e.g. Deluxe Room" /></label>
-      <label class="field"><span>Price / night (Rs)</span><input id="ro-price-${h.id}" type="number" placeholder="3500" /></label>
+      <label class="field"><span>${t('Type')}</span><input id="ro-type-${h.id}" placeholder="${t('e.g.')} Deluxe Room" /></label>
+      <label class="field"><span>${t('Price / night (Rs)')}</span><input id="ro-price-${h.id}" type="number" placeholder="3500" /></label>
     </div>
     <div class="grid2">
-      <label class="field"><span>How many rooms</span><input id="ro-count-${h.id}" type="number" value="3" min="1" max="50" /></label>
-      <label class="field"><span>Sleeps</span><input id="ro-sleeps-${h.id}" type="number" value="2" min="1" max="10" /></label>
+      <label class="field"><span>${t('How many rooms')}</span><input id="ro-count-${h.id}" type="number" value="3" min="1" max="50" /></label>
+      <label class="field"><span>${t('Sleeps')}</span><input id="ro-sleeps-${h.id}" type="number" value="2" min="1" max="10" /></label>
     </div>
-    <label class="field"><span>Amenities (comma separated)</span><input id="ro-amen-${h.id}" placeholder="WiFi, Breakfast, AC" /></label>
-    ${photoField(`room-${h.id}`, '📷 Add a room photo')}
-    <button class="btn" onclick="addRoom('${h.id}')">Add room type</button>
+    <label class="field"><span>${t('Amenities (comma separated)')}</span><input id="ro-amen-${h.id}" placeholder="WiFi, ${t('Breakfast')}, AC" /></label>
+    ${photoField(`room-${h.id}`, t('📷 Add a room photo'))}
+    <button class="btn" onclick="addRoom('${h.id}')">${t('Add room type')}</button>
     ${removeListingBlock(h, 'Remove this hotel', 'deleteHotel')}
   </div>`;
 }
@@ -1575,7 +1631,7 @@ window.addRoom = async (hid) => {
     });
     delete state.photos[`room-${hid}`];
     await reload();
-    toast('Room type added ✅');
+    toast(t('Room type added ✅'));
     render();
   } catch (e) {
     toast(e.message, true);
@@ -1596,7 +1652,7 @@ window.resubmitListing = async (kind, id) => {
   try {
     await api(`/api/partner/${kind}/${id}/resubmit`, { method: 'POST' });
     await reload();
-    toast('Resubmitted — the SewaGo team will take another look. ⏳');
+    toast(t('Resubmitted — the SewaGo team will take another look. ⏳'));
     render();
   } catch (e) {
     toast(e.message, true);
@@ -1609,7 +1665,7 @@ window.deleteHotel = async (hid) => {
     state.activeListing = null;
     state.confirmRemove = '';
     await reload();
-    toast('Hotel removed from the app.');
+    toast(t('Hotel removed from the app.'));
     render();
   } catch (e) {
     toast(e.message, true);
@@ -1630,7 +1686,7 @@ function partnerReady() {
 
 function earningsTab() {
   return `
-  <div class="section-title">Earnings 💰</div>
+  <div class="section-title">${t('Earnings')} 💰</div>
   ${earningsCard()}`;
 }
 
@@ -1642,45 +1698,45 @@ function earningsCard() {
   <div class="card">
     <div class="row">
       <div>
-        <div class="muted small">Available to withdraw</div>
+        <div class="muted small">${t('Available to withdraw')}</div>
         <div style="font-size:24px;font-weight:900">${money(p.earnings || 0)}</div>
       </div>
       <span style="font-size:28px">💰</span>
     </div>
     ${(p.pendingEarnings || 0) > 0 ? `
     <div class="muted small" style="margin-top:6px">
-      ⏳ <b style="color:var(--text)">${money(p.pendingEarnings)}</b> pending — clears when orders are delivered and stays reach check-in.
+      ⏳ <b style="color:var(--text)">${money(p.pendingEarnings)}</b> ${t('pending — clears when orders are delivered and stays reach check-in.')}
     </div>` : ''}
     <div class="muted small" style="margin-top:6px">
-      You receive <b style="color:var(--text)">85%</b> of food subtotals and <b style="color:var(--text)">90%</b> of bookings. Income clears to withdrawable once the order is delivered or the stay begins.
+      ${t('You receive 85% of food subtotals and 90% of bookings. Income clears to withdrawable once the order is delivered or the stay begins.')}
     </div>
     ${partnerReady() ? `
-    <button class="btn ${state.showWithdraw ? '' : 'ghost'}" aria-pressed="${!!state.showWithdraw}" style="margin-top:12px" onclick="toggleWithdraw()">🏦 Withdraw earnings</button>`
-    : `<div class="muted small" style="margin-top:12px">🔒 Withdrawals unlock once your phone is verified and business KYC is approved.</div>`}
+    <button class="btn ${state.showWithdraw ? '' : 'ghost'}" aria-pressed="${!!state.showWithdraw}" style="margin-top:12px" onclick="toggleWithdraw()">${t('🏦 Withdraw earnings')}</button>`
+    : `<div class="muted small" style="margin-top:12px">${t('🔒 Withdrawals unlock once your phone is verified and business KYC is approved.')}</div>`}
     ${state.showWithdraw && partnerReady() ? `
     <div class="divider"></div>
     <div class="grid2">
-      <label class="field"><span>Amount (Rs)</span><input id="pw-amount" type="number" placeholder="1000" min="100" /></label>
-      <label class="field"><span>Payout to</span>
+      <label class="field"><span>${t('Amount (Rs)')}</span><input id="pw-amount" type="number" placeholder="1000" min="100" /></label>
+      <label class="field"><span>${t('Payout to')}</span>
         <select id="pw-channel">
-          <option value="bank">Bank transfer</option>
+          <option value="bank">${t('Bank transfer')}</option>
           <option value="esewa">eSewa</option>
           <option value="khalti">Khalti</option>
         </select>
       </label>
     </div>
-    <label class="field"><span>Account / wallet ID</span><input id="pw-account" placeholder="e.g. business account no." /></label>
-    <div class="muted small" style="margin-bottom:10px">Rs 10 payout fee · paid out after SewaGo approves it.</div>
-    <button class="btn" onclick="partnerWithdraw()">Request payout</button>` : ''}
+    <label class="field"><span>${t('Account / wallet ID')}</span><input id="pw-account" placeholder="${t('e.g. business account no.')}" /></label>
+    <div class="muted small" style="margin-bottom:10px">${t('Rs 10 payout fee · paid out after SewaGo approves it.')}</div>
+    <button class="btn" onclick="partnerWithdraw()">${t('Request payout')}</button>` : ''}
     ${shown.length ? `
     <div class="divider"></div>
-    <div class="muted small" style="font-weight:700;margin-bottom:8px">Recent activity</div>
-    ${shown.map((t) => `
+    <div class="muted small" style="font-weight:700;margin-bottom:8px">${t('Recent activity')}</div>
+    ${shown.map((tx) => `
       <div class="row" style="margin-bottom:8px">
-        <div class="small">${PARTNER_TXN_ICONS[t.type] || '💳'} ${esc(t.label)}${t.status === 'processing' ? ' <span class="muted">· ⏳</span>' : ''}</div>
-        <div style="font-weight:800;white-space:nowrap;color:${t.sign > 0 ? 'var(--accent)' : 'var(--text)'}">${t.sign > 0 ? '+' : '−'}${money(t.amount)}</div>
+        <div class="small">${PARTNER_TXN_ICONS[tx.type] || '💳'} ${esc(tx.label)}${tx.status === 'processing' ? ' <span class="muted">· ⏳</span>' : ''}</div>
+        <div style="font-weight:800;white-space:nowrap;color:${tx.sign > 0 ? 'var(--accent)' : 'var(--text)'}">${tx.sign > 0 ? '+' : '−'}${money(tx.amount)}</div>
       </div>`).join('')}
-    ${hidden > 0 ? `<button class="btn ghost compact" onclick="showMoreTxns()">Show ${Math.min(15, hidden)} more</button>` : ''}` : ''}
+    ${hidden > 0 ? `<button class="btn ghost compact" onclick="showMoreTxns()">${t('Show {n} more', { n: Math.min(15, hidden) })}</button>` : ''}` : ''}
   </div>`;
 }
 
@@ -1704,7 +1760,7 @@ window.partnerWithdraw = async () => {
     state.partner = data.partner;
     state.showWithdraw = false;
     await reload();
-    toast('Payout requested — money arrives once SewaGo approves it 🏦');
+    toast(t('Payout requested — money arrives once SewaGo approves it 🏦'));
     render();
   } catch (e) {
     toast(e.message, true);
@@ -1716,7 +1772,7 @@ window.partnerWithdraw = async () => {
 function profileTab() {
   const p = state.partner;
   return `
-  <div class="section-title">Profile 👤</div>
+  <div class="section-title">${t('Profile')} 👤</div>
   <div class="card">
     <div class="row">
       <div>
@@ -1728,23 +1784,22 @@ function profileTab() {
   </div>
   ${kycNotice()}
   ${kycCard()}
-  <button class="btn danger" style="margin-top:18px" onclick="doLogout()">Log out</button>
+  <button class="btn danger" style="margin-top:18px" onclick="doLogout()">${t('Log out')}</button>
   <div class="card" style="margin-top:14px;border-color:#7f1d1d">
-    <div style="font-weight:800">Delete account</div>
+    <div style="font-weight:800">${t('Delete account')}</div>
     <div class="muted small" style="margin:6px 0 10px;line-height:1.6">
-      Removes your personal data permanently and takes your listings off the marketplace.
-      Withdraw your earnings and settle upcoming bookings first.
-      <a href="/privacy" target="_blank" class="link">Privacy policy</a>
+      ${t('Removes your personal data permanently and takes your listings off the marketplace. Withdraw your earnings and settle upcoming bookings first.')}
+      <a href="/privacy" target="_blank" class="link">${t('Privacy policy')}</a>
     </div>
     ${state.showDeleteAccount ? `
-    <label class="field"><span>Confirm with your password</span>
-      <input id="del-password" type="password" placeholder="Your password" />
+    <label class="field"><span>${t('Confirm with your password')}</span>
+      <input id="del-password" type="password" placeholder="${t('Your password')}" />
     </label>
     <div class="grid2">
-      <button class="btn danger" onclick="partnerDeleteAccount()">Delete forever</button>
-      <button class="btn ghost" onclick="toggleDeleteAccount(false)">Keep my account</button>
+      <button class="btn danger" onclick="partnerDeleteAccount()">${t('Delete forever')}</button>
+      <button class="btn ghost" onclick="toggleDeleteAccount(false)">${t('Keep my account')}</button>
     </div>` : `
-    <button class="btn ghost" style="border-color:#7f1d1d;color:#f87171" onclick="toggleDeleteAccount(true)">Delete my account…</button>`}
+    <button class="btn ghost" style="border-color:#7f1d1d;color:#f87171" onclick="toggleDeleteAccount(true)">${t('Delete my account…')}</button>`}
   </div>`;
 }
 
@@ -1757,7 +1812,7 @@ window.toggleDeleteAccount = (show) => {
 window.partnerDeleteAccount = async () => {
   try {
     await api('/api/partner/account/delete', { method: 'POST', body: { password: $('#del-password').value } });
-    toast('Your account has been deleted. Goodbye 👋');
+    toast(t('Your account has been deleted. Goodbye 👋'));
     state.showDeleteAccount = false;
     logoutLocal();
   } catch (e) {
@@ -1777,10 +1832,10 @@ function kycNotice() {
     <div class="card" style="border-color:var(--accent)">
       <div class="row">
         <div>
-          <div style="font-weight:900">🎉 Business KYC approved!</div>
-          <div class="muted small">Your documents were verified — you can now add restaurants and hotels, and withdraw earnings.</div>
+          <div style="font-weight:900">${t('🎉 Business KYC approved!')}</div>
+          <div class="muted small">${t('Your documents were verified — you can now add listings and withdraw earnings.')}</div>
         </div>
-        <button class="btn ghost compact" onclick="ackKycNotice()">Got it</button>
+        <button class="btn ghost compact" onclick="ackKycNotice()">${t('Got it')}</button>
       </div>
     </div>`;
   }
@@ -1788,10 +1843,10 @@ function kycNotice() {
   <div class="card" style="border-color:var(--danger)">
     <div class="row">
       <div>
-        <div style="font-weight:900">❌ Business KYC rejected</div>
-        <div class="muted small">${p.businessKycNote ? esc(p.businessKycNote) : 'Fix your details in the KYC card in Profile and resubmit.'}</div>
+        <div style="font-weight:900">${t('❌ Business KYC rejected')}</div>
+        <div class="muted small">${p.businessKycNote ? esc(p.businessKycNote) : t('Fix your details in the KYC card in Profile and resubmit.')}</div>
       </div>
-      <button class="btn ghost compact" onclick="ackKycNotice()">Got it</button>
+      <button class="btn ghost compact" onclick="ackKycNotice()">${t('Got it')}</button>
     </div>
   </div>`;
 }
@@ -1812,51 +1867,51 @@ function kycCard() {
   <div class="card">
     <div class="row">
       <div>
-        <div style="font-weight:900">Business KYC</div>
-        <div class="muted small">📱 ${esc(p.phone)} — verified · ${esc(p.regNo || '')} approved. You're all set.</div>
+        <div style="font-weight:900">${t('Business KYC')}</div>
+        <div class="muted small">📱 ${esc(p.phone)} — ${t('verified')} · ${esc(p.regNo || '')} ${t('approved. You are all set.')}</div>
       </div>
-      <span class="badge">APPROVED</span>
+      <span class="badge">${t('APPROVED')}</span>
     </div>
-    <button class="btn ghost compact" style="margin-top:12px" onclick="togglePhoneEdit(true)">Change phone number</button>
+    <button class="btn ghost compact" style="margin-top:12px" onclick="togglePhoneEdit(true)">${t('Change phone number')}</button>
   </div>`;
   }
   return `
   <div class="card">
     <div class="row">
       <div>
-        <div style="font-weight:900">Business KYC</div>
-        <div class="muted small">Phone verification and business document review unlock listings.</div>
+        <div style="font-weight:900">${t('Business KYC')}</div>
+        <div class="muted small">${t('Phone verification and business document review unlock listings.')}</div>
       </div>
-      <span class="badge ${status === 'approved' ? '' : status === 'rejected' ? 'red' : 'amber'}">${esc(status.toUpperCase())}</span>
+      <span class="badge ${status === 'approved' ? '' : status === 'rejected' ? 'red' : 'amber'}">${t(status.toUpperCase())}</span>
     </div>
     <div class="status-grid" style="margin-top:12px">
-      <span class="badge ${p.phoneVerified ? '' : 'amber'}">${p.phoneVerified ? 'PHONE VERIFIED' : 'PHONE NEEDED'}</span>
-      <span class="badge ${status === 'approved' ? '' : 'amber'}">BUSINESS ${esc(status.toUpperCase())}</span>
+      <span class="badge ${p.phoneVerified ? '' : 'amber'}">${p.phoneVerified ? t('PHONE VERIFIED') : t('PHONE NEEDED')}</span>
+      <span class="badge ${status === 'approved' ? '' : 'amber'}">${t('BUSINESS')} ${t(status.toUpperCase())}</span>
     </div>
     ${p.businessKycNote ? `<div class="muted small" style="color:var(--danger);margin-top:8px">${esc(p.businessKycNote)}</div>` : ''}
     ${showPhoneForm ? `
-    <label class="field" style="margin-top:12px"><span>Phone</span>
-      <input id="partner-phone" value="${esc(p.phone || '')}" placeholder="e.g. 9841000000" />
+    <label class="field" style="margin-top:12px"><span>${t('Phone')}</span>
+      <input id="partner-phone" value="${esc(p.phone || '')}" placeholder="${t('e.g.')} 9841000000" />
     </label>
     <div class="grid2">
-      <button class="btn ghost" onclick="partnerRequestOtp()">Send OTP</button>
-      <label class="field"><span>OTP code</span><input id="partner-otp" placeholder="123456" /></label>
+      <button class="btn ghost" onclick="partnerRequestOtp()">${t('Send OTP')}</button>
+      <label class="field"><span>${t('OTP code')}</span><input id="partner-otp" placeholder="123456" /></label>
     </div>
-    <button class="btn" onclick="partnerVerifyOtp()">Verify phone</button>
-    ${state.showPhoneEdit ? `<button class="btn ghost" style="margin-top:8px" onclick="togglePhoneEdit(false)">Cancel</button>` : ''}` : `
-    <div class="muted small" style="margin-top:12px">📱 ${esc(p.phone)} — verified. <button class="link" onclick="togglePhoneEdit(true)">Change</button></div>`}
+    <button class="btn" onclick="partnerVerifyOtp()">${t('Verify phone')}</button>
+    ${state.showPhoneEdit ? `<button class="btn ghost" style="margin-top:8px" onclick="togglePhoneEdit(false)">${t('Cancel')}</button>` : ''}` : `
+    <div class="muted small" style="margin-top:12px">📱 ${esc(p.phone)} — ${t('verified')}. <button class="link" onclick="togglePhoneEdit(true)">${t('Change')}</button></div>`}
     ${status !== 'approved' ? `
     <div class="divider"></div>
-    <label class="field"><span>Legal business name</span>
-      <input id="kyc-name" value="${esc(p.name || '')}" placeholder="Registered business name" />
+    <label class="field"><span>${t('Legal business name')}</span>
+      <input id="kyc-name" value="${esc(p.name || '')}" placeholder="${t('Registered business name')}" />
     </label>
-    <label class="field"><span>Registration / PAN no.</span>
+    <label class="field"><span>${t('Registration / PAN no.')}</span>
       <input id="kyc-regno" value="${esc(p.regNo || '')}" placeholder="PAN-301234567" />
     </label>
-    <label class="field"><span>Document reference / upload link</span>
-      <input id="kyc-doc" value="${esc(p.businessKycDocumentRef || '')}" placeholder="Certificate file ID or secure link" />
+    <label class="field"><span>${t('Document reference / upload link')}</span>
+      <input id="kyc-doc" value="${esc(p.businessKycDocumentRef || '')}" placeholder="${t('Certificate file ID or secure link')}" />
     </label>
-    <button class="btn" onclick="submitPartnerKyc()">${status === 'rejected' ? 'Fix & resubmit KYC' : 'Submit KYC for review'}</button>` : ''}
+    <button class="btn" onclick="submitPartnerKyc()">${status === 'rejected' ? t('Fix & resubmit KYC') : t('Submit KYC for review')}</button>` : ''}
   </div>`;
 }
 
@@ -1872,7 +1927,7 @@ window.partnerRequestOtp = async () => {
       body: { phone: $('#partner-phone').value.trim() }
     });
     state.partner = data.partner;
-    toast(data.devCode ? `Sandbox OTP: ${data.devCode}` : 'Verification code sent.');
+    toast(data.devCode ? t('Sandbox OTP: {code}', { code: data.devCode }) : t('Verification code sent.'));
     render();
   } catch (e) {
     toast(e.message, true);
@@ -1887,7 +1942,7 @@ window.partnerVerifyOtp = async () => {
     });
     state.partner = data.partner;
     state.showPhoneEdit = false;
-    toast('Phone verified.');
+    toast(t('Phone verified.'));
     render();
   } catch (e) {
     toast(e.message, true);
@@ -1905,7 +1960,7 @@ window.submitPartnerKyc = async () => {
       }
     });
     state.partner = data.partner;
-    toast('KYC submitted — SewaGo will review it.');
+    toast(t('KYC submitted — SewaGo will review it.'));
     render();
   } catch (e) {
     toast(e.message, true);
@@ -1977,6 +2032,7 @@ window.openStore = async (id) => {
 window.closeStore = () => {
   state.activeStore = null;
   state.inventory = null;
+  state.insights = null;
   state.voice = { listening: false, heard: '', error: '' };
   state.drafts = null;
   state.itemForm = null;
@@ -1993,6 +2049,13 @@ window.setInvTab = async (tab) => {
   try {
     if (tab === 'reorder') state.reorder = await api(`/api/partner/stores/${state.activeStore}/reorder`);
     if (tab === 'subs') await loadSubscribeRequests();
+    if (tab === 'insights') {
+      // "Today" is the shopkeeper's midnight, not the server's — the phone
+      // knows its own timezone, so it sends the boundary.
+      const midnight = new Date();
+      midnight.setHours(0, 0, 0, 0);
+      state.insights = await api(`/api/partner/stores/${state.activeStore}/insights?since=${midnight.getTime()}`);
+    }
     render();
   } catch (e) { toast(e.message, true); }
 };
@@ -2007,7 +2070,7 @@ window.createStore = async () => {
     await api('/api/partner/stores', { method: 'POST', body: { name, area, deliveryFee, icon: state.storeIcon || '🏪' } });
     state.showStoreForm = false;
     await loadStores();
-    toast('Shop submitted for review 🏪');
+    toast(t('Shop submitted for review 🏪'));
     render();
   } catch (e) { toast(e.message, true); }
 };
@@ -2018,7 +2081,7 @@ window.toggleShopOpen = async (open) => {
   try {
     await api(`/api/partner/stores/${state.activeStore}`, { method: 'PATCH', body: { open } });
     await loadInventory();
-    toast(open ? 'Shop is open — customers can order 🟢' : 'Shop closed — no new orders');
+    toast(open ? t('Shop is open — customers can order 🟢') : t('Shop closed — no new orders'));
     render();
   } catch (e) { toast(e.message, true); }
 };
@@ -2027,15 +2090,15 @@ function storeForm() {
   const icon = state.storeIcon || '🏪';
   return `
   <div class="card">
-    <label class="field"><span>Shop name</span><input id="store-name" placeholder="e.g. Ram Kirana Pasal" /></label>
-    <label class="field"><span>Area</span><input id="store-area" placeholder="e.g. Thamel, New Baneshwor" /></label>
-    <label class="field"><span>Delivery charge (Rs, 0 if customers collect)</span><input id="store-fee" type="number" value="0" min="0" max="200" /></label>
-    <div class="muted small" style="margin-bottom:6px">Shop icon</div>
+    <label class="field"><span>${t('Shop name')}</span><input id="store-name" placeholder="${t('e.g.')} Ram Kirana Pasal" /></label>
+    <label class="field"><span>${t('Area')}</span><input id="store-area" placeholder="${t('e.g.')} Thamel, New Baneshwor" /></label>
+    <label class="field"><span>${t('Delivery charge (Rs, 0 if customers collect)')}</span><input id="store-fee" type="number" value="0" min="0" max="200" /></label>
+    <div class="muted small" style="margin-bottom:6px">${t('Shop icon')}</div>
     <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px">
       ${STORE_ICONS.map((i) => `<button class="btn ghost compact" style="${i === icon ? 'border-color:var(--accent)' : ''}" onclick="pickStoreIcon('${i}')">${i}</button>`).join('')}
     </div>
-    <button class="btn" onclick="createStore()">Submit for review</button>
-    <button class="btn ghost" style="margin-top:8px" onclick="toggleStoreForm()">Cancel</button>
+    <button class="btn" onclick="createStore()">${t('Submit for review')}</button>
+    <button class="btn ghost" style="margin-top:8px" onclick="toggleStoreForm()">${t('Cancel')}</button>
   </div>`;
 }
 
@@ -2046,22 +2109,22 @@ function storeForm() {
 // commits through the bulk endpoint.
 function aiCard() {
   if (state.aiDisabled) {
-    return `<div class="muted small" style="margin-bottom:12px">🤖 The AI stock assistant is not set up on this server — add items by voice or typing below.</div>`;
+    return `<div class="muted small" style="margin-bottom:12px">${t('🤖 The AI stock assistant is not set up on this server — add items by voice or typing below.')}</div>`;
   }
   return `
   <div class="card ai-card">
-    <div style="font-weight:900">Stock assistant 🤖</div>
+    <div style="font-weight:900">${t('Stock assistant')} 🤖</div>
     <div class="muted small" style="margin:6px 0 10px">
-      Describe what to add or restock — it drafts the rows, you check and save.
+      ${t('Describe what to add or restock — it drafts the rows, you check and save.')}
     </div>
-    <textarea id="ai-prompt" rows="3" placeholder="wai wai 20 packet 25 rs, coca cola 12 bottle…&#10;restock everything that's running low&#10;set up a typical cold store"></textarea>
-    <button class="btn" style="margin-top:10px" onclick="aiGenerate()" ${state.aiBusy ? 'disabled' : ''}>${state.aiBusy ? '⏳ Drafting…' : '✨ Generate draft'}</button>
+    <textarea id="ai-prompt" rows="3" placeholder="${t('wai wai 20 packet 25 rs, coca cola 12 bottle…')}"></textarea>
+    <button class="btn" style="margin-top:10px" onclick="aiGenerate()" ${state.aiBusy ? 'disabled' : ''}>${state.aiBusy ? t('⏳ Drafting…') : t('✨ Generate draft')}</button>
   </div>`;
 }
 
 window.aiGenerate = async () => {
   const prompt = (($('#ai-prompt') || {}).value || '').trim();
-  if (prompt.length < 3) return toast('Describe what to add or restock first.', true);
+  if (prompt.length < 3) return toast(t('Describe what to add or restock first.'), true);
   state.aiBusy = true;
   renderKeepingForms();
   try {
@@ -2094,7 +2157,7 @@ function speechSupported() {
 
 window.startVoice = () => {
   if (!speechSupported()) {
-    state.voice.error = 'This phone cannot listen — type the item instead.';
+    state.voice.error = t('This phone cannot listen — type the item instead.');
     return render();
   }
   const Rec = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -2116,8 +2179,8 @@ window.startVoice = () => {
   rec.onerror = (ev) => {
     state.voice.listening = false;
     state.voice.error = ev.error === 'not-allowed'
-      ? 'Microphone blocked — allow it in your browser, or type the item.'
-      : 'Could not hear that. Try again, or type the item.';
+      ? t('Microphone blocked — allow it in your browser, or type the item.')
+      : t('Could not hear that. Try again, or type the item.');
     render();
   };
   rec.onend = () => { state.voice.listening = false; render(); };
@@ -2133,7 +2196,7 @@ window.stopVoice = () => {
 
 window.toggleVoiceLang = () => {
   state.voiceLang = (state.voiceLang || 'ne-NP') === 'ne-NP' ? 'en-IN' : 'ne-NP';
-  toast(state.voiceLang === 'ne-NP' ? 'Listening in Nepali' : 'Listening in English');
+  toast(state.voiceLang === 'ne-NP' ? t('Listening in Nepali') : t('Listening in English'));
   render();
 };
 
@@ -2162,22 +2225,22 @@ function voiceCard() {
   return `
   <div class="card">
     <div class="row">
-      <div style="font-weight:900">Add stock by speaking 🎤</div>
+      <div style="font-weight:900">${t('Add stock by speaking 🎤')}</div>
       <button class="btn ghost compact" onclick="toggleVoiceLang()">${lang}</button>
     </div>
     <div class="muted small" style="margin:6px 0 12px">
-      Say the item, how many, and the price — “<b style="color:var(--text)">दुई किलो चिनी सय रुपैयाँ</b>” or “<b style="color:var(--text)">5 packet wai wai 20 rupees</b>”.
+      ${t('Say the item, how many, and the price —')} “<b style="color:var(--text)">दुई किलो चिनी सय रुपैयाँ</b>” ${t('or')} “<b style="color:var(--text)">5 packet wai wai 20 rupees</b>”.
     </div>
     ${v.listening
-      ? `<button class="btn danger mic-btn listening" onclick="stopVoice()">● Listening… tap when done</button>
+      ? `<button class="btn danger mic-btn listening" onclick="stopVoice()">${t('● Listening… tap when done')}</button>
          <div class="muted small" id="voice-heard" style="margin-top:8px;min-height:20px">${esc(v.heard || '')}</div>`
-      : `<button class="btn mic-btn" onclick="startVoice()">🎤 Hold a moment and speak</button>`}
+      : `<button class="btn mic-btn" onclick="startVoice()">${t('🎤 Hold a moment and speak')}</button>`}
     ${v.error ? `<div class="muted small" style="color:#fca5a5;margin-top:8px">${esc(v.error)}</div>` : ''}
     <div class="divider"></div>
-    <label class="field" style="margin:0"><span>…or type it</span>
+    <label class="field" style="margin:0"><span>${t('…or type it')}</span>
       <input id="voice-typed" placeholder="2 kg sugar 100" onkeydown="if(event.key==='Enter')typeVoiceLine()" />
     </label>
-    <button class="btn ghost compact" style="margin-top:8px" onclick="typeVoiceLine()">Add typed line</button>
+    <button class="btn ghost compact" style="margin-top:8px" onclick="typeVoiceLine()">${t('Add typed line')}</button>
   </div>`;
 }
 
@@ -2194,27 +2257,27 @@ function draftsCard() {
   const warn = (row, f) => ((row.needsReview || []).includes(f) ? 'warn' : '');
   return `
   <div class="card" style="border-color:var(--accent);margin-top:12px">
-    <div style="font-weight:900">${d.source === 'ai' ? '🤖 AI draft — check before saving' : 'Check before saving'}</div>
+    <div style="font-weight:900">${d.source === 'ai' ? t('🤖 AI draft — check before saving') : t('Check before saving')}</div>
     ${d.note ? `<div class="muted small" style="margin-top:4px">${esc(d.note)}</div>` : ''}
-    <div class="muted small" style="margin-top:4px">Nothing is saved yet — fix any cell, drop rows you don't want.</div>
+    <div class="muted small" style="margin-top:4px">${t("Nothing is saved yet — fix any cell, drop rows you don't want.")}</div>
     ${d.items.map((row, i) => `
     <div class="draft-row">
       <div class="dr-top">
-        <input id="dr-name-${i}" class="${warn(row, 'name')}" value="${esc(row.name || '')}" placeholder="Item" />
+        <input id="dr-name-${i}" class="${warn(row, 'name')}" value="${esc(row.name || '')}" placeholder="${t('Item')}" />
         <button class="btn ghost compact dr-x" onclick="removeDraftRow(${i})">✕</button>
       </div>
-      ${row.raw ? `<div class="muted small" style="margin-top:4px">Heard: “${esc(row.raw)}”</div>` : ''}
+      ${row.raw ? `<div class="muted small" style="margin-top:4px">${t('Heard:')} “${esc(row.raw)}”</div>` : ''}
       <div class="dr-grid">
-        <input id="dr-qty-${i}" class="${warn(row, 'qty')}" type="number" step="0.5" value="${row.qty ?? ''}" placeholder="Qty" />
+        <input id="dr-qty-${i}" class="${warn(row, 'qty')}" type="number" step="0.5" value="${row.qty ?? ''}" placeholder="${t('Qty')}" />
         <select id="dr-unit-${i}" class="${warn(row, 'unit')}">
-          ${Object.entries(units).map(([k, u]) => `<option value="${k}" ${k === row.unit ? 'selected' : ''}>${u.label}</option>`).join('')}
+          ${Object.entries(units).map(([k, u]) => `<option value="${k}" ${k === row.unit ? 'selected' : ''}>${t(u.label)}</option>`).join('')}
         </select>
         <input id="dr-price-${i}" class="${warn(row, 'price')}" type="number" value="${row.price ?? ''}" placeholder="Rs" />
-        <input id="dr-cat-${i}" value="${esc(row.category || '')}" placeholder="Category" />
+        <input id="dr-cat-${i}" value="${esc(row.category || '')}" placeholder="${t('Category')}" />
       </div>
     </div>`).join('')}
-    <button class="btn" style="margin-top:12px" onclick="commitDrafts()">Add all ${d.items.length} to inventory</button>
-    <button class="btn ghost" style="margin-top:8px" onclick="discardDrafts()">Discard draft</button>
+    <button class="btn" style="margin-top:12px" onclick="commitDrafts()">${t('Add all {n} to inventory', { n: d.items.length })}</button>
+    <button class="btn ghost" style="margin-top:8px" onclick="discardDrafts()">${t('Discard draft')}</button>
   </div>`;
 }
 
@@ -2249,7 +2312,7 @@ window.commitDrafts = async () => {
   const rows = state.drafts.items
     .map((r) => ({ name: (r.name || '').trim(), qty: r.qty, unit: r.unit, price: r.price, category: (r.category || '').trim() }))
     .filter((r) => r.name);
-  if (!rows.length) return toast('Nothing to add — every row needs a name.', true);
+  if (!rows.length) return toast(t('Nothing to add — every row needs a name.'), true);
   try {
     const res = await api(`/api/partner/stores/${state.activeStore}/items/bulk`, { method: 'POST', body: { items: rows } });
     const restocked = (res.added || []).filter((a) => a.restocked).length;
@@ -2257,8 +2320,8 @@ window.commitDrafts = async () => {
     const failed = res.failed || [];
     state.drafts = null;
     await loadInventory();
-    const summary = [added ? `${added} added` : '', restocked ? `${restocked} restocked` : ''].filter(Boolean).join(' · ') || 'Saved';
-    if (failed.length) toast(`${summary} — ${failed.length} failed: ${failed[0].error}`, true);
+    const summary = [added ? t('{n} added', { n: added }) : '', restocked ? t('{n} restocked', { n: restocked }) : ''].filter(Boolean).join(' · ') || t('Saved');
+    if (failed.length) toast(`${summary} — ${t('{n} failed:', { n: failed.length })} ${failed[0].error}`, true);
     else toast(`${summary} ✓`);
     render();
   } catch (e) { toast(e.message, true); }
@@ -2293,38 +2356,38 @@ function itemInlineForm(i) {
   if (f.kind === 'restock') {
     return `
     <div class="inline-form">
-      <span>How many ${esc(i.unitLabel)} did you receive? (negative corrects a miscount)</span>
+      <span>${t('How many {unit} did you receive? (negative corrects a miscount)', { unit: esc(t(i.unitLabel)) })}</span>
       <input id="if-qty-${i.id}" type="number" step="0.5" placeholder="10" />
-      <button class="btn" onclick="confirmRestock('${i.id}')">Add stock</button>
-      <button class="btn ghost" onclick="closeItemForm()">Cancel</button>
+      <button class="btn" onclick="confirmRestock('${i.id}')">${t('Add stock')}</button>
+      <button class="btn ghost" onclick="closeItemForm()">${t('Cancel')}</button>
     </div>`;
   }
   if (f.kind === 'price') {
     return `
     <div class="inline-form">
-      <span>New shelf price (Rs / ${esc(i.unitLabel)})</span>
+      <span>${t('New shelf price (Rs / {unit})', { unit: esc(t(i.unitLabel)) })}</span>
       <input id="if-price-${i.id}" type="number" value="${i.price}" />
-      <button class="btn" onclick="confirmPrice('${i.id}')">Save price</button>
-      <button class="btn ghost" onclick="closeItemForm()">Cancel</button>
+      <button class="btn" onclick="confirmPrice('${i.id}')">${t('Save price')}</button>
+      <button class="btn ghost" onclick="closeItemForm()">${t('Cancel')}</button>
     </div>`;
   }
   return `
   <div class="inline-form">
-    <span>Subscriber price — must be under Rs ${i.price}. Leave blank to remove.</span>
+    <span>${t('Subscriber price — must be under Rs {price}. Leave blank to remove.', { price: i.price })}</span>
     <input id="if-sub-${i.id}" type="number" value="${i.subscribePrice || ''}" placeholder="Rs" />
-    <button class="btn" onclick="confirmSubPrice('${i.id}')">Save</button>
-    <button class="btn ghost" onclick="closeItemForm()">Cancel</button>
+    <button class="btn" onclick="confirmSubPrice('${i.id}')">${t('Save')}</button>
+    <button class="btn ghost" onclick="closeItemForm()">${t('Cancel')}</button>
   </div>`;
 }
 
 window.confirmRestock = async (itemId) => {
   const qty = Number((($(`#if-qty-${itemId}`) || {}).value || ''));
-  if (!qty) return toast('Enter how many came in.', true);
+  if (!qty) return toast(t('Enter how many came in.'), true);
   try {
     await api(`/api/partner/stores/${state.activeStore}/items/${itemId}/restock`, { method: 'POST', body: { qty } });
     state.itemForm = null;
     await loadInventory();
-    toast('Stock updated ✓');
+    toast(t('Stock updated ✓'));
     render();
   } catch (e) { toast(e.message, true); }
 };
@@ -2335,7 +2398,7 @@ window.confirmPrice = async (itemId) => {
     await api(`/api/partner/stores/${state.activeStore}/items/${itemId}`, { method: 'PATCH', body: { price } });
     state.itemForm = null;
     await loadInventory();
-    toast('Price updated ✓');
+    toast(t('Price updated ✓'));
     render();
   } catch (e) { toast(e.message, true); }
 };
@@ -2348,7 +2411,7 @@ window.confirmSubPrice = async (itemId) => {
     });
     state.itemForm = null;
     await loadInventory();
-    toast(raw ? 'Subscriber price set — regulars pay less ✓' : 'Subscriber price removed');
+    toast(raw ? t('Subscriber price set — regulars pay less ✓') : t('Subscriber price removed'));
     render();
   } catch (e) { toast(e.message, true); }
 };
@@ -2385,9 +2448,9 @@ function helperBlock() {
   if (state.helperInvite) {
     return `
     <div class="card" style="border-color:var(--accent)">
-      <div style="font-weight:900">👥 Helper invited</div>
+      <div style="font-weight:900">${t('👥 Helper invited')}</div>
       <div class="muted small" style="margin:6px 0 10px">
-        Give ${esc(state.helperInvite.name || 'your helper')} this code to join in the SewaGo app. They can add items and count stock — never change prices or see your money.
+        ${t('Give {name} this code to join in the SewaGo app.', { name: esc(state.helperInvite.name || t('your helper')) })} ${t('They can add items and count stock — never change prices or see your money.')}
       </div>
       <div style="font-size:26px;font-weight:900;letter-spacing:4px;text-align:center">${esc(state.helperInvite.code)}</div>
       <div class="muted small" style="text-align:center;margin-top:6px">Works for 24 hours — invite again if they miss it.</div>
@@ -2397,44 +2460,55 @@ function helperBlock() {
   if (state.helperForm) {
     return `
     <div class="inline-form">
-      <span>Helper name (so you know whose count is whose)</span>
-      <input id="helper-name" placeholder="e.g. Sita" />
-      <button class="btn" onclick="inviteHelper()">Invite</button>
-      <button class="btn ghost" onclick="toggleHelperForm(false)">Cancel</button>
+      <span>${t('Helper name (so you know whose count is whose)')}</span>
+      <input id="helper-name" placeholder="${t('e.g.')} Sita" />
+      <button class="btn" onclick="inviteHelper()">${t('Invite')}</button>
+      <button class="btn ghost" onclick="toggleHelperForm(false)">${t('Cancel')}</button>
     </div>`;
   }
   return `
-    <button class="btn ghost" onclick="toggleHelperForm(true)">👥 Invite a helper to count stock</button>
-    <div class="muted small" style="margin-top:6px">They can add items and count shelves — never change prices or see your money.</div>`;
+    <button class="btn ghost" onclick="toggleHelperForm(true)">${t('👥 Invite a helper to count stock')}</button>
+    <div class="muted small" style="margin-top:6px">${t('They can add items and count shelves — never change prices or see your money.')}</div>`;
 }
 
 /* ---------------- views ---------------- */
 
 function itemRow(i) {
-  const out = i.stock <= 0;
+  const stock = Number(i.stock) || 0;
+  const out = stock <= 0;
   const asks = ((state.subReqs[state.activeStore] || {}).pendingByItem || {})[i.id] || 0;
+  // The level bar answers "do I need to buy this?" at a glance. Full means a
+  // comfortable three times the low-stock mark; the colour is the verdict:
+  // red = act now (at or under the low mark, or gone), amber = getting low,
+  // green = fine. The low mark itself comes from the server — the shop's own
+  // threshold if set, otherwise a week of cover at the item's real sales rate.
+  const mark = Math.max(1, Number(i.lowStockAt) || 3);
+  const pct = out ? 0 : Math.max(4, Math.min(100, Math.round((stock / (mark * 3)) * 100)));
+  const level = out || stock <= mark ? 'low' : stock <= mark * 2 ? 'mid' : 'ok';
+  const numColor = level === 'low' ? 'var(--danger)' : level === 'mid' ? 'var(--amber)' : 'var(--text)';
   return `
-  <div class="card" style="${out ? 'border-color:#7f1d1d' : i.low ? 'border-color:#a16207' : ''}">
+  <div class="card" style="${level === 'low' ? 'border-color:#7f1d1d' : level === 'mid' ? 'border-color:#a16207' : ''}">
     <div class="row">
       <div class="grow">
         <div style="font-weight:800">${esc(i.name)}</div>
         <div class="muted small">
-          ${money(i.price)} / ${esc(i.unitLabel)}${i.subscribePrice ? ` · 🔁 ${money(i.subscribePrice)} for subscribers` : ''}
+          ${money(i.price)} / ${esc(t(i.unitLabel))}${i.subscribePrice ? ` · 🔁 ${money(i.subscribePrice)} ${t('for subscribers')}` : ''}
         </div>
       </div>
       <div style="text-align:right">
-        <div style="font-size:20px;font-weight:900;color:${out ? '#f87171' : i.low ? '#fbbf24' : 'var(--text)'}">${i.stock}</div>
-        <div class="muted small">${esc(i.unitLabel)} left</div>
+        <div style="font-size:20px;font-weight:900;color:${numColor}">${i.stock}</div>
+        <div class="muted small">${esc(t(i.unitLabel))} ${t('left')}</div>
+        <div class="stock-meter ${level}"><div style="width:${pct}%"></div></div>
       </div>
     </div>
-    ${out ? `<div class="muted small" style="color:#fca5a5;margin-top:6px">Out of stock — customers cannot order it</div>`
-      : i.low ? `<div class="muted small" style="color:#fbbf24;margin-top:6px">Running low — reorder soon</div>` : ''}
-    ${asks ? `<div class="muted small" style="color:var(--accent);margin-top:6px">🔁 ${asks} customer${asks > 1 ? 's' : ''} asking to subscribe — see the Subscriptions tab</div>` : ''}
+    ${out ? `<div class="muted small" style="color:#fca5a5;margin-top:6px">${t('Out of stock — customers cannot order it')}</div>`
+      : level === 'low' ? `<div class="muted small" style="color:#fca5a5;margin-top:6px">${t('Running low — reorder soon')}</div>` : ''}
+    ${asks ? `<div class="muted small" style="color:var(--accent);margin-top:6px">🔁 ${t('{n} customers asking to subscribe — see the Subscriptions tab', { n: asks })}</div>` : ''}
     <div style="display:flex;gap:6px;margin-top:10px;flex-wrap:wrap">
-      <button class="btn compact" onclick="markSold('${i.id}', 1)" ${out ? 'disabled' : ''}>Sold 1</button>
-      <button class="btn ghost compact" onclick="openItemForm('${i.id}','restock')">+ Stock</button>
-      <button class="btn ghost compact" onclick="openItemForm('${i.id}','price')">Price</button>
-      <button class="btn ghost compact" title="Subscriber price" onclick="openItemForm('${i.id}','sub')">🔁</button>
+      <button class="btn compact" onclick="markSold('${i.id}', 1)" ${out ? 'disabled' : ''}>${t('Sold 1')}</button>
+      <button class="btn ghost compact" onclick="openItemForm('${i.id}','restock')">${t('+ Stock')}</button>
+      <button class="btn ghost compact" onclick="openItemForm('${i.id}','price')">${t('Price')}</button>
+      <button class="btn ghost compact" title="${t('Subscriber price')}" onclick="openItemForm('${i.id}','sub')">🔁</button>
     </div>
     ${itemInlineForm(i)}
   </div>`;
@@ -2442,28 +2516,28 @@ function itemRow(i) {
 
 function reorderView() {
   const r = state.reorder;
-  if (!r) return `<div class="empty">Loading…</div>`;
+  if (!r) return `<div class="empty">${t('Loading…')}</div>`;
   if (!r.suggestions.length) {
-    return `<div class="empty"><div class="big">✅</div>Nothing is running low. Your shelves are in good shape.</div>`;
+    return `<div class="empty"><div class="big">✅</div>${t('Nothing is running low. Your shelves are in good shape.')}</div>`;
   }
   return `
-  <div class="muted small" style="margin-bottom:10px">Ranked by how soon you run out, using how fast each item actually sells.</div>
+  <div class="muted small" style="margin-bottom:10px">${t('Ranked by how soon you run out, using how fast each item actually sells.')}</div>
   ${r.suggestions.map((s) => `
   <div class="card">
     <div class="row">
       <div class="grow">
         <div style="font-weight:800">${esc(s.name)}</div>
         <div class="muted small">
-          ${s.stock} left · sells ${s.perDay}/day${s.daysLeft !== null ? ` · about ${s.daysLeft} days` : ''}
+          ${s.stock} ${t('left')} · ${t('sells {n}/day', { n: s.perDay })}${s.daysLeft !== null ? ` · ${t('about {n} days', { n: s.daysLeft })}` : ''}
         </div>
       </div>
       <div style="text-align:right">
-        <div style="font-weight:900;color:var(--accent)">buy ${s.suggestedQty}</div>
-        ${s.outOfStock ? `<div class="muted small" style="color:#f87171">out now</div>` : ''}
+        <div style="font-weight:900;color:var(--accent)">${t('buy')} ${s.suggestedQty}</div>
+        ${s.outOfStock ? `<div class="muted small" style="color:#f87171">${t('out now')}</div>` : ''}
       </div>
     </div>
   </div>`).join('')}
-  ${state.aiDisabled ? '' : `<div class="muted small" style="margin-top:10px">Tip: ask the stock assistant on the Stock tab to “restock everything that's running low” — it drafts the whole list.</div>`}`;
+  ${state.aiDisabled ? '' : `<div class="muted small" style="margin-top:10px">${t('Tip: ask the stock assistant on the Stock tab to restock everything that is running low — it drafts the whole list.')}</div>`}`;
 }
 
 /* ---------------- subscriptions (inside the inventory manager) ---------------- */
@@ -2475,14 +2549,14 @@ window.setSubAccept = (id) => {
 
 window.acceptSubRequest = async (reqId) => {
   const sp = Number((($(`#sub-price-${reqId}`) || {}).value || ''));
-  if (!sp) return toast('Enter the subscriber price first.', true);
+  if (!sp) return toast(t('Enter the subscriber price first.'), true);
   try {
     await api(`/api/partner/stores/${state.activeStore}/subscribe-requests/${reqId}/accept`, {
       method: 'POST', body: { subscribePrice: sp }
     });
     state.subAccept = '';
     await Promise.all([loadSubscribeRequests(), loadInventory()]);
-    toast('Offer sent — the customer can subscribe now 🔁');
+    toast(t('Offer sent — the customer can subscribe now 🔁'));
     render();
   } catch (e) { toast(e.message, true); }
 };
@@ -2492,7 +2566,7 @@ window.declineSubRequest = async (reqId) => {
     await api(`/api/partner/stores/${state.activeStore}/subscribe-requests/${reqId}/decline`, { method: 'POST' });
     state.subAccept = '';
     await loadSubscribeRequests();
-    toast('Request declined.');
+    toast(t('Request declined.'));
     render();
   } catch (e) { toast(e.message, true); }
 };
@@ -2503,20 +2577,20 @@ function subReqCard(r) {
   <div class="card" style="border-color:var(--accent)">
     <div class="row">
       <div class="grow">
-        <div style="font-weight:800">👤 ${esc(r.userName)} asks for <b>${esc(r.itemName)}</b></div>
-        <div class="muted small">${item ? `${money(item.price)} / ${esc(item.unitLabel)} on the shelf · ` : ''}asked ${timeAgo(r.createdAt)}</div>
+        <div style="font-weight:800">${t('👤 {user} asks for {item}', { user: esc(r.userName), item: `<b>${esc(r.itemName)}</b>` })}</div>
+        <div class="muted small">${item ? `${money(item.price)} / ${esc(t(item.unitLabel))} ${t('on the shelf')} · ` : ''}${t('asked')} ${timeAgo(r.createdAt)}</div>
       </div>
     </div>
     ${state.subAccept === r.id ? `
     <div class="inline-form">
-      <span>Subscriber price${item ? ` — must be under Rs ${item.price}` : ''}</span>
-      <input id="sub-price-${r.id}" type="number" placeholder="${item ? `e.g. ${Math.max(1, Math.round(item.price * 0.9))}` : 'Rs'}" />
-      <button class="btn" onclick="acceptSubRequest('${r.id}')">Offer it</button>
-      <button class="btn ghost" onclick="setSubAccept('')">Back</button>
+      <span>${t('Subscriber price')}${item ? ` — ${t('must be under Rs {price}', { price: item.price })}` : ''}</span>
+      <input id="sub-price-${r.id}" type="number" placeholder="${item ? `${t('e.g.')} ${Math.max(1, Math.round(item.price * 0.9))}` : 'Rs'}" />
+      <button class="btn" onclick="acceptSubRequest('${r.id}')">${t('Offer it')}</button>
+      <button class="btn ghost" onclick="setSubAccept('')">${t('Back')}</button>
     </div>` : `
     <div class="grid2" style="margin-top:10px">
-      <button class="btn" onclick="setSubAccept('${r.id}')">✅ Accept — set price</button>
-      <button class="btn ghost" onclick="declineSubRequest('${r.id}')">Decline</button>
+      <button class="btn" onclick="setSubAccept('${r.id}')">${t('✅ Accept — set price')}</button>
+      <button class="btn ghost" onclick="declineSubRequest('${r.id}')">${t('Decline')}</button>
     </div>`}
   </div>`;
 }
@@ -2527,9 +2601,9 @@ function subPricedRow(i) {
     <div class="row">
       <div class="grow">
         <div style="font-weight:800">${esc(i.name)}</div>
-        <div class="muted small">${money(i.price)} shelf · 🔁 ${money(i.subscribePrice)} for subscribers</div>
+        <div class="muted small">${money(i.price)} ${t('shelf')} · 🔁 ${money(i.subscribePrice)} ${t('for subscribers')}</div>
       </div>
-      <button class="btn ghost compact" onclick="openItemForm('${i.id}','sub')">Edit</button>
+      <button class="btn ghost compact" onclick="openItemForm('${i.id}','sub')">${t('Edit')}</button>
     </div>
     ${itemInlineForm(i)}
   </div>`;
@@ -2541,14 +2615,14 @@ function subsView() {
   const priced = ((state.inventory && state.inventory.items) || []).filter((i) => i.subscribePrice);
   return `
   <div class="muted small" style="margin-bottom:10px">
-    Subscriber prices: a lower price for customers who subscribe to an item — they save, you get steady weekly sales.
+    ${t('Subscriber prices: a lower price for customers who subscribe to an item — they save, you get steady weekly sales.')}
   </div>
-  <div class="section-title">Customer requests 🔁${pending.length ? ` <span class="badge">${pending.length}</span>` : ''}</div>
+  <div class="section-title">${t('Customer requests')} 🔁${pending.length ? ` <span class="badge">${pending.length}</span>` : ''}</div>
   ${pending.length ? pending.map(subReqCard).join('')
-    : `<div class="muted small" style="margin-bottom:12px">No one is waiting on an answer. Requests from the customer app land here instantly.</div>`}
-  <div class="section-title">Items with a subscriber price</div>
+    : `<div class="muted small" style="margin-bottom:12px">${t('No one is waiting on an answer. Requests from the customer app land here instantly.')}</div>`}
+  <div class="section-title">${t('Items with a subscriber price')}</div>
   ${priced.length ? priced.map(subPricedRow).join('')
-    : `<div class="muted small">None yet — accept a request above, or tap 🔁 on any item in Stock.</div>`}`;
+    : `<div class="muted small">${t('None yet — accept a request above, or tap 🔁 on any item in Stock.')}</div>`}`;
 }
 
 /* ---------------- inventory takeover ---------------- */
@@ -2558,11 +2632,11 @@ function stockTab(inv) {
     ${aiCard()}
     ${voiceCard()}
     ${draftsCard()}
-    <label class="field" style="margin-top:12px"><span>Find an item</span>
-      <input id="inv-search" value="${esc(state.invSearch)}" placeholder="Search your shelves" oninput="searchInventory()" />
+    <label class="field" style="margin-top:12px"><span>${t('Find an item')}</span>
+      <input id="inv-search" value="${esc(state.invSearch)}" placeholder="${t('Search your shelves')}" oninput="searchInventory()" />
     </label>
     ${inv.items.length ? inv.items.map(itemRow).join('')
-      : `<div class="empty"><div class="big">📦</div>${state.invSearch ? 'Nothing matches that.' : 'No items yet — speak your first one above.'}</div>`}
+      : `<div class="empty"><div class="big">📦</div>${state.invSearch ? t('Nothing matches that.') : t('No items yet — speak your first one above.')}</div>`}
     <div class="divider"></div>
     ${helperBlock()}`;
 }
@@ -2570,54 +2644,59 @@ function stockTab(inv) {
 function inventoryView() {
   const inv = state.inventory;
   const store = state.stores.find((s) => s.id === state.activeStore) || {};
-  if (!inv) return `<div class="empty">Loading…</div>`;
+  if (!inv) return `<div class="empty">${t('Loading…')}</div>`;
   const st = inv.stats || {};
   const subsPending = pendingSubCount(state.activeStore);
   return `
     <header class="topbar">
-      <button class="btn ghost compact" onclick="closeStore()">← Shops</button>
-      <span class="badge ${inv.open ? '' : 'gray'}">${inv.open ? '🟢 OPEN' : '⚫ CLOSED'}</span>
+      <button class="btn ghost compact" onclick="closeStore()">${t('← Shops')}</button>
+      <div style="display:flex;gap:8px;align-items:center">
+        ${langButton()}
+        <span class="badge ${inv.open ? '' : 'gray'}">${inv.open ? `🟢 ${t('OPEN')}` : `⚫ ${t('CLOSED')}`}</span>
+      </div>
     </header>
     <main>
       <div class="row" style="margin-bottom:12px">
         <div>
-          <div style="font-size:18px;font-weight:900">${store.icon || '🏪'} ${esc(store.name || 'Your shop')}</div>
-          <div class="muted small">${st.items || 0} items · ${money(st.stockValue || 0)} on the shelves</div>
+          <div style="font-size:18px;font-weight:900">${store.icon || '🏪'} ${esc(store.name || t('Your shop'))}</div>
+          <div class="muted small">${t('{n} items', { n: st.items || 0 })} · ${money(st.stockValue || 0)} ${t('on the shelves')}</div>
         </div>
-        <button class="btn ghost compact" onclick="toggleShopOpen(${inv.open ? 'false' : 'true'})">${inv.open ? 'Close shop' : 'Open shop'}</button>
+        <button class="btn ghost compact" onclick="toggleShopOpen(${inv.open ? 'false' : 'true'})">${inv.open ? t('Close shop') : t('Open shop')}</button>
       </div>
 
       ${store.locPinned ? '' : `
       <div class="card" style="border-color:var(--accent);margin-bottom:12px">
-        <div style="font-weight:900">📍 Put your shop on the map</div>
+        <div style="font-weight:900">${t('📍 Put your shop on the map')}</div>
         <div class="muted small" style="margin:4px 0 10px">
-          Customers find shops by how close they are. Stand in your shop and tap below so nearby customers can see you.
+          ${t('Customers find shops by how close they are. Stand in your shop and tap below so nearby customers can see you.')}
         </div>
-        <button class="btn" onclick="pinShopLocation()">Use my current location</button>
+        <button class="btn" onclick="pinShopLocation()">${t('Use my current location')}</button>
       </div>`}
 
       <div class="grid2" style="margin-bottom:12px">
         <div class="card" style="padding:12px">
-          <div class="muted small">Sold today</div>
+          <div class="muted small">${t('Sold today')}</div>
           <div style="font-size:22px;font-weight:900">${st.soldToday || 0}</div>
           <div class="muted small">${money(st.revenueToday || 0)}</div>
         </div>
         <div class="card" style="padding:12px">
-          <div class="muted small">Needs attention</div>
+          <div class="muted small">${t('Needs attention')}</div>
           <div style="font-size:22px;font-weight:900;color:${(st.lowStock || st.outOfStock) ? '#fbbf24' : 'var(--text)'}">${(st.lowStock || 0) + (st.outOfStock || 0)}</div>
-          <div class="muted small">${st.outOfStock || 0} out · ${st.lowStock || 0} low</div>
+          <div class="muted small">${st.outOfStock || 0} ${t('out')} · ${st.lowStock || 0} ${t('low')}</div>
         </div>
       </div>
 
       <div class="pipe-tabs">
-        <button class="${state.invTab === 'stock' ? 'active' : ''}" onclick="setInvTab('stock')">Stock</button>
-        <button class="${state.invTab === 'reorder' ? 'active' : ''}" onclick="setInvTab('reorder')">To buy${state.reorder && state.reorder.suggestions.length ? ` <b class="tab-badge">${state.reorder.suggestions.length}</b>` : ''}</button>
-        <button class="${state.invTab === 'subs' ? 'active' : ''}" onclick="setInvTab('subs')">Subscriptions${subsPending ? ` <b class="tab-badge">${subsPending}</b>` : ''}</button>
+        <button class="${state.invTab === 'stock' ? 'active' : ''}" onclick="setInvTab('stock')">${t('Stock')}</button>
+        <button class="${state.invTab === 'reorder' ? 'active' : ''}" onclick="setInvTab('reorder')">${t('To buy')}${state.reorder && state.reorder.suggestions.length ? ` <b class="tab-badge">${state.reorder.suggestions.length}</b>` : ''}</button>
+        <button class="${state.invTab === 'subs' ? 'active' : ''}" onclick="setInvTab('subs')">${t('Subs')}${subsPending ? ` <b class="tab-badge">${subsPending}</b>` : ''}</button>
+        <button class="${state.invTab === 'insights' ? 'active' : ''}" onclick="setInvTab('insights')">📊 ${t('Insights')}</button>
       </div>
 
       ${state.invTab === 'stock' ? stockTab(inv) : ''}
       ${state.invTab === 'reorder' ? reorderView() : ''}
       ${state.invTab === 'subs' ? subsView() : ''}
+      ${state.invTab === 'insights' ? insightsView() : ''}
       <div style="height:40px"></div>
     </main>`;
 }
@@ -2625,8 +2704,8 @@ function inventoryView() {
 // A shop's position is what puts it in "near me" for customers, so it is taken
 // from the shopkeeper's own phone standing in the shop rather than a typed area.
 window.pinShopLocation = () => {
-  if (!navigator.geolocation) return toast('This phone cannot share location.', true);
-  toast('Finding your shop…');
+  if (!navigator.geolocation) return toast(t('This phone cannot share location.'), true);
+  toast(t('Finding your shop…'));
   navigator.geolocation.getCurrentPosition(async (pos) => {
     try {
       await api(`/api/partner/stores/${state.activeStore}`, {
@@ -2635,8 +2714,241 @@ window.pinShopLocation = () => {
       });
       await loadStores();
       await loadInventory();
-      toast('Shop pinned — nearby customers can find you now 📍');
+      toast(t('Shop pinned — nearby customers can find you now 📍'));
       render();
     } catch (e) { toast(e.message, true); }
-  }, () => toast('Could not get your location — allow it in your browser.', true), { enableHighAccuracy: true, timeout: 10000 });
+  }, () => toast(t('Could not get your location — allow it in your browser.'), true), { enableHighAccuracy: true, timeout: 10000 });
 };
+
+/* ---------------- insights (how is my shop doing?) ---------------- */
+
+window.setInsightsPeriod = (p) => {
+  state.insightsPeriod = p;
+  render();
+};
+
+// A daily-units bar chart shared by the week and month views. The last bar is
+// today, in amber.
+function dailyChart(days, labelEvery) {
+  const maxU = Math.max(...days.map((w) => w.units), 1);
+  return `
+  <div class="vbar-chart" style="margin-top:10px">
+    ${days.map((w, idx) => `<div class="vbar ${w.units ? '' : 'zero'} ${idx === days.length - 1 ? 'today' : ''}" style="height:${w.units ? Math.max(8, Math.round((w.units / maxU) * 100)) : 2}%" title="${esc(w.date)} — ${w.units}"></div>`).join('')}
+  </div>
+  <div class="vbar-labels">
+    ${days.map((w, idx) => `<span>${labelEvery(w, idx)}</span>`).join('')}
+  </div>`;
+}
+
+// One ranked row per item: name, units in the period, money bar.
+function itemBars(rows) {
+  const maxRevenue = Math.max(...rows.map((x) => x.revenue), 1);
+  return rows.map((x) => `
+    <div style="margin-top:10px">
+      <div class="row">
+        <div class="grow small">${esc(x.name)} <span class="muted">· ${x.qty} ${esc(t(x.unit || ''))}</span></div>
+        <div style="font-weight:800;white-space:nowrap">${money(x.revenue)}</div>
+      </div>
+      <div class="hbar-track"><div style="width:${Math.max(4, Math.round((x.revenue / maxRevenue) * 100))}%"></div></div>
+    </div>`).join('');
+}
+
+// Pure-CSS bars: every number a shopkeeper needs, no chart library. The events
+// come with real timestamps and are bucketed by the PHONE's clock, so "10 AM"
+// means 10 AM in the shop, wherever the server lives. One switch flips the
+// whole report between today / this week / this month — per item every time.
+function insightsView() {
+  const ins = state.insights;
+  if (!ins) return `<div class="empty">${t('Loading…')}</div>`;
+  const period = state.insightsPeriod;
+  const daily = ins.daily || [];
+  const periodItems = ins.items || [];
+  const dayNames = [t('Sun'), t('Mon'), t('Tue'), t('Wed'), t('Thu'), t('Fri'), t('Sat')];
+
+  const switcher = `
+  <div class="pipe-tabs" style="margin-bottom:12px">
+    <button class="${period === 'today' ? 'active' : ''}" onclick="setInsightsPeriod('today')">${t('Today')}</button>
+    <button class="${period === 'week' ? 'active' : ''}" onclick="setInsightsPeriod('week')">${t('This week')}</button>
+    <button class="${period === 'month' ? 'active' : ''}" onclick="setInsightsPeriod('month')">${t('This month')}</button>
+  </div>`;
+
+  if (period !== 'today') {
+    const week = period === 'week';
+    const days = week ? daily.slice(-7) : daily;
+    const units = Math.round(days.reduce((s, w) => s + w.units, 0) * 10) / 10;
+    const rows = periodItems
+      .map((x) => ({ name: x.name, unit: x.unit, qty: week ? x.qty7 : x.qty30, revenue: week ? x.revenue7 : x.revenue30 }))
+      .filter((x) => x.qty > 0)
+      .sort((a, b) => b.revenue - a.revenue || b.qty - a.qty);
+    const revenue = rows.reduce((s, x) => s + x.revenue, 0);
+    return `
+    ${switcher}
+    <div class="grid2" style="margin-bottom:12px">
+      <div class="card" style="padding:12px">
+        <div class="muted small">${week ? t('Sold this week') : t('Sold this month')}</div>
+        <div style="font-size:22px;font-weight:900">${units}</div>
+        <div class="muted small">${week ? t('last 7 days') : t('last 30 days')}</div>
+      </div>
+      <div class="card" style="padding:12px">
+        <div class="muted small">${t('Sales value')}</div>
+        <div style="font-size:22px;font-weight:900;color:var(--accent)">${money(revenue)}</div>
+        <div class="muted small">${t("valued at today's prices")}</div>
+      </div>
+    </div>
+    <div class="card">
+      <div style="font-weight:900">${t('Sales per day')} 📅</div>
+      ${dailyChart(days, week
+        ? (w) => dayNames[new Date(w.date + 'T00:00:00').getDay()]
+        : (w, idx) => ((idx % 5 === 0 || idx === days.length - 1) ? String(Number(w.date.slice(8, 10))) : ''))}
+      <div class="muted small" style="margin-top:8px">${t('Units sold per day — the amber bar is today.')}</div>
+    </div>
+    <div class="card">
+      <div style="font-weight:900">${week ? t('What sold this week') : t('What sold this month')} 🏆</div>
+      ${rows.length ? itemBars(rows.slice(0, 12)) : `
+      <div class="muted small" style="margin-top:8px">${t('No sales in this period yet.')}</div>`}
+      <div class="muted small" style="margin-top:12px">${t("valued at today's prices")}</div>
+    </div>`;
+  }
+
+  const tot = ins.totals || {};
+  const events = ins.events || [];
+  const topItems = ins.topItems || [];
+
+  // Hour histogram, trimmed to the interesting part of the day but never
+  // narrower than morning-to-evening so the shape is comparable day to day.
+  const buckets = Array.from({ length: 24 }, () => 0);
+  for (const e of events) buckets[new Date(e.at).getHours()] += e.qty;
+  let lo = 7;
+  let hi = 20;
+  for (let h = 0; h < 24; h += 1) {
+    if (buckets[h] > 0) { lo = Math.min(lo, h); hi = Math.max(hi, h); }
+  }
+  const maxHour = Math.max(...buckets, 1);
+  const hourBars = [];
+  const hourLabels = [];
+  for (let h = lo; h <= hi; h += 1) {
+    const v = buckets[h];
+    hourBars.push(`<div class="vbar ${v ? '' : 'zero'}" style="height:${v ? Math.max(8, Math.round((v / maxHour) * 100)) : 2}%" title="${h}:00 — ${v}"></div>`);
+    hourLabels.push(`<span>${(h - lo) % 3 === 0 ? h : ''}</span>`);
+  }
+
+  return `
+  ${switcher}
+  <div class="grid2" style="margin-bottom:12px">
+    <div class="card" style="padding:12px">
+      <div class="muted small">${t('Sold today')}</div>
+      <div style="font-size:22px;font-weight:900">${tot.units || 0}</div>
+      <div class="muted small">${t('{n} at the counter', { n: tot.walkinUnits || 0 })}</div>
+    </div>
+    <div class="card" style="padding:12px">
+      <div class="muted small">${t("Today's sales")}</div>
+      <div style="font-size:22px;font-weight:900;color:var(--accent)">${money(tot.revenue || 0)}</div>
+      <div class="muted small">${t('{n} app orders', { n: tot.orders || 0 })}</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div style="font-weight:900">${t('When things sold today')} 🕐</div>
+    ${events.length ? `
+    <div class="vbar-chart" style="margin-top:10px">${hourBars.join('')}</div>
+    <div class="vbar-labels">${hourLabels.join('')}</div>` : `
+    <div class="muted small" style="margin:10px 0 4px">${t('Nothing sold yet today — sales appear here as they happen.')}</div>`}
+  </div>
+
+  <div class="card">
+    <div style="font-weight:900">${t('What sold today')} 🏆</div>
+    ${topItems.length ? itemBars(topItems.slice(0, 8)) : `
+    <div class="muted small" style="margin-top:8px">${t('Nothing sold yet today — sales appear here as they happen.')}</div>`}
+    ${topItems.some((x) => x.walkinQty > 0) ? `
+    <div class="muted small" style="margin-top:12px">${t("Counter sales are valued at today's shelf price.")}</div>` : ''}
+  </div>`;
+}
+
+/* ---------------- invoice (a printable bill per order) ---------------- */
+
+window.openInvoice = (orderId) => {
+  const order = state.storeOrders.find((x) => x.id === orderId);
+  if (!order) return;
+  state.invoiceOrder = order;
+  render();
+  window.scrollTo(0, 0);
+};
+
+window.closeInvoice = () => {
+  state.invoiceOrder = null;
+  render();
+};
+
+// Everything on the bill was frozen onto the order when it was placed (names,
+// unit prices, fees), so it stays correct even after shelf prices change.
+// Money the customer never sees — commission, the shop's cut — stays off it.
+function invoiceView() {
+  const o = state.invoiceOrder;
+  const store = state.stores.find((s) => s.id === o.storeId) || {};
+  const p = state.partner || {};
+  const delivered = o.status === 'delivered';
+  const paidLine = o.payment === 'cash'
+    ? (delivered ? t('Paid in cash') : t('To pay in cash on handover'))
+    : t('Paid in the SewaGo app');
+  return `
+  <header class="topbar no-print">
+    <button class="btn ghost compact" onclick="closeInvoice()">${t('← Back')}</button>
+    <div style="display:flex;gap:8px">
+      ${langButton()}
+      <button class="btn compact" onclick="window.print()">🖨️ ${t('Print')}</button>
+    </div>
+  </header>
+  <main>
+    <div class="invoice-sheet">
+      <div class="invoice-head">
+        <div>
+          <div style="font-size:19px;font-weight:900">${store.icon || '🏪'} ${esc(o.storeName)}</div>
+          ${store.area ? `<div class="invoice-muted">${esc(store.area)}</div>` : ''}
+          ${p.regNo ? `<div class="invoice-muted">${t('PAN / Reg. no.')}: ${esc(p.regNo)}</div>` : ''}
+          ${p.phone ? `<div class="invoice-muted">${t('Phone')}: ${esc(p.phone)}</div>` : ''}
+        </div>
+        <div style="text-align:right">
+          <div style="font-weight:900;letter-spacing:0.06em">${t('INVOICE')}</div>
+          <div class="invoice-muted">#${esc(String(o.id).slice(-8).toUpperCase())}</div>
+          <div class="invoice-muted">${new Date(o.createdAt).toLocaleString()}</div>
+        </div>
+      </div>
+
+      <div style="margin-top:12px;font-size:13px">
+        <div><span class="invoice-muted">${t('Customer')}:</span> <b>${esc(o.customerName)}</b></div>
+        <div class="invoice-muted" style="margin-top:2px">
+          ${o.fulfilment === 'pickup' ? t('Collected at the shop') : o.deliveryLoc ? `${t('Delivered to')}: ${esc(o.deliveryLoc.name)}` : ''}
+          ${delivered && o.deliveredAt ? ` · ${new Date(o.deliveredAt).toLocaleString()}` : ''}
+        </div>
+      </div>
+
+      <table class="invoice-table">
+        <thead>
+          <tr><th>${t('Item')}</th><th class="num">${t('Qty')}</th><th class="num">${t('Rate')}</th><th class="num">${t('Amount')}</th></tr>
+        </thead>
+        <tbody>
+          ${o.items.map((l) => `
+          <tr>
+            <td>${esc(l.name)}${l.subscribed ? ` <span class="invoice-muted">🔁 ${t('subscriber price')}</span>` : ''}</td>
+            <td class="num">${l.qty} ${esc(t(unitLabelOf(l.unit)))}</td>
+            <td class="num">${money(l.price)}</td>
+            <td class="num">${money(l.price * l.qty)}</td>
+          </tr>`).join('')}
+        </tbody>
+      </table>
+
+      <div class="invoice-totals">
+        <div class="row"><div class="invoice-muted">${t('Subtotal')}</div><div>${money(o.subtotal)}</div></div>
+        ${o.deliveryFee ? `<div class="row"><div class="invoice-muted">${t('Delivery fee')}</div><div>${money(o.deliveryFee)}</div></div>` : ''}
+        ${o.serviceFee ? `<div class="row"><div class="invoice-muted">${t('Service fee')}</div><div>${money(o.serviceFee)}</div></div>` : ''}
+        <div class="row invoice-grand"><div>${t('Total')}</div><div>${money(o.total)}</div></div>
+        <div class="invoice-muted" style="margin-top:6px">${paidLine}</div>
+      </div>
+
+      <div class="invoice-muted" style="margin-top:16px;text-align:center">
+        ${t('Thank you! Sold through SewaGo.')} · sewago.app
+      </div>
+    </div>
+    <div style="height:40px"></div>
+  </main>`;
+}

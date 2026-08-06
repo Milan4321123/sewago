@@ -83,7 +83,8 @@ before(async () => {
   server = spawn(process.execPath, [path.join(__dirname, '..', 'server', 'index.js')], {
     env: {
       ...process.env, EXIT_WHEN_STDIN_CLOSES: '1', NODE_ENV: 'development', PORT: String(PORT), DATA_STORE: 'json', DATA_DIR: dataDir,
-      ADMIN_EMAIL, ADMIN_PASSWORD, OTP_PROVIDER: 'sandbox', EMAIL_PROVIDER: 'sandbox',
+      ADMIN_EMAIL, ADMIN_PASSWORD, OTP_PROVIDER: 'sandbox',
+      RATE_LIMIT_API_PER_MIN: '100000', EMAIL_PROVIDER: 'sandbox',
       DRIVER_LICENSE_DEMO_CODE: '123456', FOOD_SERVICE_FEE: '15',
       // Small float so a single ordinary order can exceed it — this is what the
       // exposure-bound tests below exercise.

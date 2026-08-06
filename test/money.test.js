@@ -71,6 +71,7 @@ before(async () => {
       ADMIN_EMAIL,
       ADMIN_PASSWORD,
       OTP_PROVIDER: 'sandbox',
+      RATE_LIMIT_API_PER_MIN: '100000',
       OTP_SANDBOX_CODE: '123456',
       EMAIL_PROVIDER: 'sandbox',
       DRIVER_LICENSE_DEMO_CODE: '123456',

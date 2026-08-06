@@ -48,6 +48,7 @@ async function openShop(name, lat, lng) {
       phone: `+9779${stamp.slice(-9)}`, regNo: `PAN-${stamp.slice(-6)}`
     }
   });
+  assert.equal(reg.status, 200, `partner register failed: ${JSON.stringify(reg.data)}`);
   const token = reg.data.token;
   const otp = await api('/partner/phone/request-otp', { method: 'POST', token, body: {} });
   await api('/partner/phone/verify', { method: 'POST', token, body: { code: otp.data.devCode } });
@@ -55,6 +56,7 @@ async function openShop(name, lat, lng) {
   const store = await api('/partner/stores', {
     method: 'POST', token, body: { name, area: 'Thamel', deliveryFee: 30 }
   });
+  assert.equal(store.status, 200, `store create failed: ${JSON.stringify(store.data)}`);
   const storeId = store.data.store.id;
   await api(`/admin/stores/${storeId}/approve`, { method: 'POST', token: adminToken });
   // Drop the shop's real pin so the batcher can cluster by geography.
@@ -136,7 +138,8 @@ before(async () => {
   server = spawn(process.execPath, [path.join(__dirname, '..', 'server', 'index.js')], {
     env: {
       ...process.env, EXIT_WHEN_STDIN_CLOSES: '1', NODE_ENV: 'development', PORT: String(PORT), DATA_STORE: 'json', DATA_DIR: dataDir,
-      ADMIN_EMAIL, ADMIN_PASSWORD, OTP_PROVIDER: 'sandbox', EMAIL_PROVIDER: 'sandbox',
+      ADMIN_EMAIL, ADMIN_PASSWORD, OTP_PROVIDER: 'sandbox',
+      RATE_LIMIT_API_PER_MIN: '100000', EMAIL_PROVIDER: 'sandbox',
       DRIVER_LICENSE_DEMO_CODE: '123456',
       DELIVERY_BATCH_TARGET: '3',
       DELIVERY_MAX_WAIT_MIN: '0.02', // ~1s, so the "never strand an order" path is testable
@@ -448,5 +451,113 @@ test('the platform ledger reconciles after runs complete and cash settles', asyn
     data.reconciliation.drift,
     0,
     `ledger (${data.reconciliation.ledgerTotal}) and recomputed revenue (${data.reconciliation.derivedTotal}) must agree`
+  );
+});
+
+// The counter and the batcher race: a shopkeeper may reject-and-refund a
+// waiting order while its run is still in the pool (a prepaid delivery order
+// never settles at the counter — reject is the only counter exit). The tests
+// below pin down what the batcher must do about it: never offer — or pay for —
+// cargo that is no longer coming.
+// Their shops sit >6km (the offer radius) from every earlier test's courier so
+// the only rider each run can reach is the test's own.
+
+test('a run emptied by a reject is cancelled, not re-offered', async () => {
+  const shop = await openShop('Ghost Kirana', 27.6000, 85.5000);
+  const courier = await onboardCourier(27.6005, 85.5005);
+  const c = await registerUser('ghost-c');
+  const order = await orderAndPack(shop, c.token, { lat: 27.5980, lng: 85.4980, name: 'Ghost Tole' });
+
+  // The offer proves the run formed; leave it hanging — this rider never taps.
+  const first = await waitForRunFrom(courier.token, 'Ghost Kirana');
+  assert.ok(first.run, `the run is offered once (saw: ${JSON.stringify(first.seen)})`);
+
+  // No rider taps, the customer gives up, and the shopkeeper rejects the
+  // waiting order — refunding it in full. Allowed while nobody is carrying it.
+  const rejected = await api(`/partner/store-orders/${order.id}/reject`, { method: 'POST', token: shop.token });
+  assert.equal(rejected.status, 200, JSON.stringify(rejected.data));
+
+  // Let the untouched offer lapse and give the sweep a full cycle to expire and
+  // prune it. The old behaviour re-offered the empty run to the same rider on
+  // the very next sweep; it must die in the pool instead.
+  await new Promise((r) => setTimeout(r, 6500));
+  for (let i = 0; i < 15; i += 1) {
+    const r = await api('/driver/run', { token: courier.token });
+    assert.equal(r.data.run, null, 'a run with nothing left to carry must never be offered again');
+    await new Promise((res) => setTimeout(res, 400));
+  }
+});
+
+test('accepting a run whose order was just rejected is refused', async () => {
+  const shop = await openShop('Counter Kirana', 27.6000, 85.6000);
+  const courier = await onboardCourier(27.6005, 85.6005);
+  const c = await registerUser('counter-c');
+  const order = await orderAndPack(shop, c.token, { lat: 27.5985, lng: 85.5985, name: 'Counter Tole' });
+
+  const { run, seen } = await waitForRunFrom(courier.token, 'Counter Kirana');
+  assert.ok(run, `the run is offered (saw: ${JSON.stringify(seen)})`);
+
+  // The shop rejects (and refunds) the order while the offer card is still on
+  // the rider's screen. Legal — the run is only 'offered', nobody is carrying it.
+  const rejectedNow = await api(`/partner/store-orders/${order.id}/reject`, { method: 'POST', token: shop.token });
+  assert.equal(rejectedNow.status, 200, JSON.stringify(rejectedNow.data));
+
+  // Accepting now must fail: there is nothing left to deliver, and the old
+  // behaviour paid the rider the full payout for ticking two no-op stops.
+  const accepted = await api(`/driver/runs/${run.id}/accept`, { method: 'POST', token: courier.token });
+  assert.equal(accepted.status, 409, JSON.stringify(accepted.data));
+  assert.match(accepted.data.error, /already handed over/i);
+
+  // And the rider is genuinely free, not pinned to a ghost run.
+  const mine = await api('/driver/run', { token: courier.token });
+  assert.equal(mine.data.run, null);
+});
+
+test('a half-emptied run is re-planned, not paid at full size', async () => {
+  // Two cash orders batch while no rider is around; one customer then gives up
+  // and the shop rejects that order (cash: nothing to refund, shelf restocked).
+  // When a rider finally comes online, the run they are offered must be the one
+  // order still going — one pickup, one drop, that order's cash — not the
+  // original route and payout.
+  const shop = await openShop('Half Kirana', 27.5300, 85.5500);
+  const c1 = await registerUser('half-c1');
+  const c2 = await registerUser('half-c2');
+  const o1 = await orderAndPack(shop, c1.token, { lat: 27.5280, lng: 85.5480, name: 'Half Tole A' }, 'cash');
+  const o2 = await orderAndPack(shop, c2.token, { lat: 27.5275, lng: 85.5470, name: 'Half Tole B' }, 'cash');
+
+  // No rider is in range, so the run forms and idles. Wait out the max-wait
+  // trigger plus a full sweep so it has definitely formed BEFORE the handover —
+  // otherwise the handover merely shrinks the pool, not the run, and the test
+  // proves nothing.
+  await new Promise((r) => setTimeout(r, 8000));
+
+  const rejected1 = await api(`/partner/store-orders/${o1.id}/reject`, { method: 'POST', token: shop.token });
+  assert.equal(rejected1.status, 200, JSON.stringify(rejected1.data));
+
+  const courier = await onboardCourier(27.5305, 85.5505);
+  const { run, seen } = await waitForRunFrom(courier.token, 'Half Kirana');
+  assert.ok(run, `the pruned run is offered (saw: ${JSON.stringify(seen)})`);
+  assert.equal(run.orders, 1, 'the handed-over order is out of the run');
+  assert.equal(run.pickups, 1);
+  assert.equal(run.dropoffs, 1);
+  assert.equal(run.stops.length, 2);
+  assert.equal(run.cashToCollect, o2.total, "only the surviving order's cash rides along");
+
+  // The slimmed run is workable end to end.
+  const accepted = await api(`/driver/runs/${run.id}/accept`, { method: 'POST', token: courier.token });
+  assert.equal(accepted.status, 200, JSON.stringify(accepted.data));
+  for (const stop of run.stops) {
+    const done = await api(`/driver/runs/${run.id}/stops/${stop.seq}/done`, { method: 'POST', token: courier.token });
+    assert.equal(done.status, 200, JSON.stringify(done.data));
+  }
+  // The rider owes the cash for the order they delivered — and only that one.
+  const me = await api('/driver/me', { token: courier.token });
+  assert.ok(
+    me.data.driver.commissionOwed >= o2.total - run.payout,
+    `courier must owe the cash they collected (owes ${me.data.driver.commissionOwed})`
+  );
+  assert.ok(
+    me.data.driver.commissionOwed < o1.total + o2.total - run.payout,
+    'the rejected order must not be debited to the rider'
   );
 });

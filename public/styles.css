@@ -1,4 +1,4 @@
-/* ============================================================
+/* =====================================================
    SewaGo "Midnight Glass" design system
    Deep navy night sky with an emerald aurora; every surface is
    translucent glass floating above it. Chrome (bars, sheets,
@@ -1457,6 +1457,101 @@ a.link { text-decoration: none; }
 .member-split .row { padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
 .member-split .row:last-of-type { border-bottom: none; }
 .member-split s { margin-right: 4px; }
+
+/* Stock level meter — the one-glance answer to "do I need to buy this?".
+   Green: comfortable. Amber: getting low. Red: act now (or already gone). */
+.stock-meter {
+  height: 6px;
+  min-width: 76px;
+  margin-top: 6px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.10);
+  overflow: hidden;
+}
+.stock-meter > div {
+  height: 100%;
+  border-radius: 999px;
+  transition: width 0.5s var(--spring);
+}
+.stock-meter.ok > div { background: var(--accent); }
+.stock-meter.mid > div { background: var(--amber); }
+.stock-meter.low > div { background: var(--danger); }
+
+/* Insights — tiny CSS-only charts a cheap phone renders instantly.
+   No canvas, no library: just flex columns whose heights are percentages. */
+.vbar-chart {
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+  height: 92px;
+  padding-top: 4px;
+}
+.vbar-chart .vbar {
+  flex: 1;
+  min-height: 2px;
+  border-radius: 3px 3px 0 0;
+  background: var(--accent);
+}
+.vbar-chart .vbar.zero { background: rgba(255, 255, 255, 0.08); }
+.vbar-chart .vbar.today { background: var(--amber); }
+.vbar-labels { display: flex; gap: 3px; margin-top: 4px; }
+.vbar-labels span {
+  flex: 1;
+  text-align: center;
+  font-size: 9px;
+  color: var(--muted);
+  overflow: hidden;
+  white-space: nowrap;
+}
+.hbar-track {
+  height: 8px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+  margin-top: 4px;
+}
+.hbar-track > div { height: 100%; border-radius: 999px; background: var(--accent); }
+
+/* Invoice — rendered like paper even on screen, because it becomes paper. */
+.invoice-sheet {
+  background: #fff;
+  color: #111827;
+  border-radius: 14px;
+  padding: 22px 20px;
+  box-shadow: var(--shadow);
+}
+.invoice-sheet .invoice-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding-bottom: 12px;
+  border-bottom: 2px solid #111827;
+}
+.invoice-muted { color: #6b7280; font-size: 12px; }
+.invoice-table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 6px; }
+.invoice-table th {
+  text-align: left;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #6b7280;
+  padding: 8px 0 4px;
+  border-bottom: 1px solid #d1d5db;
+}
+.invoice-table td { padding: 7px 0; border-bottom: 1px solid #f0f1f3; vertical-align: top; }
+.invoice-table .num { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.invoice-totals { margin-top: 8px; font-size: 13px; }
+.invoice-totals .row { margin-bottom: 4px; }
+.invoice-grand { font-size: 17px; font-weight: 900; border-top: 2px solid #111827; padding-top: 8px; margin-top: 6px; }
+
+@media print {
+  body { background: #fff !important; }
+  body::before { display: none !important; }
+  .no-print, .toast, .tabbar, .topbar { display: none !important; }
+  .phone { max-width: none; }
+  main { padding: 0 !important; }
+  .invoice-sheet { box-shadow: none; border-radius: 0; padding: 0; }
+}
 
 /* ===== app-specific: admin ===== */
 

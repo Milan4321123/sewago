@@ -159,6 +159,146 @@ function reorderSuggestions(store, limit = 20) {
   return out.slice(0, limit);
 }
 
+/**
+ * "How is my shop doing?" — the numbers behind the partner insights screen.
+ * Joins the two records a sale leaves behind:
+ *   * stockMoves — every sale event with a real timestamp (walk-in taps and
+ *     app orders alike), which gives per-item counts and the hour-by-hour
+ *     rhythm of the day;
+ *   * storeOrders — the exact charged price for app orders. A walk-in sale
+ *     records no price, so its revenue is estimated at the item's current
+ *     price — the same honest approximation storeStats already makes.
+ * Cancelled orders are excluded: money that went back is not a sale, even
+ * though the daily counters (deliberately) never un-count it.
+ * `sinceMs` is the start of the shopkeeper's "today" — the CLIENT's midnight,
+ * because the server may live in a different timezone than the shop.
+ */
+function salesInsights(store, sinceMs) {
+  const now = Date.now();
+  const since = Number.isFinite(sinceMs) ? sinceMs : now - 86400000;
+  const itemsById = new Map(store.items.map((i) => [i.id, i]));
+  const ordersById = new Map();
+  for (const o of db.storeOrders || []) {
+    if (o.storeId === store.id) ordersById.set(o.id, o);
+  }
+
+  const perItem = new Map(); // itemId -> aggregate row
+  const events = [];         // [{ at, qty }] for the client's hour histogram
+  const orderIds = new Set();
+  let walkinUnits = 0;
+  let orderUnits = 0;
+  let revenue = 0;
+
+  for (const m of db.stockMoves || []) {
+    if (m.storeId !== store.id || m.at < since || m.qty >= 0) continue;
+    if (m.reason !== 'sale_counter' && m.reason !== 'order') continue;
+    const qty = -m.qty;
+    let amount = 0;
+    if (m.reason === 'order') {
+      const order = ordersById.get(m.refId);
+      if (!order || order.status === 'cancelled') continue; // refunded — not a sale
+      const line = (order.items || []).find((l) => l.itemId === m.itemId);
+      amount = line ? line.price * qty : 0;
+      orderIds.add(order.id);
+      orderUnits += qty;
+    } else {
+      const item = itemsById.get(m.itemId);
+      amount = (item ? Number(item.price) || 0 : 0) * qty;
+      walkinUnits += qty;
+    }
+    revenue += amount;
+    const row = perItem.get(m.itemId) || {
+      itemId: m.itemId, name: m.itemName, unit: '', qty: 0, revenue: 0, walkinQty: 0, orderQty: 0
+    };
+    const item = itemsById.get(m.itemId);
+    if (item) {
+      row.name = item.name; // ledger rows keep the name at sale time; show the current one
+      row.unit = (UNITS[item.unit] || UNITS.each).label;
+    }
+    // Accumulate raw and round once at the end — rounding every step made the
+    // top-items column disagree with totals.revenue on fractional quantities
+    // (two 0.5 kg sales at Rs 55 showed Rs 56 against a Rs 55 day total).
+    row.qty += qty;
+    row.revenue += amount;
+    if (m.reason === 'order') row.orderQty += qty;
+    else row.walkinQty += qty;
+    perItem.set(m.itemId, row);
+    events.push({ at: m.at, qty });
+  }
+
+  const topItems = [...perItem.values()]
+    .map((row) => ({
+      ...row,
+      qty: Math.round(row.qty * 100) / 100,
+      revenue: Math.round(row.revenue),
+      walkinQty: Math.round(row.walkinQty * 100) / 100,
+      orderQty: Math.round(row.orderQty * 100) / 100
+    }))
+    .sort((a, b) => b.revenue - a.revenue || b.qty - a.qty)
+    .slice(0, 20);
+  events.sort((a, b) => a.at - b.at);
+
+  // Thirty-day rhythm from the daily buckets — walk-ins and orders together,
+  // gross of cancellations, exactly as the reorder analytics count them. The
+  // client draws "this week" from the tail of the same series. Note the
+  // buckets are keyed by UTC date (moveStock's today()), so near midnight the
+  // chart's last bar can lag the move-based totals above by a few hours.
+  const dayKeys = []; // [0] = today, [29] = 29 days ago — computed once, not per item
+  for (let i = 0; i < 30; i += 1) {
+    dayKeys.push(new Date(now - i * 86400000).toISOString().slice(0, 10));
+  }
+  const daily = [];
+  for (let i = 29; i >= 0; i -= 1) {
+    const key = dayKeys[i];
+    let units = 0;
+    for (const item of store.items) units += ((item.salesDaily || {})[key] || 0);
+    daily.push({ date: key, units: Math.round(units * 10) / 10 });
+  }
+
+  // Per-item week/month totals from the same buckets. Revenue here is the
+  // item's CURRENT price × units — the daily buckets carry no prices, and a
+  // shopkeeper wants "roughly what did rice earn this month", not a ledger.
+  const items = [];
+  for (const item of store.items) {
+    if (item.archived) continue;
+    const bucket = item.salesDaily || {};
+    let qty7 = 0;
+    let qty30 = 0;
+    for (let i = 0; i < 30; i += 1) {
+      const v = bucket[dayKeys[i]] || 0;
+      if (i < 7) qty7 += v;
+      qty30 += v;
+    }
+    if (qty30 <= 0) continue;
+    const price = Number(item.price) || 0;
+    items.push({
+      itemId: item.id,
+      name: item.name,
+      unit: (UNITS[item.unit] || UNITS.each).label,
+      qty7: Math.round(qty7 * 100) / 100,
+      qty30: Math.round(qty30 * 100) / 100,
+      revenue7: Math.round(qty7 * price),
+      revenue30: Math.round(qty30 * price)
+    });
+  }
+  items.sort((a, b) => b.revenue30 - a.revenue30 || b.qty30 - a.qty30);
+
+  return {
+    since,
+    totals: {
+      units: Math.round((walkinUnits + orderUnits) * 100) / 100,
+      revenue: Math.round(revenue),
+      orders: orderIds.size,
+      walkinUnits: Math.round(walkinUnits * 100) / 100,
+      orderUnits: Math.round(orderUnits * 100) / 100
+    },
+    topItems,
+    events,
+    daily,
+    items: items.slice(0, 30)
+  };
+}
+
 // Headline numbers for the shopkeeper's dashboard.
 function storeStats(store) {
   const items = store.items.filter((i) => !i.archived);
@@ -247,6 +387,7 @@ module.exports = {
   lowStockThreshold,
   reorderSuggestions,
   storeStats,
+  salesInsights,
   canManageStore,
   helperFor,
   HELPER_PERMS,

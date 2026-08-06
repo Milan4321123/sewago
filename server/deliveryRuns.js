@@ -219,33 +219,40 @@ function eligibleCouriers(runCash, near) {
     .sort((a, b) => a.km - b.km);
 }
 
-// An order can leave a run before any rider accepts it: handed over at the
-// counter while the run was still forming, cancelled, or released from an
-// abandoned run and then handed over at the till. Left alone, the run still
-// lists it — a rider gets dispatched to collect a bag that no longer exists
-// and is paid per stop for ticking hollow stops. Prune dead orders and
-// re-plan the route; a run with nothing left to carry is cancelled outright.
-// Only 'forming' runs are pruned: they have no rider and no ticked stops, so
-// rewriting the plan is safe, and every offered run cycles back through
-// 'forming' whenever an offer lapses or is declined.
+/**
+ * Orders can die while their run waits for a rider: the shopkeeper may hand
+ * one over at the counter (allowed while no courier is carrying it — see the
+ * handover guard in routes/stores.js) or it may be cancelled outright. Left
+ * alone, the run kept its full stop list and payout, so a rider could accept
+ * it, ride the route ticking no-op stops, and be paid in full for delivering
+ * nothing. Drop the dead orders and re-plan the run; a run with nothing left
+ * to carry is cancelled, not offered.
+ *
+ * Only waiting runs are touched — once a rider is collecting, the stops are
+ * their work in progress and the handover guard protects the orders instead.
+ * Returns true if the run was changed.
+ */
 function pruneDeadOrders(run) {
-  const orders = run.orderIds
+  if (run.status !== 'forming' && run.status !== 'offered') return false;
+  const live = run.orderIds
     .map((id) => (db.storeOrders || []).find((o) => o.id === id))
-    .filter((o) => o && o.status !== 'delivered' && o.status !== 'cancelled');
-  if (orders.length === run.orderIds.length) return 0;
-  if (!orders.length) {
+    // A missing pickup pin also drops the order: it cannot be routed, and the
+    // pool applies the same filter, so it is stuck either way.
+    .filter((o) => o && o.status !== 'delivered' && o.status !== 'cancelled' && pickupLocOf(o));
+  if (live.length === run.orderIds.length) return false;
+  if (!live.length) {
     run.status = 'cancelled';
     run.cancelledAt = Date.now();
-    run.cancelReason = 'nothing_left_to_carry';
-    return 1;
+    run.cancelReason = 'no_live_orders';
+    return true;
   }
-  const from = pickupLocOf(orders[0]);
-  run.orderIds = orders.map((o) => o.id);
-  run.stops = planStops(orders, from);
+  const from = pickupLocOf(live[0]);
+  run.orderIds = live.map((o) => o.id);
+  run.stops = planStops(live, from);
   run.distanceKm = routeDistanceKm(run.stops, from);
   run.payout = payoutFor(run.stops, run.distanceKm);
-  run.cashToCollect = cashTotal(orders);
-  return 1;
+  run.cashToCollect = cashTotal(live);
+  return true;
 }
 
 /**
@@ -311,8 +318,12 @@ function sweepDeliveryRuns() {
   //    handed over or cancelled while the run sat in the pool.
   for (const run of db.deliveryRuns || []) {
     if (run.status !== 'forming') continue;
-    changed += pruneDeadOrders(run);
-    if (run.status !== 'forming') continue;
+    // Re-check the cargo before every offer — an order may have been rejected
+    // and refunded (or otherwise cancelled) while the run sat in the pool.
+    if (pruneDeadOrders(run)) {
+      changed += 1;
+      if (run.status !== 'forming') continue; // nothing left to carry — cancelled
+    }
     const declined = new Set((run.offer && run.offer.declined) || []);
     const passed = (run.offer && run.offer.passed) || {};
     const all = eligibleCouriers(run.cashToCollect, run.stops[0] && run.stops[0].loc)
@@ -549,6 +560,7 @@ function runView(run) {
 module.exports = {
   sweepDeliveryRuns,
   recoverAbandonedRuns,
+  pruneDeadOrders,
   runForCourier,
   committedRunCash,
   courierOtherwiseBusy,
