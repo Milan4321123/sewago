@@ -1497,7 +1497,7 @@ a.link { text-decoration: none; }
 @media print {
   body { background: #fff !important; }
   body::before { display: none !important; }
-  .no-print, .toast, .tabbar { display: none !important; }
+  .no-print, .toast, .tabbar, .topbar { display: none !important; }
   .phone { max-width: none; }
   main { padding: 0 !important; }
   .invoice-sheet { box-shadow: none; border-radius: 0; padding: 0; }

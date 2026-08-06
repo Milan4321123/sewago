@@ -2614,8 +2614,10 @@ window.searchBasketAdd = (storeId, itemId, delta) => {
 };
 
 function shopsView() {
+  if (state.shopReceipt) return shopReceiptView();
   if (state.shop) return shopDetailView();
   const orders = (state.shopOrders || []).filter((o) => o.status !== 'delivered' && o.status !== 'cancelled');
+  const past = (state.shopOrders || []).filter((o) => o.status === 'delivered' || o.status === 'cancelled').slice(0, 6);
   const searching = !!(state.shopQuery || state.shopCategory);
   return `
   <div class="section-title" style="margin-top:0">What do you need? 🛒</div>
@@ -2654,6 +2656,11 @@ function shopsView() {
   ${orders.length ? `
     <div class="section-title">Your orders</div>
     ${orders.map(shopOrderCard).join('')}
+  ` : ''}
+
+  ${past.length ? `
+    <div class="section-title">Past orders 🧾</div>
+    ${past.map(pastOrderRow).join('')}
   ` : ''}
 
   <div class="section-title">Shops near you 🏪</div>
@@ -2752,7 +2759,97 @@ function shopOrderCard(o) {
       <div class="muted small">Show this code at the counter</div>
       <div style="font-size:30px;font-weight:900;letter-spacing:8px">${esc(o.pickupCode)}</div>
     </div>` : ''}
-    ${o.status === 'placed' ? `<button class="btn danger compact" style="margin-top:10px" onclick="cancelShopOrder('${o.id}')">Cancel order</button>` : ''}
+    <div style="display:flex;gap:6px;margin-top:10px;flex-wrap:wrap">
+      ${o.status === 'placed' ? `<button class="btn danger compact" onclick="cancelShopOrder('${o.id}')">Cancel order</button>` : ''}
+      <button class="btn ghost compact" onclick="openShopReceipt('${o.id}')">🧾 Receipt</button>
+    </div>
+  </div>`;
+}
+
+// A finished order stays reachable — the receipt is often wanted days later.
+function pastOrderRow(o) {
+  const when = new Date(o.deliveredAt || o.cancelledAt || o.createdAt)
+    .toLocaleDateString([], { month: 'short', day: 'numeric' });
+  return `
+  <div class="card" onclick="openShopReceipt('${o.id}')" style="cursor:pointer">
+    <div class="row">
+      <div class="grow">
+        <div style="font-weight:800">${o.storeIcon || '🏪'} ${esc(o.storeName)}</div>
+        <div class="muted small">${when} · ${o.items.length} item${o.items.length === 1 ? '' : 's'}</div>
+      </div>
+      <div style="text-align:right">
+        <div style="font-weight:900">${money(o.total)}</div>
+        ${o.status === 'cancelled'
+          ? '<span class="badge gray">CANCELLED</span>'
+          : '<span class="badge">✓ DONE</span>'}
+      </div>
+    </div>
+  </div>`;
+}
+
+window.openShopReceipt = (id) => {
+  state.shopReceipt = (state.shopOrders || []).find((x) => x.id === id) || null;
+  render();
+  window.scrollTo(0, 0);
+};
+
+window.closeShopReceipt = () => {
+  state.shopReceipt = null;
+  render();
+};
+
+// The same paper-styled sheet the shopkeeper prints — the customer's copy.
+// Every number was frozen onto the order at purchase time, so it stays right
+// even after shelf prices change.
+function shopReceiptView() {
+  const o = state.shopReceipt;
+  const delivered = o.status === 'delivered';
+  const paidLine = o.payment === 'cash'
+    ? (delivered ? 'Paid in cash' : 'To pay in cash on handover')
+    : 'Paid from your SewaGo wallet';
+  return `
+  <div class="row no-print" style="margin-bottom:10px">
+    <button class="btn ghost compact" style="width:auto" onclick="closeShopReceipt()">← Back</button>
+    <button class="btn compact" style="width:auto" onclick="window.print()">🖨️ Print</button>
+  </div>
+  <div class="invoice-sheet">
+    <div class="invoice-head">
+      <div>
+        <div style="font-size:19px;font-weight:900">${o.storeIcon || '🏪'} ${esc(o.storeName)}</div>
+        ${o.deliveryLoc ? `<div class="invoice-muted">Delivered to: ${esc(o.deliveryLoc.name)}</div>` : `<div class="invoice-muted">Collected at the shop</div>`}
+      </div>
+      <div style="text-align:right">
+        <div style="font-weight:900;letter-spacing:0.06em">RECEIPT</div>
+        <div class="invoice-muted">#${esc(String(o.id).slice(-8).toUpperCase())}</div>
+        <div class="invoice-muted">${new Date(o.createdAt).toLocaleString()}</div>
+      </div>
+    </div>
+    <table class="invoice-table">
+      <thead>
+        <tr><th>Item</th><th class="num">Qty</th><th class="num">Rate</th><th class="num">Amount</th></tr>
+      </thead>
+      <tbody>
+        ${o.items.map((l) => `
+        <tr>
+          <td>${esc(l.name)}${l.subscribed ? ' <span class="invoice-muted">🔁 subscriber price</span>' : ''}</td>
+          <td class="num">${l.qty} ${esc(l.unit === 'each' ? 'pc' : l.unit)}</td>
+          <td class="num">${money(l.price)}</td>
+          <td class="num">${money(l.price * l.qty)}</td>
+        </tr>`).join('')}
+      </tbody>
+    </table>
+    <div class="invoice-totals">
+      <div class="row"><div class="invoice-muted">Subtotal</div><div>${money(o.subtotal)}</div></div>
+      ${o.deliveryFee ? `<div class="row"><div class="invoice-muted">Delivery fee</div><div>${money(o.deliveryFee)}</div></div>` : ''}
+      ${o.serviceFee ? `<div class="row"><div class="invoice-muted">Service fee</div><div>${money(o.serviceFee)}</div></div>` : ''}
+      <div class="row invoice-grand"><div>Total</div><div>${money(o.total)}</div></div>
+      <div class="invoice-muted" style="margin-top:6px">${paidLine}${
+        o.status === 'cancelled' ? ' · cancelled and refunded' : ''}${
+        delivered && o.deliveredAt ? ` · ${new Date(o.deliveredAt).toLocaleString()}` : ''}</div>
+    </div>
+    <div class="invoice-muted" style="margin-top:16px;text-align:center">
+      Thank you for ordering with SewaGo · sewago.app
+    </div>
   </div>`;
 }
 
