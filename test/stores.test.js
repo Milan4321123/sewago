@@ -68,7 +68,13 @@ before(async () => {
     env: {
       ...process.env, EXIT_WHEN_STDIN_CLOSES: '1', NODE_ENV: 'development', PORT: String(PORT), DATA_STORE: 'json', DATA_DIR: dataDir,
       ADMIN_EMAIL, ADMIN_PASSWORD, OTP_PROVIDER: 'sandbox', EMAIL_PROVIDER: 'sandbox',
-      STORE_COMMISSION_PCT: '8', STORE_SERVICE_FEE: '5', LOG_LEVEL: 'error'
+      STORE_COMMISSION_PCT: '8', STORE_SERVICE_FEE: '5', LOG_LEVEL: 'error',
+      // The suite drives one server from one IP; the default strict budget
+      // (60 per 10 min across auth+money paths) would trip as tests grow.
+      RATE_LIMIT_STRICT_PER_10MIN: '1000',
+      // 12s invite lifetime: generous for the join right below an invite,
+      // short enough that the expiry test doesn't stall the suite.
+      HELPER_INVITE_TTL_MIN: '0.2'
     },
     stdio: ['pipe', 'ignore', 'inherit']
   });
@@ -828,6 +834,50 @@ test('a declined request can be asked again, and only the owner answers the inbo
     method: 'POST', token: cust
   });
   assert.equal(reAsk.status, 200, JSON.stringify(reAsk.data));
+});
+
+test('helper invite codes cannot be brute-forced, and go stale', async () => {
+  const shop = await openShop();
+  const invite = await api(`/partner/stores/${shop.storeId}/helpers`, {
+    method: 'POST', token: shop.token, body: { name: 'Target' }
+  });
+  const code = invite.data.invite.code;
+
+  // An attacker with a customer account guesses codes. Codes start at 100000,
+  // so anything below can never be real — every guess is a guaranteed miss.
+  const attacker = await registerUser('code-guesser');
+  for (let i = 0; i < 10; i += 1) {
+    const guess = await api('/stores/helper/join', {
+      method: 'POST', token: attacker.token, body: { code: String(i).padStart(6, '0') }
+    });
+    assert.equal(guess.status, 404, 'a wrong code reads the same as a missing one');
+  }
+  const locked = await api('/stores/helper/join', {
+    method: 'POST', token: attacker.token, body: { code: '000010' }
+  });
+  assert.equal(locked.status, 429, 'the 11th wrong code locks the account out');
+
+  // Even the RIGHT code is refused once locked — the lock is checked first,
+  // so a lucky last guess buys nothing.
+  const luckyLate = await api('/stores/helper/join', {
+    method: 'POST', token: attacker.token, body: { code }
+  });
+  assert.equal(luckyLate.status, 429, 'lockout is not bypassed by a correct code');
+
+  // The lock is per-account: the real helper joins with the same code, first try.
+  const legit = await registerUser('legit-helper');
+  const joined = await api('/stores/helper/join', { method: 'POST', token: legit.token, body: { code } });
+  assert.equal(joined.status, 200, JSON.stringify(joined.data));
+
+  // Invites expire (12s TTL on this server): a code left lying around goes stale.
+  const second = await api(`/partner/stores/${shop.storeId}/helpers`, {
+    method: 'POST', token: shop.token, body: { name: 'Latecomer' }
+  });
+  await new Promise((r) => setTimeout(r, 13000));
+  const stale = await api('/stores/helper/join', {
+    method: 'POST', token: legit.token, body: { code: second.data.invite.code }
+  });
+  assert.equal(stale.status, 404, 'an expired invite reads the same as a wrong code');
 });
 
 // --- the books must check themselves ------------------------------------------

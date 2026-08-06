@@ -25,6 +25,12 @@ const router = express.Router();
 
 const MAX_ORDER_LINES = 40; // a grocery basket is longer than a food order
 const PICKUP_CODE_MAX_TRIES = 5; // same cap the OTP flow uses — enough for fat fingers, useless for brute force
+// Helper invite codes live this long (minutes via env; low minimum so the
+// expiry path is testable in seconds). Default two days.
+const HELPER_INVITE_TTL_MS = (() => {
+  const n = Number(process.env.HELPER_INVITE_TTL_MIN);
+  return (Number.isFinite(n) && n >= 0.01 && n <= 43200 ? n : 48 * 60) * 60000;
+})();
 
 /* ---------------- shared helpers ---------------- */
 
@@ -441,11 +447,15 @@ router.post('/partner/stores/:id/helpers', authPartner, (req, res) => {
     return res.status(400).json({ error: 'A shop can have up to 5 helpers.' });
   }
   const invite = {
-    code: String(Math.floor(100000 + Math.random() * 900000)),
+    // crypto, like every other code in the app — Math.random() is predictable.
+    code: String(crypto.randomInt(100000, 1000000)),
     status: 'invited',
     userId: null,
     name: String((req.body || {}).name || '').trim().slice(0, 40),
-    createdAt: Date.now()
+    createdAt: Date.now(),
+    // The code is read out in person and used the same day; one that never
+    // expires is a standing brute-force target.
+    expiresAt: Date.now() + HELPER_INVITE_TTL_MS
   };
   store.helpers.push(invite);
   save();
@@ -479,16 +489,44 @@ router.delete('/partner/stores/:id/helpers/:code', authPartner, (req, res) => {
 
 // A helper joins with the code the shopkeeper read out to them, using their own
 // customer account — so their counting work is attributed to them by name.
+// A 6-digit code only proves anything if guessing is expensive: each account
+// gets a handful of wrong tries per hour (mirroring the pickup-code lock on
+// handover), every failure is audited, and invites expire.
+const HELPER_JOIN_MAX_FAILS = 10; // per account, per hour
+
 router.post('/stores/helper/join', authRequired, (req, res) => {
   const code = String((req.body || {}).code || '').trim();
   if (!/^\d{6}$/.test(code)) return res.status(400).json({ error: 'Enter the 6-digit code from the shopkeeper.' });
-  const store = db.stores.find((s) => !s.removedAt && (s.helpers || []).some((h) => h.code === code && h.status === 'invited'));
-  if (!store) return res.status(404).json({ error: 'That code is not valid any more.' });
+  const now = Date.now();
+  const fails = req.user.helperJoinFails && req.user.helperJoinFails.resetAt > now
+    ? req.user.helperJoinFails
+    : { count: 0, resetAt: now + 60 * 60 * 1000 };
+  if (fails.count >= HELPER_JOIN_MAX_FAILS) {
+    return res.status(429).json({ error: 'Too many wrong codes — ask the shopkeeper for a fresh code and try again in an hour.' });
+  }
+  const store = db.stores.find((s) => !s.removedAt && (s.helpers || []).some(
+    (h) => h.code === code && h.status === 'invited' && (!h.expiresAt || h.expiresAt > now)
+  ));
+  if (!store) {
+    fails.count += 1;
+    req.user.helperJoinFails = fails;
+    logAudit({
+      actor: { role: 'user', id: req.user.id, email: req.user.email },
+      action: 'store.helper.join_code_failed',
+      targetType: 'user',
+      targetId: req.user.id,
+      meta: { fails: fails.count },
+      ip: req.ip
+    });
+    save();
+    return res.status(404).json({ error: 'That code is not valid any more.' });
+  }
   const helper = store.helpers.find((h) => h.code === code);
   helper.status = 'active';
   helper.userId = req.user.id;
   helper.name = helper.name || req.user.name;
-  helper.joinedAt = Date.now();
+  helper.joinedAt = now;
+  delete req.user.helperJoinFails;
   save();
   events.publish(`partner:${store.ownerId}`, { topic: 'stores' });
   res.json({ store: publicStore(store) });
