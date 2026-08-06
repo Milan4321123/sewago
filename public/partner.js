@@ -993,8 +993,8 @@ function foodOrderCard(o) {
       <button class="btn danger" onclick="rejectOrder('${o.id}')">${t('Reject & refund')}</button>
       <button class="btn ghost" onclick="setConfirmReject('')">${t('Back')}</button>
     </div>` : `
-    <button class="btn" style="margin-top:10px" onclick="acceptOrder('${o.id}')">✅ Accept — start cooking</button>
-    <button class="btn ghost compact" style="margin-top:8px" onclick="setConfirmReject('${o.id}')">Reject…</button>`) : ''}
+    <button class="btn" style="margin-top:10px" onclick="acceptOrder('${o.id}')">${t('✅ Accept — start cooking')}</button>
+    <button class="btn ghost compact" style="margin-top:8px" onclick="setConfirmReject('${o.id}')">${t('Reject…')}</button>`) : ''}
     ${ahead && o.status === 'preparing' ? `
     <button class="btn" style="margin-top:10px" onclick="markFoodReady('${o.id}')">🛎️ Food's ready</button>` : ''}
     ${ahead && o.status === 'ready' ? (state.pickupFor === o.id ? `
@@ -1012,7 +1012,7 @@ function foodOrderCard(o) {
       <button class="btn ghost" onclick="setConfirmReject('')">Back</button>
     </div>` : `
     <button class="btn ghost compact" style="margin-top:8px" onclick="setConfirmReject('${o.id}')">Never collected — refund…</button>`) : ''}
-    ${o.status === 'cancelled' ? `<div class="muted small" style="margin-top:6px">Customer refunded in full.</div>` : ''}
+    ${o.status === 'cancelled' ? `<div class="muted small" style="margin-top:6px">${t('Customer refunded in full.')}</div>` : ''}
   </div>`;
 }
 
@@ -1096,8 +1096,8 @@ function storeOrderCard(o) {
   // no rider has taken yet, so neither can strand the customer's money.
   const canReject = o.status === 'placed' || o.status === 'accepted'
     || (o.status === 'ready' && !withCourier);
-  const rejectLabel = o.status !== 'ready' ? "Can't fulfil — refund"
-    : o.fulfilment === 'pickup' ? 'Never collected — refund' : 'No rider — refund';
+  const rejectLabel = o.status !== 'ready' ? t("Can't fulfil — refund")
+    : o.fulfilment === 'pickup' ? t('Never collected — refund') : t('No rider — refund');
   return `
   <div class="card" ${o.status === 'placed' ? 'style="border-color:var(--accent)"' : ''}>
     <div class="row">

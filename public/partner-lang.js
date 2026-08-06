@@ -294,6 +294,7 @@ window.SEWAGO_NE = {
   '🏃 customer collects': '🏃 ग्राहक आफैं लिन आउँछन्',
   'you get': 'तपाईंले पाउने',
   'Never collected — refund': 'लिन आएनन् — फिर्ता गर्नुहोस्',
+  'No rider — refund': 'राइडर भेटिएन — फिर्ता गर्नुहोस्',
   'Bill': 'बिल',
 
   /* ---- inventory shell ---- */
