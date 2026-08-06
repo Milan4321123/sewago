@@ -135,7 +135,7 @@ before(async () => {
   dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sewago-runs-'));
   server = spawn(process.execPath, [path.join(__dirname, '..', 'server', 'index.js')], {
     env: {
-      ...process.env, NODE_ENV: 'development', PORT: String(PORT), DATA_STORE: 'json', DATA_DIR: dataDir,
+      ...process.env, EXIT_WHEN_STDIN_CLOSES: '1', NODE_ENV: 'development', PORT: String(PORT), DATA_STORE: 'json', DATA_DIR: dataDir,
       ADMIN_EMAIL, ADMIN_PASSWORD, OTP_PROVIDER: 'sandbox', EMAIL_PROVIDER: 'sandbox',
       DRIVER_LICENSE_DEMO_CODE: '123456',
       DELIVERY_BATCH_TARGET: '3',
@@ -146,7 +146,7 @@ before(async () => {
       STORE_COMMISSION_PCT: '8', STORE_SERVICE_FEE: '5',
       LOG_LEVEL: 'error'
     },
-    stdio: ['ignore', 'ignore', 'inherit']
+    stdio: ['pipe', 'ignore', 'inherit']
   });
   for (let i = 0; i < 100; i += 1) {
     try { if ((await fetch(`${BASE}/health`)).ok) break; } catch (e) { /* not up */ }
@@ -433,4 +433,20 @@ test('a run is never offered to a rider whose cash float it would blow', async (
   // The run forms, but no rider may be offered it — their float cannot hold it.
   const offered = await waitForRun(courier.token, 8);
   assert.equal(offered.run, null, 'a rider must never be handed more cash than their float covers');
+});
+
+// --- the books must check themselves ------------------------------------------
+
+test('the platform ledger reconciles after runs complete and cash settles', async () => {
+  // This suite has completed multi-stop runs (courier payouts, a platform
+  // cost), settled wallet and cash orders and cancelled others. The
+  // /admin/overview cross-check recomputes revenue from booking rows; drift
+  // means a store or run money path wrote the ledger but not the books.
+  const { data } = await api('/admin/overview', { token: adminToken });
+  assert.ok(data.reconciliation, 'overview must expose a reconciliation block');
+  assert.equal(
+    data.reconciliation.drift,
+    0,
+    `ledger (${data.reconciliation.ledgerTotal}) and recomputed revenue (${data.reconciliation.derivedTotal}) must agree`
+  );
 });

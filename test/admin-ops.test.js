@@ -50,7 +50,7 @@ before(async () => {
   dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sewago-admin-test-'));
   server = spawn(process.execPath, [path.join(__dirname, '..', 'server', 'index.js')], {
     env: {
-      ...process.env,
+      ...process.env, EXIT_WHEN_STDIN_CLOSES: '1',
       NODE_ENV: 'development',
       PORT: String(PORT),
       DATA_STORE: 'json',
@@ -61,7 +61,7 @@ before(async () => {
       EMAIL_PROVIDER: 'sandbox',
       LOG_LEVEL: 'error'
     },
-    stdio: ['ignore', 'ignore', 'inherit']
+    stdio: ['pipe', 'ignore', 'inherit']
   });
   for (let i = 0; i < 100; i += 1) {
     try {

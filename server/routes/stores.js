@@ -469,7 +469,12 @@ router.post('/partner/stores/:id/ai/inventory', authPartner, async (req, res) =>
 // attacker is shooting at), and it must be unique while live (a collision
 // would walk a helper into a stranger's inventory, since join takes the first
 // shop that matches).
-const HELPER_INVITE_TTL = 24 * 60 * 60 * 1000;
+// Minutes via env (low minimum so the expiry path is testable in seconds);
+// default one day — codes are read out in person and used the same visit.
+const HELPER_INVITE_TTL = (() => {
+  const n = Number(process.env.HELPER_INVITE_TTL_MIN);
+  return (Number.isFinite(n) && n >= 0.01 && n <= 43200 ? n : 24 * 60) * 60000;
+})();
 
 // Invites written before expiry existed fall back to their creation time, so
 // they run out their natural 24h instead of being invalidated on deploy.

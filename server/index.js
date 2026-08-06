@@ -26,6 +26,22 @@ process.on('unhandledRejection', (reason) => {
   logger.error('unhandled_rejection', { reason: reason && reason.message ? reason.message : String(reason) });
 });
 
+// Die with the harness that spawned us. Test suites spawn this server as a
+// child and SIGTERM it in their teardown — but a runner that dies hard
+// (SIGKILL, crashed terminal, killed CI job) never runs teardown, and the
+// orphaned server then squats on its port and poisons every later run with
+// port-in-use / ECONNREFUSED failures. A harness that sets
+// EXIT_WHEN_STDIN_CLOSES=1 must also pipe our stdin; the OS closes that pipe
+// the moment the runner dies — however it dies — and we exit with it.
+// Hard exit on purpose: the data dir is a throwaway and a graceful close
+// could hang on open SSE connections.
+if (process.env.EXIT_WHEN_STDIN_CLOSES === '1') {
+  process.stdin.resume();
+  for (const ev of ['end', 'close', 'error']) {
+    process.stdin.on(ev, () => process.exit(0));
+  }
+}
+
 const app = express();
 const PORT = config.port;
 
@@ -115,7 +131,11 @@ function makeLimiter(windowMs, max) {
 // a NAT/proxy IP; the auth limiter below stays strict regardless.
 const API_LIMIT_PER_MIN = Number(process.env.RATE_LIMIT_API_PER_MIN) || 600;
 app.use('/api', makeLimiter(60 * 1000, API_LIMIT_PER_MIN));
-const authLimiter = makeLimiter(10 * 60 * 1000, 60);
+// Strict per-IP budget shared by the auth and money paths below (per 10 min).
+// Env-tunable for the same NAT reason as above — and because the test suites
+// drive one server from one IP and would otherwise trip it as they grow.
+const STRICT_LIMIT_PER_10MIN = Number(process.env.RATE_LIMIT_STRICT_PER_10MIN) || 60;
+const authLimiter = makeLimiter(10 * 60 * 1000, STRICT_LIMIT_PER_10MIN);
 app.use(
   ['/api/auth/login', '/api/auth/register',
     '/api/auth/otp/request', '/api/auth/otp/verify',
@@ -127,13 +147,15 @@ app.use(
 // Money movement and phone-verification endpoints get their own strict budget:
 // legitimate users touch these a handful of times a day, so a tight cap costs
 // them nothing while blunting brute-force OTP guessing and drain-the-wallet loops.
-const moneyLimiter = makeLimiter(10 * 60 * 1000, 60);
+const moneyLimiter = makeLimiter(10 * 60 * 1000, STRICT_LIMIT_PER_10MIN);
 app.use(
   ['/api/payments/withdraw', '/api/payments/topup/initiate', '/api/payments/topup/confirm',
     '/api/partner/withdraw', '/api/driver/withdraw',
     '/api/auth/phone/request-otp', '/api/auth/phone/verify',
     '/api/partner/phone/request-otp', '/api/partner/phone/verify',
-    '/api/driver/phone/request-otp', '/api/driver/phone/verify'],
+    '/api/driver/phone/request-otp', '/api/driver/phone/verify',
+    // Helper-invite joins are code guesses — same brute-force surface as OTP.
+    '/api/stores/helper/join'],
   moneyLimiter
 );
 // Redeeming a shop's helper invite grants write access to that shop's stock, and

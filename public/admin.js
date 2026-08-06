@@ -108,6 +108,7 @@ async function loadCore() {
   };
   state.partners = p.partners;
   state.payments = pay;
+  state.attention = att.orders || [];
   // Licenses awaiting a manual decision (drivers self-verify at signup, so
   // these are the rare flagged/rejected-and-resubmitted cases).
   state.pendingDrivers = (ppl.drivers || []).filter((d) => d.verificationStatus === 'pending');
@@ -434,6 +435,7 @@ function overviewView() {
   <div class="card">
     <div class="list-row"><div>🚗 Ride commission (20%)</div><div class="rt"><b>${money(s.rideCommission)}</b></div></div>
     <div class="list-row"><div>🍔 Food commission</div><div class="rt"><b>${money(s.foodCommission)}</b></div></div>
+    <div class="list-row"><div>🏪 Store commission</div><div class="rt"><b>${money(s.storeCommission || 0)}</b></div></div>
     <div class="list-row"><div>🏨 Stay commission</div><div class="rt"><b>${money(s.stayCommission)}</b></div></div>
     <div class="list-row"><div>🧰 Task fees</div><div class="rt"><b>${money(s.taskFees)}</b></div></div>
     <div class="list-row"><div>🏦 Withdrawal fees</div><div class="rt"><b>${money(s.withdrawalFees)}</b></div></div>
@@ -601,6 +603,24 @@ function payoutDetail(w) {
   </div>`;
 }
 
+// Abandoned-delivery incident. Money is already resolved by the time one lands
+// here (customer refunded, restaurant paid, courier billed) — this row exists
+// so a human closes the loop on the physical goods and the courier who took them.
+function attentionDetail(o) {
+  return `
+  <div class="muted small">${esc(o.items)}</div>
+  <div class="muted small">${money(o.total)} · ${o.payment === 'cash' ? 'CASH — customer had not paid' : 'PAID IN APP — customer auto-refunded'} · courier billed ${money(o.total)}</div>
+  <div style="background:var(--card2);border-radius:10px;padding:10px 12px;margin-top:10px">
+    <div class="small">🛵 <b>${esc(o.courier ? o.courier.name : 'Unknown courier')}</b>${o.courier ? ` · 📞 ${esc(o.courier.phone)} · owes <b style="color:var(--danger)">${money(o.courier.owes)}</b>${o.courier.suspended ? ' · <span style="color:var(--danger)">SUSPENDED</span>' : ''}` : ''}</div>
+    ${o.customer ? `<div class="muted small">👤 ${esc(o.customer.name)} · 📞 ${esc(o.customer.phone)}</div>` : ''}
+    <div class="muted small" style="margin-top:3px">Call the courier about the food; suspend them or settle their debt from the 👥 People tab.</div>
+  </div>
+  <label class="field" style="margin-top:12px"><span>Resolution note (kept on the audit trail)</span>
+    <input id="anote-${o.id}" placeholder="e.g. goods written off, courier suspended" />
+  </label>
+  <button class="btn" style="margin-top:4px" onclick="resolveAttention('${o.id}')">✓ Dealt with — clear</button>`;
+}
+
 function approvalDetail(item) {
   const d = item.data;
   if (item.kind === 'restaurants') {
@@ -632,6 +652,18 @@ function approvalDetail(item) {
   if (item.kind === 'attention') return attentionDetail(d);
   return payoutDetail(d);
 }
+
+window.resolveAttention = async (id) => {
+  try {
+    const note = ($(`#anote-${id}`) || { value: '' }).value.trim();
+    await api(`/api/admin/orders/${id}/attention/resolve`, { method: 'POST', body: { note } });
+    state.approvalOpen = null;
+    toast('Incident cleared ✓');
+    await reloadAfterAction();
+  } catch (e) {
+    toast(e.message, true);
+  }
+};
 
 function queueRowHtml(item) {
   const key = item.kind + ':' + item.id;
