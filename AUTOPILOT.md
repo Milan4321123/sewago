@@ -22,11 +22,19 @@ the platform ledger, partner earnings and driver debts must always reconcile.
    (JSON file locally / one Supabase row in prod). #1 scaling risk per owner
    memory. Needs incremental persistence design; too big for one session —
    design doc + slice plan first.
-3. **Mobile walkthrough of customer checkout** — click through order → pay →
-   track on a phone viewport looking for friction/embarrassments. Not done yet
-   (this session went to money-safety + test infra).
+3. **Parallel-suite timing flakiness** — under `npm test` (10 servers at once),
+   timing-sensitive suites occasionally cascade-fail mid-file (seen twice on
+   2026-08-06: money.test 6 fails, delivery-runs 5 fails; both green on
+   re-run/isolation). Mechanism: one timing flake leaves state (e.g. an
+   unclaimed run) that steals later tests' offers. Suspects: 5s offer window ==
+   5s sweep in delivery-runs env. Consider longer offer windows in test envs or
+   capping --test-concurrency.
 4. **Per-source revenue trend** — revenueTrend(14) charts totals only; a
    per-vertical split would show which business line moves. Low priority.
+5. **Partner UI for helper invites doesn't show expiry** — invites now expire
+   (48h default); the helpers list endpoint doesn't expose expiresAt, so a
+   shopkeeper can't tell a code went stale until the join fails. One-line API
+   field + a line in the partner UI.
 
 ## Shipped log
 - 2026-08-06 — **Food courier abandonment resolves money + admin queue**
@@ -50,6 +58,17 @@ the platform ledger, partner earnings and driver debts must always reconcile.
 - 2026-08-06 — **Store commission row on admin revenue breakdown** (7cf61fd):
   the kirana vertical's revenue was in the Total but had no row, so rows didn't
   sum. Verified in the running app (Rs 80 + Rs 5 = Rs 85, green banner).
+- 2026-08-06 — **Helper invite hardening** (50dab00): /stores/helper/join was
+  the one unguarded code-guessing surface (Math.random 6-digit code, no expiry,
+  no attempt cap; a joined "helper" can rewrite someone's stock counts). Now:
+  crypto.randomInt codes, 48h expiry (HELPER_INVITE_TTL_MIN), 10-wrong-codes/hr
+  per-account lock (audited), and the strict per-IP limiter. Strict limiter
+  budget now env-tunable (RATE_LIMIT_STRICT_PER_10MIN, default 60 unchanged).
+- 2026-08-06 — **Shop checkout bar readability on mobile** (583e9e1): .cartbar
+  was a transparent positioning div — the shop checkout's toggle/address/pay
+  controls had the item list bleeding through on a phone. Now the same glass
+  chrome as the tabbar; clearance sized per mode. Verified at 375px in pickup,
+  delivery and food variants.
 
 ## Decisions needed
 - **Worktree merge order** for the shop-side vs food-side abandonment fixes
@@ -63,8 +82,13 @@ the platform ledger, partner earnings and driver debts must always reconcile.
 ## Session notes
 - Test suite: `npm test` (10 files, each spawns a real server on its own 49xx
   port; ports 4979–4997 odd set, 4995 reserved by the zealous worktree's test).
-- Audited this session, found healthy: auth rate limiting (per-IP + strict
-  auth/money limiters, OTP 5-attempt cap, admin login covered), run-stop
-  settlement (ownership, ordering, idempotent via moneySettledAt), AI inventory
-  endpoint (partner-auth, 2000-char cap, per-partner limiter).
-- Baseline at session close: 83/83 green, no lingering listeners.
+- Audited and found healthy across two sessions: auth rate limiting + OTP caps,
+  admin login, run-stop settlement (ownership/ordering/idempotence), AI
+  inventory endpoint (auth, length cap, per-partner limiter), pickup-code
+  handover (5-try lock + audit), session tokens & OTPs (crypto randomness).
+- Mobile walkthrough done (2026-08-06, 375px): login, food browse → cart →
+  wallet checkout → live tracking (wallet math exact), shops browse → cart →
+  pickup/delivery/pay toggles. One bug found (cartbar transparency — fixed).
+  Sim (demo) food orders skip the address prompt by design; real partner
+  restaurants require it.
+- Baseline at session close: 84/84 green, no lingering listeners.
