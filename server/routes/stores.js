@@ -896,13 +896,26 @@ router.post('/store-orders', authRequired, (req, res) => {
   save();
   events.publish(`partner:${store.ownerId}`, { topic: 'store_orders' });
   events.publish('admin', { topic: 'orders' });
-  res.json({ order, user: publicUser(req.user) });
+  res.json({ order: customerOrderView(order), user: publicUser(req.user) });
 });
+
+// The customer's own view of their order: everything needed to track, prove
+// and get a receipt for it — none of the shop's economics. commission and
+// partnerCut are the platform↔shop split; leaking them turns every counter
+// handover into a "so that's your cut?" argument. The settlement flags and
+// codeTries are internal bookkeeping.
+function customerOrderView(order) {
+  const {
+    commission, partnerCut, partnerSettled, moneySettledAt,
+    codeTries, partnerId, courierId, needsAttention, abandonedBy, ...rest
+  } = order;
+  return rest;
+}
 
 router.get('/store-orders', authRequired, (req, res) => {
   const orders = [];
   for (let i = db.storeOrders.length - 1; i >= 0 && orders.length < 20; i -= 1) {
-    if (db.storeOrders[i].userId === req.user.id) orders.push(db.storeOrders[i]);
+    if (db.storeOrders[i].userId === req.user.id) orders.push(customerOrderView(db.storeOrders[i]));
   }
   res.json({ orders });
 });
@@ -959,7 +972,7 @@ router.post('/store-orders/:id/cancel', authRequired, (req, res) => {
   unwindStoreOrder(order, { label: `Shop order cancelled — refund: ${order.storeName}` });
   save();
   events.publish(`partner:${order.partnerId}`, { topic: 'store_orders' });
-  res.json({ order, user: publicUser(req.user) });
+  res.json({ order: customerOrderView(order), user: publicUser(req.user) });
 });
 
 /* ---------------- shopkeeper: orders ---------------- */

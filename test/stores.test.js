@@ -175,6 +175,31 @@ test('counter sales and restocks keep the number on screen matching the shelf', 
   assert.ok(reasons.includes('initial_count'));
 });
 
+test("a customer's order view carries the receipt, never the shop's economics", async () => {
+  const shop = await openShop();
+  const created = await api(`/partner/stores/${shop.storeId}/items`, {
+    method: 'POST', token: shop.token, body: { name: 'Ghee', unit: 'kg', price: 900, stock: 10 }
+  });
+  const { token: cust } = await registerUser('receipt-shopper');
+  const placed = await api('/store-orders', {
+    method: 'POST', token: cust,
+    body: { storeId: shop.storeId, items: [{ itemId: created.data.item.id, qty: 2 }], payment: 'wallet', fulfilment: 'pickup' }
+  });
+  assert.equal(placed.status, 200, JSON.stringify(placed.data));
+
+  const list = await api('/store-orders', { token: cust });
+  for (const [label, o] of [['creation response', placed.data.order], ['list response', list.data.orders[0]]]) {
+    // Everything a receipt needs…
+    assert.ok(o.items[0].price === 900 && o.items[0].qty === 2, `${label} keeps itemised lines`);
+    assert.ok(o.subtotal === 1800 && o.total > 0 && o.payment === 'wallet', `${label} keeps the money breakdown`);
+    assert.ok(o.pickupCode, `${label} keeps the customer's own pickup code`);
+    // …and none of the platform↔shop split or internal bookkeeping.
+    for (const secret of ['commission', 'partnerCut', 'partnerSettled', 'codeTries', 'partnerId', 'courierId']) {
+      assert.ok(!(secret in o), `${label} must not expose ${secret}`);
+    }
+  }
+});
+
 test('insights add up: walk-ins at current price, orders at charged price, cancels excluded', async () => {
   const shop = await openShop();
   const chiura = await api(`/partner/stores/${shop.storeId}/items`, {
@@ -355,8 +380,12 @@ test('a wallet order conserves money from customer to shopkeeper to platform', a
   const o = order.data.order;
   // 500 goods + 30 delivery + 5 service = 535; commission is 8% of goods = 40.
   assert.equal(o.total, 535);
-  assert.equal(o.commission, 40);
-  assert.equal(o.partnerCut, 490, 'shopkeeper keeps goods + delivery minus commission');
+  // The split is the shop's business, so it lives on the PARTNER's view of the
+  // order — the customer response deliberately no longer carries it.
+  const pview = await api(`/partner/stores/${shop.storeId}/orders`, { token: shop.token });
+  const po = pview.data.orders.find((x) => x.id === o.id);
+  assert.equal(po.commission, 40);
+  assert.equal(po.partnerCut, 490, 'shopkeeper keeps goods + delivery minus commission');
 
   const walletAfter = (await api('/auth/me', { token: cust })).data.user.wallet;
   assert.equal(walletBefore - walletAfter, 535, 'exactly the order total leaves the wallet');
@@ -376,7 +405,7 @@ test('a wallet order conserves money from customer to shopkeeper to platform', a
   assert.equal(settled.data.partner.pendingEarnings, 0);
 
   // Customer paid 535 = shopkeeper 490 + platform 45 (40 commission + 5 fee).
-  assert.equal(o.partnerCut + o.commission + o.serviceFee, o.total);
+  assert.equal(po.partnerCut + po.commission + po.serviceFee, o.total);
 });
 
 test('click & collect: no delivery fee, and handover needs the customer\'s code', async () => {
