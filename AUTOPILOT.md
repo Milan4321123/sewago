@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # AUTOPILOT — session memory
 
 Read by the `/autopilot` command. Each session: execute the backlog top-down, then update this file before ending.
@@ -8,122 +7,52 @@ SewaGo — rides, food delivery, kirana shops and hotel stays in one app for the
 
 ## How to verify
 - `npm test` — integration tests that boot the real server (money paths especially). Must stay green.
-- `npm run verify` — syntax-checks all server/ and public/ JS.
-- `npm start` — dev server; Express + vanilla-JS frontends in `public/` (app.js customer, driver.js, partner.js, admin.js).
+- `npm run verify` — syntax-checks all server/ and public/ JS, then the partner-lang dictionary drift guard.
+- `npm run dev` / `npm run dev:seed` — local dev server on a JSON store in `data/local` with sandbox providers. **Never run the app against `.env` to click through it** — that config points at the live Supabase project.
 
 ## Conventions (do not violate)
 - Customer + partner apps use the hub-and-spoke Home launcher (`.home-grid` tiles → full-screen pages with `.back-chip`, popstate back). Driver and admin keep bottom tabbars. Keep new UI consistent with this — explicit owner preference.
 - Money or auth logic never ships without an integration test (see `test/money.test.js` pattern).
-- Bump the `sw.js` cache version whenever precached frontend files change.
+- Bump the `sw.js` cache version whenever precached frontend files change (now v8).
 - Large uncommitted owner work may be present — the owner commits their own checkpoints; never commit files you didn't change.
 - With `DATA_STORE=supabase`, never run `npm run demo:seed` while a server is running (blob save clobbers the seed) — use dev route `POST /api/demo/seed` instead.
-- **Never run the app against `.env` to click through it** — that config points at the live Supabase project. Use `npm run dev` (JSON store in `data/local`, sandbox providers) and `npm run dev:seed` to fill it.
-- **Two autopilot sessions ran at once on 2026-08-06 and both committed.** If `git log` shows commits you did not make, re-read this file and `git log` before picking work — an item you are about to start may already be fixed. Read AUTOPILOT.md immediately before editing it, and keep commits scoped to files you actually changed.
+- Partner UI strings go through `t()` and the `public/partner-lang.js` dictionary; `npm run verify` fails on drift.
+- **Parallel sessions happen.** On 2026-08-06 four worktrees (main + three branches) shipped overlapping fixes independently; the divergence cost a large merge. If `git log` shows commits you did not make, re-read this file and `git log` before picking work, keep commits scoped to files you actually changed — and prefer working ON MAIN unless the owner says otherwise.
+
+## Current state (2026-08-06, post-merge)
+All three worktree branches (`claude/zealous-ishizaka-c363de`, `claude/upbeat-engelbart-6bf40a`, `claude/confident-neumann-d0f9ec`) are merged into main and the suite is green (114 tests). Where branches had re-implemented the same feature, one implementation was kept: main's helper-invite hardening (+ env-tunable TTL), main's `test/net.js` OS-port helper, zealous's courier-abandonment cluster (shop + food + unified `/admin/attention` + reconciliation terms), confident's run pruning, upbeat's stdin watchdog and store-commission dashboard row. The branches can be deleted.
 
 ## Backlog (ranked)
-
-1. **Customer-experience pass** — click through sign-up → ride → food order → shop basket → subscription request as a first-time customer at mobile viewport. Log every friction point, fix the worst ones. *(2026-08-06 covered the Shops vertical — fixed the transparent checkout bar, b0efa05. Rides/Food/Stays/Tasks still un-walked.)*
-2. **Throttle `/group-orders/join` + subscribe-request abuse** — two loose endpoints of the same shape. **(a) `/group-orders/join`:** a 6-digit code matched against every open group, no attempt limit; the code IS crypto-generated and joining moves no money, so the prize is a privacy leak (who is in the lobby, what they picked) plus lobby spam. Give it the same per-account failure budget + dedicated per-IP limiter as `/stores/helper/join`. **(b) `POST /stores/:id/items/:itemId/subscribe-request`** has no strict limiter and no per-user/per-store cap, and `db.subscriptionRequests` is never pruned — one account can open ~500 pending requests per shop (an SSE nudge each) and grow the Supabase blob unbounded. Cap concurrent pending requests per user/store, add a strict limiter, and prune decided/old entries in the hourly housekeeping sweep — the sweep now already prunes group lobbies (4642cba), so mirror that block.
-3. **Revenue candidates the owner already wants** — SewaGo Plus subscription; corporate accounts. Design the smallest shippable slice (e.g. Plus = monthly fee from wallet → waived service fees + free delivery under X km), backlog the design, then build.
+1. **Customer-experience pass** — click through sign-up → ride → food order → shop basket → subscription request as a first-time customer at mobile viewport. Log every friction point, fix the worst ones. *(Shops vertical covered 2026-08-06 — transparent checkout bar fixed. Rides/Food/Stays/Tasks still un-walked.)*
+2. **Throttle `/group-orders/join` + subscribe-request abuse** — (a) `/group-orders/join`: 6-digit code matched against every open group, no attempt limit; give it the same per-account failure budget + per-IP limiter as `/stores/helper/join`. (b) `POST /stores/:id/items/:itemId/subscribe-request`: no strict limiter, no per-user/per-store cap, `db.subscriptionRequests` never pruned — cap pending requests, add a strict limiter, prune in the hourly sweep (mirror the group-lobby pruning, 4642cba).
+3. **Revenue candidates the owner already wants** — SewaGo Plus subscription; corporate accounts. Design the smallest shippable slice, backlog the design, then build.
 4. **Food-delivery dispatch parity** — delivery jobs are broadcast first-come while rides use sequential nearest-driver offers with decline/timeout. Port sequential offers to delivery runs.
-5. **Money-path scaling** — longer term: move wallet/earnings/payouts/rides onto fully-relational tables with Postgres transactions (currently per-row `app_records` store) for true multi-instance concurrency.
-6. **Audit the pre-2026-08-05 surface the same way** — the adversarial passes so far all read recently-added code because that is where they looked. The older rides/stays/food routes have never had an adversarial read for authorization gaps and guessable codes.
+5. **Money-path scaling** — move wallet/earnings/payouts/rides onto fully-relational tables with Postgres transactions (currently per-row `app_records` store) for true multi-instance concurrency.
+6. **Audit the pre-2026-08-05 surface** — older rides/stays/food routes have never had an adversarial read for authorization gaps and guessable codes.
+7. **Parallel-suite timing flakiness** — timing-sensitive suites occasionally cascade-fail mid-file under the full parallel run and pass in isolation (seen with money.test and delivery-runs on 2026-08-06). Suspects: offer windows == sweep cadence. Consider more headroom in test envs or capping --test-concurrency.
 
 ## Shipped log
-### 2026-08-06 (autopilot)
-- **Baseline** — the 10 failing delivery-run tests were not a product bug: test files hardcoded ports and collided with stray servers. The owner's `test/net.js` (`freePort()`) migration landed in parallel and fixed it (82c199b). Suite green, no change needed from me.
-- **Helper invite codes were guessable into a stranger's shop** (11acddb) — `/stores/helper/join` matches a code against EVERY shop, so any hit anywhere grants write access to that shop's stock. Code came from `Math.random()` (the only security code in the app not using crypto), invites never expired, and only the general 600/min/IP budget capped guessing against a 900k space. Now crypto codes, 24h expiry, collision-rejected at creation, 10 wrong tries per account per hour, and its own per-IP limiter (deliberately NOT the money limiter — a fat-fingered invite code must not spend the budget guarding withdrawals).
-- **The withdrawal hold could be laundered off** (c610156) — spending released the hold correctly, but refunds credited the wallet and restored nothing. Top up by card → post a task → cancel it → the money came back withdrawable with no counterparty, then charge back the card. Every refund path had it (rides, stays, tasks, food incl. per-member group refunds, shop orders, admin-rejected withdrawals). All now go through `creditWallet()`, which restores the hold capped at the window's high-water mark so refunds of genuinely old money stay withdrawable.
-- **Voice parser accepted any Authorization header** (95c8274) — the "partner or helper" check tested only that the header existed, so `Bearer x` worked. Both token maps are now really checked and spoken input is bounded per line.
+### 2026-08-06, merge session (all branches → main)
+- Merged the three parallel worktree branches into main, resolving overlapping re-implementations (see Current state). Semantic fixes made during the merge, each with tests: a released delivery order still cannot settle at the counter (asserts the 409 + reject-and-refund exit); confident's counter-race run tests converted to the reject exit; duplicate `pruneDeadOrders` and duplicate derived-revenue terms collapsed to one canonical version each; tests recompute the shop split the customer API now hides (aa83c1b); a shadowing duplicate of `resolveAttention` posted to a dead route (caught by browser smoke test, removed); five partner-order `t()` wraps restored + `No rider — refund` added to the dictionary.
+- The unified admin attention queue (shop + food abandonment incidents) now renders in the Approvals inbox with per-kind rows and a single resolve endpoint — browser-verified end to end.
 
-#### 2026-08-06, second autopilot session (ran concurrently with the one above — see the note in Conventions)
-- **A shop could pocket a prepaid delivery order** (97d5a4f) — this was the ⚠️ item ranked #1 above; now closed. The handover code check only guarded `fulfilment==='pickup'`, so a delivery order accepted an empty body, went `delivered`, and moved the whole prepaid total — the customer's delivery fee included — into withdrawable earnings for goods that never left the counter, with no refund path left. Delivery orders now settle in exactly one place (the courier's dropoff) and handover is refused. Refusing alone would have stranded a shop with no rider available, so `reject`-at-ready was widened from pickup-only to any ready order no courier is carrying. Two tests asserted the old behaviour by name and were corrected; the concurrent session's double-debit test keeps its intent but pins the stronger guarantee, since the race it made idempotent can no longer start.
-- **The food counter code had no attempt cap** (49a60c7) — 4 digits, 9000 values, only the general 600/min budget: roughly seven minutes of scripting for a restaurant to settle a prepaid pickup/dine-in/group order nobody collected. `completed` is terminal, so the customer lost the whole total, and for a group order that is every confirmed member's share at once. Five failures now lock the order with each failure audit-logged, mirroring the kirana handover. Deliberately did NOT add it to the `moneyLimiter` list: the per-order lock already makes brute force useless, and a 60-per-10-min IP cap would punish a genuinely busy counter on shared NAT.
-- **Session tokens no longer travel in the realtime URL** (8347912) — `/api/events` took the 60-day session token as a query param because EventSource cannot set a header. Our logger is path-only, but Render's router, nginx and any CDN log full query strings, so every realtime connection wrote a working token into log stores we neither control nor expire. Clients now trade the token (over `Authorization`) for a one-minute single-use ticket. Because the ticket burns on use, EventSource's own retry would loop on 401 — all four apps reconnect explicitly. `?token=` still works in development for tooling and is refused in production; `test/stream-tickets.test.js` boots a production-mode server to pin exactly that.
-- **Home lied about in-flight orders** (e7a8cb0) — Home renders a row and a tile badge per live order, but boot hydrated only the *saved* tab and explicitly skipped `home`, the screen the app opens on. Reopen SewaGo with a shop order already packed and waiting at the counter and you saw a bare launcher. `hydrateHome()` now pulls the two order lists in the background (never blocking the paint, 15s throttle) on boot into Home and on every return to it.
-- **`npm run dev` / `npm run dev:seed`** (1422800) — `npm start` reads `.env`, where `DATA_STORE=supabase` and a service-role key point at the production project, so the only documented way to run the app locally wrote to real data. The new scripts pin a JSON store in `data/local` with sandbox providers (dotenv does not override shell vars, so they win over `.env`). Used them for this session's mobile walkthrough.
-- **Audit method** — the five findings above came from a four-lens adversarial pass (authorization / money / abuse / state machines) over the 2026-08-05 endpoints: 22 raw findings, each faced three skeptics briefed to refute it, and the survivors were re-verified by hand against the code before any fix. Most raw findings did not survive, which is the point. The unfixed survivors are ranked in the backlog below.
+### 2026-08-06 (branch work now merged; highlights)
+- **Courier abandonment resolves the money** (zealous cluster, b1ef305 + 4faf57f): shop runs and food deliveries whose courier vanishes auto-refund prepaid customers, honour partner income, bill the courier the order total on the COD-debt ledger, and queue the incident for staff with an audit-note resolve. Reconciliation counts abandoned orders correctly.
+- **Test servers die with their runner** (upbeat, c541c9a): `EXIT_WHEN_STDIN_CLOSES=1` stdin watchdog + piped stdin in every suite; an interrupted run can no longer orphan servers onto test ports.
+- **Store commission surfaced on the admin revenue breakdown** (upbeat, 7cf61fd).
+- **Delivery runs prune dead orders before offer and accept** (confident, 72bc5b1): no payout for hollow stops; re-planned runs carry only live orders.
+- **Partner portal cluster** (confident): stock gauges, sales insights + per-item day/week/month reports, Nepali-first i18n with dictionary CI guard, printable invoices, customer receipts + order history, customer order API stops leaking shop economics (aa83c1b).
 
-#### 2026-08-06, third autopilot session (continued after the two above; group-order cluster)
-- **Store-order settlement is now idempotent** (c84a479) — `settleStoreOrderOnDelivery` debited the courier the full cash total unconditionally while its three sibling money-moves were gated by `!partnerSettled`. A courier working a run for an order already settled another way (a shopkeeper handover before a run formed) was debited for cash they never collected, going negative and possibly forced offline. Gated the courier debit the same way; test reproduces the handover-then-run race. (This was the courier-side half of the delivery-handover bug; the theft half is 97d5a4f above.)
-- **Shop checkout bar bled through on mobile** (b0efa05) — `.cartbar` had a transparent background, so the scrolling shelf list showed through the fulfilment/address/payment stack. Gave it the app's glass panel + widened the clearance spacer. Verified live at 375px. (sw cache v5; the concurrent session's v6 supersedes.)
-- **Group orders: charge only what a member confirmed** (a232ceb) — closed all three of the old backlog item 3. (a) place() recomputed each share fresh, so a plate that drifted between confirm and place (a pulled menu item, any future re-price) was charged silently; each member's subtotal is now frozen at confirm and place refuses + un-confirms anyone whose plate moved. (b) confirmations expire (`GROUP_CONFIRM_TTL_MIN`, default 24h) and a group whose scheduled slot has passed cannot be placed. (c) the counter code — the sole settlement key — reached every lobby member, including non-payers who could collect the whole order; it now reaches only the host and members who paid. Tests: `group-orders.test.js` (drift, code scope) + new `group-staleness.test.js` (TTL, lapsed slot).
-- **Group-order lobbies are now bounded** (4642cba) — closed old backlog item 4. A per-host cap on live open lobbies (`GROUP_MAX_OPEN_PER_USER`, default 5; a lapsed slot never counts), plus hourly housekeeping that expires open lobbies whose slot passed and drops cancelled/expired lobbies after a day. The join-code scan is no longer a growth risk once the open set is bounded. Test covers the cap and that cancelling frees a slot.
+### 2026-08-06 (main sessions before the merge)
+- Helper invite codes hardened (11acddb): crypto codes, expiry, per-account tries, own limiter. TTL now env-tunable (`HELPER_INVITE_TTL_MIN`).
+- Withdrawal-hold laundering closed (c610156); voice parser requires a real session (95c8274); session tokens out of the realtime URL via one-minute tickets (8347912); shop cannot pocket a prepaid delivery order (97d5a4f); food counter code attempt-capped (49a60c7); store-order settlement idempotent (c84a479); Home hydrates in-flight orders on boot (e7a8cb0); `npm run dev` local-only scripts (1422800); group orders charge only confirmed shares, codes scoped to payers, lobbies bounded and pruned (a232ceb, 4642cba); shop checkout bar opaque on mobile (b0efa05); tests on OS-assigned ports (82c199b).
 - (for history before 2026-08-05 see git log and docs/)
 
-## Decisions needed from the owner
-- **Rotate a leaked Supabase service-role key.** `VLM-FO1/sewago/mobile/.env` (the app's old location, now stale) holds a live service-role key for project `uxolhsevwzdmojpeubvz` — a different project from the active `kneycqxbfjurtpaopyvl`. It is gitignored and was never committed, but Expo bundles `.env` into APKs, so any build made from that folder shipped it. Recommendation: rotate the key in Supabase, then delete the stale folder. Not touched by autopilot — it is a live credential.
-- ~~Uncommitted test work (`test/net.js` + the `freePort()` migration)~~ — RESOLVED: committed as 82c199b. `npm test` is reliable across parallel checkouts.
-- `ANTHROPIC_API_KEY` is not set in `.env`, so the partner AI-inventory feature returns 503. Add a key to enable it.
-- Confirm the Supabase `app_records` migration ran in production and `DATA_STORE=supabase_rows` is live (render.yaml was flipped; the migration itself was owner-only).
-- Live provider credentials still pending: Khalti/eSewa, Twilio, Resend; Render deploy + APK build are owner-only steps.
-=======
-# AUTOPILOT.md — session memory for unattended improvement runs
-
-## Mission
-SewaGo is a Nepal-focused super-app: rides, food delivery, hotel stays, task
-hiring and kirana-shop commerce in one PWA. Customers pay per order/ride/stay;
-the platform earns commissions and service fees; partners (shopkeepers,
-restaurants, hotels) and drivers are paid out of each transaction. The paying
-loop that must never break: order placed → stock reserved → delivered/handed
-over → partner credited, courier paid, platform cut recorded.
-
-## Current state (2026-08-06)
-- Branch `claude/confident-neumann-d0f9ec` (worktree). All 83 tests green;
-  `npm run verify` = syntax check + i18n dictionary guard.
-- Partner portal is hub-and-spoke (Home + pages), Nepali-first with English
-  toggle, stock-level meters, day/week/month per-item sales reports, printable
-  invoices. Delivery runs prune counter-handed orders (payout-abuse fix).
-
-## Backlog (ranked)
-1. **storeOrders unbounded growth** — `db.storeOrders` has no cap or pruning;
-   insights (polled) and other endpoints scan the full array. Mirror the
-   stockMoves cap or resolve refIds from the tail. (Blocked on the retention
-   decision below.)
-2. **Single-blob persistence bottleneck** — the known #1 scaling risk: whole
-   DB serialized as one JSON blob (also on Supabase store). Split hot
-   collections or move to per-collection persistence.
-3. **Server error strings are English** — a Nepali-UI partner sees English
-   errors from the API (`data.error` passthrough). Either error codes with
-   client-side translation, or an Accept-Language switch.
-4. **UTC day buckets vs shop-local midnight** — `salesDaily` keys are UTC, so
-   the reports' "today" bar can lag the move-based totals until 05:45 NPT.
-   Accepted approximation, documented in `salesInsights`; revisit if partners
-   report confusion.
-5. **Re-run the interrupted review** — the adversarial review workflow lost
-   its `js-correctness` and `ui-visual` finders to a session usage limit; only
-   i18n and server-insights dimensions completed (all their findings fixed).
-6. **Customer app localization** — the partner portal is Nepali-first; the
-   customer app (app.js, ~2900 lines) is still English-only. Reuse the t() +
-   dictionary + guard pattern; sizable but mechanical.
-
-## Shipped log
-- 2026-08-06: Delivery runs prune dead (counter-handed/cancelled) orders before
-  offer and accept — closes a full-payout-for-no-work abuse. (72bc5b1)
-- 2026-08-06: Partner portal: stock gauges, sales insights endpoint + tab,
-  Nepali-first i18n with English toggle, printable invoices. (a0d70b4)
-- 2026-08-06: Merged main's hub-and-spoke portal redesign and re-ported all
-  four features onto it. (fc3476e)
-- 2026-08-06: Per-item day/week/month reports with period switcher; app always
-  boots on Home. (6d191d2)
-- 2026-08-06: Insights rounding/perf fixes; suite made deterministic — the
-  parallel run was tripping the per-IP API rate limit, cascading 429s.
-  (871eec6)
-- 2026-08-06: Three silent-English i18n fixes, 38 dead keys pruned, and a
-  dictionary drift guard wired into `npm run verify`. (0f47428)
-- 2026-08-06: Customer order API stops leaking commission/partnerCut/internal
-  flags; contract locked by test. (aa83c1b)
-- 2026-08-06: Customer receipt screen + past-orders history in the shops tab,
-  printable via the shared invoice styles. (6f116cd)
-- 2026-08-06: Sales terminology unified in partner-lang (आम्दानी → बिक्री).
-  (448b0f6)
-
 ## Decisions needed (owner)
-- **Nepali as the default language** for every partner device (English is one
-  tap away, choice persists). Recommendation: keep — the target shopkeeper
-  reads Nepali — but confirm before production, since existing partners will
-  see the flip.
-- **storeOrders retention** — cap in-memory like stockMoves (20k) and accept
-  history loss, or add an archival export first? Recommendation: cap + weekly
-  JSON archive alongside the existing backup job.
->>>>>>> claude/confident-neumann-d0f9ec
+- **Rotate a leaked Supabase service-role key.** `VLM-FO1/sewago/mobile/.env` (stale folder) holds a live service-role key for old project `uxolhsevwzdmojpeubvz`. Rotate in Supabase, then delete the folder. Not touched by autopilot — live credential.
+- **Delete the merged branches?** `claude/zealous-ishizaka-c363de`, `claude/upbeat-engelbart-6bf40a`, `claude/confident-neumann-d0f9ec` and their worktrees are fully merged into main.
+- **Nepali as the default partner language** (English one tap away, persisted). Recommendation: keep — confirm before production since existing partners see the flip.
+- **storeOrders retention** — cap in-memory like stockMoves and accept history loss, or archival export first? Recommendation: cap + weekly JSON archive alongside the backup job.
+- `ANTHROPIC_API_KEY` not set in `.env` — partner AI-inventory returns 503 until added.
+- Confirm the Supabase `app_records` migration ran in production and `DATA_STORE=supabase_rows` is live.
+- Live provider credentials pending: Khalti/eSewa, Twilio, Resend; Render deploy + APK build are owner-only.
