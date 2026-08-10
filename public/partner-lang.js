@@ -515,6 +515,8 @@ window.SEWAGO_NE = {
   'Do it': 'गर्नुहोस्',
   '✓ Yes, do it': '✓ हो, गर्नुहोस्',
   'Which one did you mean?': 'कुन चाहिँ भन्नुभएको?',
+  'None — it is new': 'कुनै पनि होइन — नयाँ हो',
+  'already on your shelves': 'पहिले नै सूचीमा छ',
   'chini 2 kilo bikri bhayo': 'चिनी २ किलो बिक्री भयो',
   'sold': 'बिक्री भयो',
   'came in': 'आयो',

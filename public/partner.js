@@ -2191,7 +2191,10 @@ function actionLine(a) {
     return `🏷️ <b>${esc(a.itemName)}</b> — ${t('price Rs {was} → Rs {now}', { was: num(a.was), now: num(a.price) })}`;
   }
   const verb = a.intent === 'sold' ? t('sold') : a.intent === 'restock' ? t('came in') : t('counted');
-  return `<b>${esc(a.itemName)}</b> — ${num(a.qty)} ${unit} ${verb}`
+  // Say plainly when a spoken "new item" turned out to be one already stocked,
+  // so it is obvious no second line is being created.
+  const known = a.alreadyStocked ? ` <span class="muted small">· ${t('already on your shelves')}</span>` : '';
+  return `<b>${esc(a.itemName)}</b> — ${num(a.qty)} ${unit} ${verb}${known}`
     + `<div class="muted small">${num(a.stock)} → <b style="color:var(--text)">${num(a.after)}</b> ${unit}</div>`;
 }
 
@@ -2294,12 +2297,37 @@ window.pickChoice = (qIndex, itemId) => {
   const choice = q.choices.find((c) => c.id === itemId);
   if (!choice) return;
   const qty = q.qty === null || q.qty === undefined ? 1 : q.qty;
-  const after = q.intent === 'sold' ? choice.stock - qty
-    : q.intent === 'restock' ? choice.stock + qty
+  // "New" on an add question means the shop really does not stock this yet —
+  // an existing line was close, but the shopkeeper says it is something else.
+  const intent = q.intent === 'add' ? 'restock' : q.intent;
+  const after = intent === 'sold' ? choice.stock - qty
+    : intent === 'restock' ? choice.stock + qty
       : qty;
   plan.actions.push({
-    intent: q.intent, itemId: choice.id, itemName: choice.name, unit: choice.unit,
-    unitLabel: choice.unitLabel, stock: choice.stock, qty, after, price: q.price
+    intent, itemId: choice.id, itemName: choice.name, unit: choice.unit,
+    unitLabel: choice.unitLabel, stock: choice.stock, qty, after,
+    alreadyStocked: q.intent === 'add',
+    price: intent === 'restock' ? undefined : q.price
+  });
+  // A different price said in the same breath stays its own decision.
+  if (q.intent === 'add' && q.price && q.price !== choice.price) {
+    plan.actions.push({
+      intent: 'price', itemId: choice.id, itemName: choice.name,
+      unit: choice.unit, unitLabel: choice.unitLabel, was: choice.price, price: q.price
+    });
+  }
+  plan.questions.splice(qIndex, 1);
+  render();
+};
+
+// "No — it really is new." Creates the item instead of topping up a near-match.
+window.pickIsNew = (qIndex) => {
+  const plan = state.cmd.plan;
+  if (!plan) return;
+  const q = plan.questions[qIndex];
+  if (!q || !q.price) return;
+  plan.actions.push({
+    intent: 'add', name: q.spoken, qty: q.qty || 0, unit: q.unit || 'each', price: q.price
   });
   plan.questions.splice(qIndex, 1);
   render();
@@ -2381,6 +2409,7 @@ function planBlock(plan) {
           <button class="btn ghost compact" onclick="pickChoice(${i},'${c.id}')">
             ${esc(c.name)} · ${num(c.stock)} ${esc(c.unitLabel)}
           </button>`).join('')}
+        ${q.canBeNew ? `<button class="btn ghost compact" onclick="pickIsNew(${i})">${t('None — it is new')}</button>` : ''}
       </div>
     </div>`).join('');
   const problems = plan.problems.map((p) => `

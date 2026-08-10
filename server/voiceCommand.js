@@ -19,7 +19,9 @@
 // A model still helps with sentences this cannot crack — that lives in ./ai and
 // produces commands in exactly this shape, so everything downstream is shared.
 
-const { tokenize, wordsToNumber, UNIT_WORDS, PRICE_WORDS } = require('./voiceParse');
+const {
+  tokenize, wordsToNumber, nearestKeyword, nearKeyword, UNIT_WORDS, PRICE_WORDS
+} = require('./voiceParse');
 
 // How sure we must be before an action is allowed to touch stock, and how much
 // daylight the best match needs over the runner-up. A shopkeeper saying "दाल"
@@ -131,12 +133,49 @@ for (const group of SYNONYMS) {
 // Verbs are recognised in whichever script they arrive in — the list above
 // spells most of them twice, but a speaker who says a Devanagari word we only
 // listed romanised should still be understood.
+// Every closed vocabulary gets the same treatment: try the word as spoken, then
+// transliterated, then one keystroke off. The length floors below are the whole
+// safety story — they decide how short a word has to be before we stop guessing
+// at it, because a wrong guess drops a real word out of an item's name.
+const INTENT_VOCAB = Object.fromEntries(INTENT_BY_WORD);
+
+// 5, not 4: at four characters "rate" is one edit from "rato" (as in रातो चामल)
+// and "thap" one from "chap". Short verbs must be said exactly.
 function intentOf(token) {
-  return INTENT_BY_WORD.get(token) || INTENT_BY_WORD.get(transliterate(token)) || null;
+  if (!token) return null;
+  const t = transliterate(token);
+  return INTENT_BY_WORD.get(token)
+    || INTENT_BY_WORD.get(t)
+    || nearestKeyword(t, INTENT_VOCAB, { minLen: 5 })
+    || null;
 }
 
 function isFiller(token) {
-  return FILLER.has(token) || FILLER.has(transliterate(token));
+  if (!token) return false;
+  const t = transliterate(token);
+  return FILLER.has(token) || FILLER.has(t) || nearKeyword(t, FILLER, { minLen: 5 });
+}
+
+function isPriceWord(token) {
+  if (!token) return false;
+  const t = transliterate(token);
+  return PRICE_WORDS.has(token) || PRICE_WORDS.has(t) || nearKeyword(t, PRICE_WORDS, { minLen: 5 });
+}
+
+// A word sitting immediately after a number is almost certainly a unit, and
+// that position is strong enough evidence to guess at three-letter words too —
+// which is what rescues "20 ots" from becoming part of the item's name.
+function unitAfterNumber(token) {
+  if (!token) return null;
+  const t = transliterate(token);
+  return UNIT_WORDS[token] || UNIT_WORDS[t] || nearestKeyword(t, UNIT_WORDS, { minLen: 3 });
+}
+
+// Anywhere else there is no positional evidence, so the bar is higher.
+function unitWord(token) {
+  if (!token) return null;
+  const t = transliterate(token);
+  return UNIT_WORDS[token] || UNIT_WORDS[t] || nearestKeyword(t, UNIT_WORDS, { minLen: 5 });
 }
 
 // Tokens that carry meaning for matching an item name: no numbers, no units,
@@ -144,8 +183,8 @@ function isFiller(token) {
 function meaningTokens(tokens) {
   return tokens.filter((t) => (
     !isFiller(t)
-    && !UNIT_WORDS[t]
-    && !PRICE_WORDS.has(t)
+    && !unitWord(t)
+    && !isPriceWord(t)
     && !intentOf(t)
     && !/^\d+(\.\d+)?$/.test(t)
   ));
@@ -283,7 +322,7 @@ function scoreItem(queryTokens, item) {
  * Returns { item } when confident, { choices } when two items are too close to
  * call, or {} when nothing is close enough.
  */
-function resolveItem(queryTokens, items) {
+function resolveItem(queryTokens, items, { confidentAt = 0 } = {}) {
   const live = items.filter((i) => !i.archived);
   if (!live.length) return {};
   const scored = live
@@ -291,11 +330,19 @@ function resolveItem(queryTokens, items) {
     .filter((s) => s.score >= MATCH_FLOOR)
     .sort((a, b) => b.score - a.score);
   if (!scored.length) return {};
+  const near = (gap) => scored.filter((s) => scored[0].score - s.score < gap).slice(0, 4).map((s) => s.item);
   if (scored.length > 1 && scored[0].score - scored[1].score < AMBIGUOUS_GAP) {
     // Two plausible items. Asking costs one tap; guessing costs a wrong count
     // on two items and a shopkeeper who stops trusting the feature.
-    return { choices: scored.filter((s) => scored[0].score - s.score < AMBIGUOUS_GAP).slice(0, 4).map((s) => s.item) };
+    return { choices: near(AMBIGUOUS_GAP) };
   }
+  // Naming something to sell or restock is naming something you already stock,
+  // so the best match wins. Announcing a NEW item is the opposite claim, and a
+  // loose match there is dangerous in a way it is not elsewhere: a shop holding
+  // "Lifebuoy Sabun" that hears "naya lux sabun" would top up the wrong soap
+  // and never create the new one. So an explicit "new" has to be nearly exact,
+  // and anything short of that becomes a question.
+  if (scored[0].score < confidentAt) return { choices: near(0.25), unsure: true };
   return { item: scored[0].item };
 }
 
@@ -327,10 +374,10 @@ function extractNumbers(tokens) {
   for (let i = 0; i < tokens.length && qty === null; i += 1) {
     const n = numberAt(i);
     if (!n) continue;
-    const next = tokens[i + n.length];
-    if (next && UNIT_WORDS[next]) {
+    const next = unitAfterNumber(tokens[i + n.length]);
+    if (next) {
       qty = n.value;
-      unit = UNIT_WORDS[next];
+      unit = next;
       for (let k = i; k <= i + n.length; k += 1) used[k] = true;
     }
   }
@@ -339,11 +386,11 @@ function extractNumbers(tokens) {
     if (!n) continue;
     const after = tokens[i + n.length];
     const before = i > 0 ? tokens[i - 1] : null;
-    if ((after && PRICE_WORDS.has(after)) || (before && PRICE_WORDS.has(before))) {
+    if (isPriceWord(after) || isPriceWord(before)) {
       price = n.value;
       for (let k = i; k < i + n.length; k += 1) used[k] = true;
-      if (after && PRICE_WORDS.has(after)) used[i + n.length] = true;
-      if (before && PRICE_WORDS.has(before)) used[i - 1] = true;
+      if (isPriceWord(after)) used[i + n.length] = true;
+      if (isPriceWord(before)) used[i - 1] = true;
     }
   }
   for (let i = 0; i < tokens.length; i += 1) {
@@ -441,9 +488,13 @@ function parseCommands(text, store) {
 // grammar above and the model-assisted path below, so a sentence that needed
 // help arrives downstream in exactly the same shape as one that did not — and
 // gets the same refusal to guess between two similar items.
+const ADD_CONFIDENT_AT = 0.9;
+
 function resolveClause({ intent, nameTokens, qty = null, unit = null, price = null }, items) {
   const spoken = nameTokens.join(' ');
-  const resolved = resolveItem(nameTokens, items);
+  const resolved = resolveItem(nameTokens, items, {
+    confidentAt: intent === 'add' ? ADD_CONFIDENT_AT : 0
+  });
   const base = {
     intent,
     kind: intent === 'ask' ? 'query' : 'stock',
@@ -456,7 +507,13 @@ function resolveClause({ intent, nameTokens, qty = null, unit = null, price = nu
     return { ...base, itemId: resolved.item.id, itemName: resolved.item.name, unitOf: resolved.item.unit };
   }
   if (resolved.choices) {
-    return { ...base, needsPick: resolved.choices.map((i) => ({ id: i.id, name: i.name, unit: i.unit, stock: i.stock })) };
+    return {
+      ...base,
+      // `canBeNew` lets the question offer "no, it is a new item" alongside the
+      // shelves it might have meant.
+      canBeNew: !!resolved.unsure && price !== null,
+      needsPick: resolved.choices.map((i) => ({ id: i.id, name: i.name, unit: i.unit, stock: i.stock, price: i.price }))
+    };
   }
   if (intent === 'add' || (price !== null && qty !== null)) {
     // Not on the shelves and priced — the shopkeeper is listing something new.

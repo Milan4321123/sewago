@@ -536,8 +536,38 @@ function planCommand(store, cmd) {
       spoken: cmd.spoken,
       qty: cmd.qty,
       price: cmd.price,
+      unit: cmd.unit || 'each',
+      // Set when the shopkeeper said "new" and the shop holds something close
+      // but not close enough — the answer might be "neither, it really is new".
+      canBeNew: !!cmd.canBeNew,
       choices: cmd.needsPick.map((c) => ({ ...c, unitLabel: (UNITS[c.unit] || UNITS.each).label }))
     };
+  }
+  // Saying "नयाँ साबुन" when साबुन is ALREADY on the shelves is a restock, not a
+  // second line for the same goods. Without this, repeating a command quietly
+  // grew a pile of near-duplicate items — which is worse than doing nothing,
+  // because the shopkeeper's counts are then split across lines they cannot see.
+  if (cmd.intent === 'add' && cmd.itemId) {
+    const item = itemIn(store, cmd.itemId);
+    if (item && !item.archived) {
+      const qty = cmd.qty === null || cmd.qty <= 0 ? 1 : cmd.qty;
+      const out = [{
+        kind: 'action',
+        intent: 'restock',
+        ...itemBrief(item),
+        qty,
+        after: item.stock + qty,
+        alreadyStocked: true
+      }];
+      // A price said alongside it is a separate decision, so it is shown and
+      // confirmed as one rather than folded silently into the restock.
+      if (cmd.price && cmd.price !== item.price) {
+        out.push({
+          kind: 'action', intent: 'price', ...itemBrief(item), price: cmd.price, was: item.price
+        });
+      }
+      return out;
+    }
   }
   if (cmd.intent === 'add' && cmd.kind === 'new') {
     if (!cmd.price) return { kind: 'problem', reason: 'need_price', spoken: cmd.spoken };
@@ -601,8 +631,12 @@ router.post('/partner/stores/:id/voice/command', authPartner, async (req, res) =
   if (!text) return res.status(400).json({ error: 'Say what you want to do.' });
   const heard = text.slice(0, MAX_SPEECH_CHARS);
 
+  // planCommand may answer one spoken clause with more than one action (a
+  // restock plus the price change said in the same breath), so flatten.
+  const planAll = (cmds) => cmds.slice(0, VOICE_MAX_ACTIONS).flatMap((c) => planCommand(store, c));
+
   const { commands } = parseCommands(heard, store);
-  let planned = commands.slice(0, VOICE_MAX_ACTIONS).map((c) => planCommand(store, c));
+  let planned = planAll(commands);
   let usedAi = false;
 
   // The offline grammar covers what a shopkeeper says all day. When it cannot
@@ -612,8 +646,7 @@ router.post('/partner/stores/:id/voice/command', authPartner, async (req, res) =
   if (!wasUnderstood(planned) && ai.aiEnabled() && !aiRateLimited(req.partner.id)) {
     try {
       const { commands: raw } = await ai.draftCommands({ text: heard, store });
-      const resolved = commandsFromFields(raw, store).slice(0, VOICE_MAX_ACTIONS);
-      const aiPlanned = resolved.map((c) => planCommand(store, c));
+      const aiPlanned = planAll(commandsFromFields(raw, store));
       if (wasUnderstood(aiPlanned)) {
         planned = aiPlanned;
         usedAi = true;

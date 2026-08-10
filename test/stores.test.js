@@ -753,6 +753,63 @@ test('it asks which dal rather than guessing between two', async () => {
   assert.equal(plan.data.questions[0].qty, 2, 'the quantity survives the question');
 });
 
+test('saying a new item twice restocks it instead of growing a second line', async () => {
+  // Reported from real use: every repeat of a spoken "new item" added another
+  // line, so one product ended up split across several the shopkeeper could not
+  // see. Two causes — mis-heard filler ("ots", "per piece") landing in the name
+  // so the names never matched, and "naya X" always meaning "create".
+  const shop = await shopWithStock('Dohoriyeko Kirana');
+
+  const first = await shop.say('naya sabun 20 ots 20 rupees per piece');
+  assert.equal(first.data.actions.length, 1, JSON.stringify(first.data));
+  assert.equal(first.data.actions[0].intent, 'add');
+  assert.equal(first.data.actions[0].name, 'sabun', 'mis-heard words must not become part of the name');
+  assert.equal(first.data.actions[0].qty, 20);
+  assert.equal(first.data.actions[0].price, 20);
+  await shop.apply(first.data.planId, first.data.actions);
+
+  // Said again — and said messily again — it is the same soap.
+  const again = await shop.say('naya sabun 10 ota 20 rupees');
+  assert.equal(again.data.actions.length, 1, JSON.stringify(again.data));
+  assert.equal(again.data.actions[0].intent, 'restock', 'the second time is a restock');
+  assert.ok(again.data.actions[0].alreadyStocked, 'and it says so');
+  assert.equal(again.data.actions[0].after, 30);
+  await shop.apply(again.data.planId, again.data.actions);
+
+  const inv = await api(`/partner/stores/${shop.storeId}/inventory`, { token: shop.token });
+  const soaps = inv.data.items.filter((i) => /sabun/i.test(i.name));
+  assert.equal(soaps.length, 1, `one soap line, got ${JSON.stringify(soaps.map((s) => s.name))}`);
+  assert.equal(soaps[0].stock, 30);
+
+  // A different price said alongside is its own decision, shown separately.
+  const repriced = await shop.say('naya sabun 5 ota 25 rupees');
+  assert.deepEqual(repriced.data.actions.map((a) => a.intent), ['restock', 'price']);
+  assert.equal(repriced.data.actions[1].was, 20);
+  assert.equal(repriced.data.actions[1].price, 25);
+});
+
+test('a new item close to one already stocked is asked about, not merged', async () => {
+  // The flip side of the rule above. Topping up the wrong soap is worse than a
+  // duplicate line, so an explicit "new" has to be nearly exact before it
+  // counts as something already on the shelves.
+  const shop = await shopWithStock('Sabun Kirana');
+  const made = await shop.say('naya lifebuoy sabun 10 ota 45 rupees');
+  assert.equal(made.data.actions[0].intent, 'add', JSON.stringify(made.data));
+  await shop.apply(made.data.planId, made.data.actions);
+
+  // A different soap: close enough to be worth asking about, not to assume.
+  const lux = await shop.say('naya lux sabun 10 ota 25 rupees');
+  assert.equal(lux.data.actions.length, 0, 'it must not quietly top up the Lifebuoy');
+  assert.equal(lux.data.questions.length, 1, JSON.stringify(lux.data));
+  assert.ok(lux.data.questions[0].canBeNew, 'and "it is new" has to be one of the answers');
+  assert.ok(lux.data.questions[0].choices.some((c) => /lifebuoy/i.test(c.name)));
+
+  // Saying the same soap again still restocks rather than duplicating.
+  const same = await shop.say('naya lifebuoy sabun 5 ota 45 rupees');
+  assert.equal(same.data.actions[0].intent, 'restock', JSON.stringify(same.data));
+  assert.equal(same.data.actions[0].after, 15);
+});
+
 test('a question is answered, never acted on', async () => {
   const shop = await shopWithStock('Sodhne Kirana');
   const plan = await shop.say('चिनी कति छ');

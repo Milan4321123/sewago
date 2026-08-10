@@ -40,17 +40,25 @@ const NUMBER_WORDS = {
 };
 
 // Unit vocabulary -> canonical unit key used by the inventory.
+//
+// Spelled out generously on purpose. Speech recognition returns whatever it
+// thinks it heard, and a shopkeeper counting stock says "ota", "wata", "gota"
+// and "pcs" interchangeably in the same minute. Anything still missed is caught
+// by the near-miss matcher below rather than landing in the item name.
 const UNIT_WORDS = {
-  kg: 'kg', kilo: 'kg', kilos: 'kg', kilogram: 'kg', किलो: 'kg', केजी: 'kg', kej: 'kg',
-  g: 'g', gm: 'g', gram: 'g', grams: 'g', ग्राम: 'g',
-  l: 'l', ltr: 'l', litre: 'l', liter: 'l', litres: 'l', लिटर: 'l',
+  kg: 'kg', kgs: 'kg', kilo: 'kg', kilos: 'kg', kilogram: 'kg', kilograms: 'kg',
+  किलो: 'kg', केजी: 'kg', kej: 'kg', keji: 'kg',
+  g: 'g', gm: 'g', gms: 'g', gram: 'g', grams: 'g', ग्राम: 'g',
+  l: 'l', ltr: 'l', litre: 'l', liter: 'l', litres: 'l', liters: 'l', लिटर: 'l',
   ml: 'ml', मिलि: 'ml', मिली: 'ml',
-  packet: 'packet', packets: 'packet', pkt: 'packet', प्याकेट: 'packet', पोका: 'packet',
-  piece: 'each', pieces: 'each', pcs: 'each', pc: 'each',
-  goto: 'each', गोटा: 'each', ota: 'each', ओटा: 'each', wata: 'each', वटा: 'each',
-  dozen: 'dozen', दर्जन: 'dozen',
-  bottle: 'bottle', bottles: 'bottle', बोतल: 'bottle',
-  bora: 'sack', बोरा: 'sack', sack: 'sack'
+  packet: 'packet', packets: 'packet', pkt: 'packet', pkts: 'packet', paket: 'packet',
+  pack: 'packet', packs: 'packet', प्याकेट: 'packet', पोका: 'packet',
+  piece: 'each', pieces: 'each', pcs: 'each', pc: 'each', pes: 'each',
+  goto: 'each', gota: 'each', गोटा: 'each',
+  ota: 'each', otas: 'each', ओटा: 'each', wata: 'each', watta: 'each', वटा: 'each',
+  dozen: 'dozen', dozens: 'dozen', darjan: 'dozen', दर्जन: 'dozen',
+  bottle: 'bottle', bottles: 'bottle', botal: 'bottle', बोतल: 'bottle',
+  bora: 'sack', boras: 'sack', बोरा: 'sack', sack: 'sack', sacks: 'sack'
 };
 
 // Words that mark the number next to them as a PRICE rather than a quantity.
@@ -60,7 +68,84 @@ const PRICE_WORDS = new Set([
 ]);
 
 // Noise words that should never end up in the item name.
-const STOP_WORDS = new Set(['ko', 'ka', 'ki', 'को', 'का', 'की', 'छ', 'हो', 'and', 'at', 'for', 'the', 'a']);
+// "naya sabun" is a shopkeeper announcing a new item, not an item called
+// "Naya Sabun".
+const STOP_WORDS = new Set([
+  'ko', 'ka', 'ki', 'को', 'का', 'की', 'छ', 'हो', 'and', 'at', 'for', 'the', 'a',
+  'naya', 'nayaa', 'नयाँ', 'नया', 'new'
+]);
+
+/* ---------------- near-miss keyword matching ----------------
+   Units, verbs and filler are small CLOSED sets, so a token one keystroke away
+   from one of them is almost certainly that word: "ots" is "ota", "nayan" is
+   "naya", "rupess" is "rupees". Item names are open-ended and never get this
+   benefit — guessing there would rename someone's stock.
+
+   Without it, every unrecognised word fell through into the item name, so a
+   single mis-heard unit turned "naya sabun 20 ots" into an item called
+   "sabun ots". One bad syllable should cost nothing. */
+
+// Levenshtein that gives up as soon as it exceeds `max` — these are 3-8
+// character words compared against a few dozen keys per token.
+function editDistance(a, b, max) {
+  if (Math.abs(a.length - b.length) > max) return max + 1;
+  let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i += 1) {
+    const cur = [i];
+    let best = i;
+    for (let j = 1; j <= b.length; j += 1) {
+      cur[j] = Math.min(
+        cur[j - 1] + 1,
+        prev[j] + 1,
+        prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)
+      );
+      if (cur[j] < best) best = cur[j];
+    }
+    if (best > max) return max + 1;
+    prev = cur;
+  }
+  return prev[b.length];
+}
+
+/**
+ * Closest entry in a vocabulary, or null when nothing is close enough.
+ * `vocab` maps word -> meaning; a tie between two DIFFERENT meanings is
+ * refused, because picking one at random is how a parser quietly does the
+ * wrong thing.
+ */
+function nearestKeyword(token, vocab, { minLen = 4 } = {}) {
+  if (!token || token.length < minLen) return null;
+  if (vocab[token] !== undefined) return vocab[token];
+  const max = token.length >= 6 ? 2 : 1;
+  let bestDist = max + 1;
+  let bestValue = null;
+  let tied = false;
+  for (const word of Object.keys(vocab)) {
+    if (word.length < 3) continue; // "g", "l", "pc" are too short to guess at
+    const d = editDistance(token, word, max);
+    if (d > max) continue;
+    if (d < bestDist) {
+      bestDist = d;
+      bestValue = vocab[word];
+      tied = false;
+    } else if (d === bestDist && vocab[word] !== bestValue) {
+      tied = true;
+    }
+  }
+  return tied ? null : bestValue;
+}
+
+// Set-flavoured version for vocabularies that are just membership tests.
+function nearKeyword(token, set, { minLen = 4 } = {}) {
+  if (!token || token.length < minLen) return false;
+  if (set.has(token)) return true;
+  const max = token.length >= 6 ? 2 : 1;
+  for (const word of set) {
+    if (word.length < 3) continue;
+    if (editDistance(token, word, max) <= max) return true;
+  }
+  return false;
+}
 
 function devanagariToAscii(text) {
   let out = '';
@@ -101,6 +186,19 @@ function tokenize(text) {
     .filter(Boolean);
 }
 
+// The same tolerance the command layer uses, so the two spoken paths agree on
+// what counts as a unit or a price word. No transliteration here — this parser
+// already carries both scripts in its vocabulary.
+function unitAfterNumber(token) {
+  if (!token) return null;
+  return UNIT_WORDS[token] || nearestKeyword(token, UNIT_WORDS, { minLen: 3 });
+}
+
+function isPriceWord(token) {
+  if (!token) return false;
+  return PRICE_WORDS.has(token) || nearKeyword(token, PRICE_WORDS, { minLen: 5 });
+}
+
 /**
  * Parse one spoken line into inventory fields.
  * Returns { name, qty, unit, price, needsReview[], raw }.
@@ -130,10 +228,10 @@ function parseItemSpeech(text) {
   for (let i = 0; i < tokens.length && qty === null; i += 1) {
     const n = numberAt(i);
     if (!n) continue;
-    const next = tokens[i + n.length];
-    if (next && UNIT_WORDS[next]) {
+    const next = unitAfterNumber(tokens[i + n.length]);
+    if (next) {
       qty = n.value;
-      unit = UNIT_WORDS[next];
+      unit = next;
       for (let k = i; k < i + n.length + 1; k += 1) used[k] = true;
     }
   }
@@ -144,11 +242,11 @@ function parseItemSpeech(text) {
     if (!n) continue;
     const after = tokens[i + n.length];
     const before = i > 0 ? tokens[i - 1] : null;
-    if ((after && PRICE_WORDS.has(after)) || (before && PRICE_WORDS.has(before))) {
+    if (isPriceWord(after) || isPriceWord(before)) {
       price = n.value;
       for (let k = i; k < i + n.length; k += 1) used[k] = true;
-      if (after && PRICE_WORDS.has(after)) used[i + n.length] = true;
-      if (before && PRICE_WORDS.has(before)) used[i - 1] = true;
+      if (isPriceWord(after)) used[i + n.length] = true;
+      if (isPriceWord(before)) used[i - 1] = true;
     }
   }
 
@@ -184,8 +282,12 @@ function parseItemSpeech(text) {
   for (let i = 0; i < tokens.length; i += 1) {
     if (used[i]) continue;
     const t = tokens[i];
-    if (UNIT_WORDS[t] && !nameTokens.length) { if (!unit) unit = UNIT_WORDS[t]; continue; }
-    if (PRICE_WORDS.has(t) || STOP_WORDS.has(t)) continue;
+    // A bare unit word is never part of a name — "20 ots 20 rupees per piece"
+    // ends on one. Sizes fused into a token ("500ml") are a single word and are
+    // not matched here, so names like "DDC Dudh 500ml" survive intact.
+    const asUnit = UNIT_WORDS[t] || nearestKeyword(t, UNIT_WORDS, { minLen: 5 });
+    if (asUnit) { if (!unit) unit = asUnit; continue; }
+    if (isPriceWord(t) || STOP_WORDS.has(t)) continue;
     nameTokens.push(t);
   }
   const name = nameTokens.join(' ').replace(/\s+/g, ' ').trim();
@@ -213,6 +315,8 @@ module.exports = {
   tokenize,
   wordsToNumber,
   devanagariToAscii,
+  nearestKeyword,
+  nearKeyword,
   UNIT_WORDS,
   NUMBER_WORDS,
   PRICE_WORDS,
