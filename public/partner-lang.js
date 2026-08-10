@@ -505,5 +505,39 @@ window.SEWAGO_NE = {
   'Paid in cash': 'नगद तिरेको',
   'To pay in cash on handover': 'बुझाउँदा नगद तिर्ने',
   'Paid in the SewaGo app': 'SewaGo एपमा तिरिसकेको',
-  'Thank you! Sold through SewaGo.': 'धन्यवाद! SewaGo मार्फत बिक्री।'
+  'Thank you! Sold through SewaGo.': 'धन्यवाद! SewaGo मार्फत बिक्री।',
+
+  /* ---- speaking to the shop ---- */
+  'Just say it 🎤': 'भन्नुहोस् मात्र 🎤',
+  'Speak like you would to a helper —': 'सहयोगीलाई भनेजस्तै भन्नुहोस् —',
+  '🎤 Tap and speak': '🎤 थिच्नुहोस् र बोल्नुहोस्',
+  'Thinking…': 'सोच्दै…',
+  'Do it': 'गर्नुहोस्',
+  '✓ Yes, do it': '✓ हो, गर्नुहोस्',
+  'Which one did you mean?': 'कुन चाहिँ भन्नुभएको?',
+  'chini 2 kilo bikri bhayo': 'चिनी २ किलो बिक्री भयो',
+  'sold': 'बिक्री भयो',
+  'came in': 'आयो',
+  'counted': 'गनिएको',
+  'Open the shop': 'पसल खोल्ने',
+  'Close the shop': 'पसल बन्द गर्ने',
+  'new item at Rs {price}': 'नयाँ सामान, रु {price}',
+  'price Rs {was} → Rs {now}': 'मूल्य रु {was} → रु {now}',
+  '{item}: {stock} {unit} left, Rs {price}.': '{item}: {stock} {unit} बाँकी, रु {price}।',
+  'Running low:': 'सकिँदै छ:',
+  'Nothing is running low.': 'केही पनि सकिँदै छैन।',
+  '{item}: only {stock} {unit} left.': '{item}: जम्मा {stock} {unit} मात्र बाँकी छ।',
+  'Say a price for “{what}”.': '“{what}” को मूल्य पनि भन्नुहोस्।',
+  'Could not catch how many — say it again.': 'कति भनेको बुझिएन — फेरि भन्नुहोस्।',
+  '“{what}” is not on your shelves. Say “new {what} …” with a price to add it.':
+    '“{what}” तपाईंको सूचीमा छैन। थप्न मूल्यसहित “नयाँ {what} …” भन्नुहोस्।',
+  'Did not catch that. Try naming the item, how many, and what happened.':
+    'बुझिएन। सामानको नाम, कति, अनि के भयो भन्नुहोस्।',
+  '{item} done.': '{item} भयो।',
+  '{n} things done.': '{n} वटा काम भयो।',
+  '{n} done, {f} could not be': '{n} भयो, {f} भएन',
+  'This phone cannot listen — type what you want instead.': 'यो फोनले सुन्न सक्दैन — टाइप गर्नुहोस्।',
+  'Microphone blocked — allow it in your browser, or type it instead.':
+    'माइक बन्द छ — ब्राउजरमा अनुमति दिनुहोस्, वा टाइप गर्नुहोस्।',
+  'Could not hear that. Try again, or type it.': 'सुनिएन। फेरि प्रयास गर्नुहोस्, वा टाइप गर्नुहोस्।'
 };

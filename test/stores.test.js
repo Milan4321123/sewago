@@ -39,7 +39,10 @@ async function registerUser(name) {
 }
 
 // A KYC-approved shopkeeper with an approved shop.
-async function openShop(name = 'Ram Kirana') {
+// `area` decides where the shop lands on the map. Tests that care about
+// distance pin their own coordinates; tests that do not should pass an area
+// away from Thamel so they don't crowd the capped "nearby" list there.
+async function openShop(name = 'Ram Kirana', area = 'Thamel') {
   const stamp = `${Date.now()}${Math.floor(Math.random() * 1000)}`;
   const reg = await api('/partner/register', {
     method: 'POST',
@@ -54,7 +57,7 @@ async function openShop(name = 'Ram Kirana') {
   await api('/partner/phone/verify', { method: 'POST', token, body: { code: otp.data.devCode } });
   await api(`/admin/partners/${partnerId}/kyc/approve`, { method: 'POST', token: adminToken });
   const store = await api('/partner/stores', {
-    method: 'POST', token, body: { name, area: 'Thamel', icon: '🏪', deliveryFee: 30 }
+    method: 'POST', token, body: { name, area, icon: '🏪', deliveryFee: 30 }
   });
   assert.equal(store.status, 200, JSON.stringify(store.data));
   // Staff approve the shop the same way they approve any listing.
@@ -673,6 +676,168 @@ test('a hired helper can count stock, and their work is attributed to them', asy
   const soap = shelf.data.items.find((i) => i.id === added.data.item.id);
   assert.equal(soap.price, 45, 'the shopkeeper’s price stands');
   assert.equal(soap.stock, 23, 'but the count the helper made still lands');
+});
+
+// --- speaking to the shop ---------------------------------------------------
+
+// A kirana owner should not have to find an item and tap buttons. These cover
+// the whole spoken path: what the shop hears, what it refuses to guess at, and
+// what it does only after being confirmed.
+async function shopWithStock(name = 'Bolne Kirana') {
+  // Parked in Bhaktapur: these shops are about speech, not geography, and a
+  // pile of extra Thamel shops would push others out of the nearby list.
+  const shop = await openShop(name, 'Bhaktapur Durbar Square');
+  const add = async (body) => {
+    const r = await api(`/partner/stores/${shop.storeId}/items`, { method: 'POST', token: shop.token, body });
+    assert.equal(r.status, 200, JSON.stringify(r.data));
+    return r.data.item;
+  };
+  shop.sugar = await add({ name: 'Sugar', unit: 'kg', price: 120, stock: 40 });
+  shop.rice = await add({ name: 'Chamal Basmati', unit: 'kg', price: 180, stock: 100 });
+  shop.musuro = await add({ name: 'Musuro Dal', unit: 'kg', price: 160, stock: 25 });
+  shop.mas = await add({ name: 'Mas Dal', unit: 'kg', price: 210, stock: 12 });
+  shop.say = (text) => api(`/partner/stores/${shop.storeId}/voice/command`, {
+    method: 'POST', token: shop.token, body: { text }
+  });
+  shop.apply = (planId, actions) => api(`/partner/stores/${shop.storeId}/voice/apply`, {
+    method: 'POST', token: shop.token, body: { planId, actions }
+  });
+  shop.stockOf = async (itemId) => {
+    const inv = await api(`/partner/stores/${shop.storeId}/inventory`, { token: shop.token });
+    return inv.data.items.find((i) => i.id === itemId).stock;
+  };
+  return shop;
+}
+
+test('a shopkeeper sells by saying it, and the shelf follows', async () => {
+  const shop = await shopWithStock();
+  const plan = await shop.say('चिनी दुई किलो बिक्री भयो');
+  assert.equal(plan.status, 200, JSON.stringify(plan.data));
+  assert.equal(plan.data.actions.length, 1);
+  const [action] = plan.data.actions;
+  assert.equal(action.intent, 'sold');
+  assert.equal(action.itemName, 'Sugar', 'चिनी must find the shop’s English "Sugar" line');
+  assert.equal(action.qty, 2);
+  assert.equal(action.after, 38, 'the shopkeeper sees the result before agreeing to it');
+
+  // Nothing moved on the planning call — speaking is not doing.
+  assert.equal(await shop.stockOf(shop.sugar.id), 40);
+
+  const applied = await shop.apply(plan.data.planId, plan.data.actions);
+  assert.equal(applied.status, 200, JSON.stringify(applied.data));
+  assert.equal(applied.data.done.length, 1);
+  assert.equal(await shop.stockOf(shop.sugar.id), 38);
+});
+
+test('one breath can carry two jobs', async () => {
+  const shop = await shopWithStock('Duita Kaam Kirana');
+  const plan = await shop.say('चिनी दुई किलो बिक्री भयो र चामल दश किलो आयो');
+  assert.equal(plan.data.actions.length, 2, JSON.stringify(plan.data));
+  assert.deepEqual(plan.data.actions.map((a) => a.intent), ['sold', 'restock']);
+
+  await shop.apply(plan.data.planId, plan.data.actions);
+  assert.equal(await shop.stockOf(shop.sugar.id), 38);
+  assert.equal(await shop.stockOf(shop.rice.id), 110);
+});
+
+test('it asks which dal rather than guessing between two', async () => {
+  // The shop stocks Musuro Dal and Mas Dal. Guessing here would quietly put the
+  // count wrong on two items at once, which is how a shopkeeper learns not to
+  // trust the feature.
+  const shop = await shopWithStock('Dal Dubidha Kirana');
+  const plan = await shop.say('दाल दुई किलो बिक्री भयो');
+  assert.equal(plan.data.actions.length, 0, 'nothing may be proposed while it is ambiguous');
+  assert.equal(plan.data.questions.length, 1, JSON.stringify(plan.data));
+  const names = plan.data.questions[0].choices.map((c) => c.name).sort();
+  assert.deepEqual(names, ['Mas Dal', 'Musuro Dal']);
+  assert.equal(plan.data.questions[0].qty, 2, 'the quantity survives the question');
+});
+
+test('a question is answered, never acted on', async () => {
+  const shop = await shopWithStock('Sodhne Kirana');
+  const plan = await shop.say('चिनी कति छ');
+  assert.equal(plan.data.actions.length, 0);
+  assert.equal(plan.data.answers.length, 1, JSON.stringify(plan.data));
+  assert.equal(plan.data.answers[0].intent, 'ask');
+  assert.equal(plan.data.answers[0].stock, 40);
+  assert.equal(await shop.stockOf(shop.sugar.id), 40);
+
+  const low = await shop.say('के सकिँदै छ');
+  assert.equal(low.data.answers.length, 1);
+  assert.equal(low.data.answers[0].intent, 'low');
+});
+
+test('the same spoken instruction cannot be run twice', async () => {
+  // A phone in a shop retries requests and fingers double-tap. Selling the same
+  // two kilos twice would be the feature quietly corrupting the count.
+  const shop = await shopWithStock('Dohoro Kirana');
+  const plan = await shop.say('चिनी दुई किलो बिक्री भयो');
+  const first = await shop.apply(plan.data.planId, plan.data.actions);
+  assert.equal(first.status, 200);
+  const second = await shop.apply(plan.data.planId, plan.data.actions);
+  assert.equal(second.status, 409, JSON.stringify(second.data));
+  assert.equal(await shop.stockOf(shop.sugar.id), 38, 'the shelf moved exactly once');
+});
+
+test('the shop will not sell more than it holds', async () => {
+  const shop = await shopWithStock('Sakiyo Kirana');
+  const plan = await shop.say('मास दाल पचास किलो बिक्री भयो');
+  assert.equal(plan.data.actions.length, 0, 'an impossible sale is never proposed');
+  assert.equal(plan.data.problems.length, 1, JSON.stringify(plan.data));
+  assert.equal(plan.data.problems[0].reason, 'not_enough');
+  assert.equal(plan.data.problems[0].stock, 12);
+});
+
+test('a confirmed plan is still re-checked before it touches anything', async () => {
+  // The plan is a statement of intent from a browser, not a source of truth.
+  const shop = await shopWithStock('Bharpardo Kirana');
+  const other = await shopWithStock('Aarko Kirana');
+  const plan = await shop.say('चिनी दुई किलो बिक्री भयो');
+
+  // Someone else's item id, smuggled into this shop's plan.
+  const crossShop = await shop.apply(plan.data.planId, [
+    { intent: 'sold', itemId: other.sugar.id, qty: 2 }
+  ]);
+  assert.equal(crossShop.status, 200);
+  assert.deepEqual(crossShop.data.done, [], 'an item from another shop is not reachable');
+  assert.equal(crossShop.data.failed[0].error, 'not_found');
+  assert.equal(await other.stockOf(other.sugar.id), 40, "the other shop's shelf is untouched");
+
+  // A quantity the plan never contained, and a price outside the allowed range.
+  const plan2 = await shop.say('चिनी दुई किलो बिक्री भयो');
+  const tampered = await shop.apply(plan2.data.planId, [
+    { intent: 'sold', itemId: shop.sugar.id, qty: -5 },
+    { intent: 'price', itemId: shop.rice.id, price: 0 }
+  ]);
+  assert.equal(tampered.data.done.length, 0, JSON.stringify(tampered.data));
+  assert.deepEqual(tampered.data.failed.map((f) => f.error).sort(), ['bad_price', 'bad_qty']);
+  assert.equal(await shop.stockOf(shop.sugar.id), 40);
+});
+
+test('speaking a new price changes it, and leaves a trace', async () => {
+  const shop = await shopWithStock('Bhau Kirana');
+  const plan = await shop.say('चिनीको मूल्य एक सय पचास');
+  assert.equal(plan.data.actions.length, 1, JSON.stringify(plan.data));
+  assert.equal(plan.data.actions[0].intent, 'price');
+  assert.equal(plan.data.actions[0].price, 150);
+  assert.equal(plan.data.actions[0].was, 120, 'the old price is shown alongside the new one');
+
+  await shop.apply(plan.data.planId, plan.data.actions);
+  const inv = await api(`/partner/stores/${shop.storeId}/inventory`, { token: shop.token });
+  assert.equal(inv.data.items.find((i) => i.id === shop.sugar.id).price, 150);
+});
+
+test('the shop can be closed and opened by voice', async () => {
+  const shop = await shopWithStock('Banda Kirana');
+  const plan = await shop.say('पसल बन्द गर');
+  assert.equal(plan.data.actions.length, 1, JSON.stringify(plan.data));
+  assert.equal(plan.data.actions[0].intent, 'close');
+  const applied = await shop.apply(plan.data.planId, plan.data.actions);
+  assert.equal(applied.data.open, false);
+
+  const back = await shop.say('पसल खोल');
+  const reopened = await shop.apply(back.data.planId, back.data.actions);
+  assert.equal(reopened.data.open, true);
 });
 
 test('voice parsing needs a real session, not just an Authorization header', async () => {

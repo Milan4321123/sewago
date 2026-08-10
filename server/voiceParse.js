@@ -206,4 +206,15 @@ function parseItemSpeech(text) {
   };
 }
 
-module.exports = { parseItemSpeech, UNIT_WORDS, NUMBER_WORDS };
+module.exports = {
+  parseItemSpeech,
+  // Shared with ./voiceCommand so spoken commands and spoken item lines never
+  // drift into two different ideas of what "दुई किलो" means.
+  tokenize,
+  wordsToNumber,
+  devanagariToAscii,
+  UNIT_WORDS,
+  NUMBER_WORDS,
+  PRICE_WORDS,
+  STOP_WORDS
+};

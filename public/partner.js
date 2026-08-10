@@ -76,7 +76,9 @@ const state = {
   aiDisabled: false, // server said the AI assistant is not configured
   helperForm: false,
   helperInvite: null, // { code, name } from a fresh helper invite
-  voice: { listening: false, heard: '', error: '' }
+  voice: { listening: false, heard: '', error: '' },
+  // The spoken-command flow: what was heard, and the plan awaiting a yes.
+  cmd: { listening: false, heard: '', error: '', busy: false, plan: null }
 };
 
 // The old shell persisted the last-open tab; that key is intentionally no
@@ -2034,6 +2036,7 @@ window.closeStore = () => {
   state.inventory = null;
   state.insights = null;
   state.voice = { listening: false, heard: '', error: '' };
+  state.cmd = { listening: false, heard: '', error: '', busy: false, plan: null };
   state.drafts = null;
   state.itemForm = null;
   state.subAccept = '';
@@ -2144,6 +2147,266 @@ window.aiGenerate = async () => {
     else toast(e.message, true);
     renderKeepingForms();
   }
+};
+
+/* ---------------- speaking to the shop ----------------
+   The shopkeeper says what happened and the shop does it. Everything below is
+   in service of two things: understanding a whole sentence at once, and never
+   moving stock the owner has not seen first. */
+
+// Nepali reads its own digits. "३८ किलो बाँकी" is the sentence a shopkeeper
+// would actually write on the shelf.
+function num(n) {
+  const s = String(n);
+  if (LANG !== 'ne') return s;
+  return s.replace(/\d/g, (d) => '०१२३४५६७८९'[Number(d)]);
+}
+
+// Answering out loud is what makes this feel like help rather than a form.
+// Never critical — a device with no voices just stays quiet.
+function speak(text) {
+  if (!window.speechSynthesis || !text) return;
+  try {
+    const u = new SpeechSynthesisUtterance(text);
+    u.lang = LANG === 'ne' ? 'ne-NP' : 'en-IN';
+    window.speechSynthesis.cancel();
+    window.speechSynthesis.speak(u);
+  } catch (e) { /* speech is a bonus, never a requirement */ }
+}
+
+function unitLabelOf(a) {
+  return a.unitLabel || '';
+}
+
+// One line describing what an action will do, in the shopkeeper's language.
+function actionLine(a) {
+  const unit = esc(unitLabelOf(a));
+  if (a.intent === 'open') return `🟢 <b>${t('Open the shop')}</b>`;
+  if (a.intent === 'close') return `⚫ <b>${t('Close the shop')}</b>`;
+  if (a.intent === 'add') {
+    return `➕ <b>${esc(a.name)}</b> — ${t('new item at Rs {price}', { price: num(a.price) })}`
+      + (a.qty ? ` · ${num(a.qty)} ${esc(a.unit)}` : '');
+  }
+  if (a.intent === 'price') {
+    return `🏷️ <b>${esc(a.itemName)}</b> — ${t('price Rs {was} → Rs {now}', { was: num(a.was), now: num(a.price) })}`;
+  }
+  const verb = a.intent === 'sold' ? t('sold') : a.intent === 'restock' ? t('came in') : t('counted');
+  return `<b>${esc(a.itemName)}</b> — ${num(a.qty)} ${unit} ${verb}`
+    + `<div class="muted small">${num(a.stock)} → <b style="color:var(--text)">${num(a.after)}</b> ${unit}</div>`;
+}
+
+function problemLine(p) {
+  const unit = esc(unitLabelOf(p));
+  if (p.reason === 'not_enough') {
+    return t('{item}: only {stock} {unit} left.', { item: esc(p.itemName), stock: num(p.stock), unit });
+  }
+  if (p.reason === 'need_price') {
+    return t('Say a price for “{what}”.', { what: esc(p.spoken) });
+  }
+  if (p.reason === 'bad_qty') return t('Could not catch how many — say it again.');
+  return t('“{what}” is not on your shelves. Say “new {what} …” with a price to add it.', { what: esc(p.spoken) });
+}
+
+function answerText(a) {
+  if (a.intent === 'low') {
+    if (!a.items.length) return t('Nothing is running low.');
+    return `${t('Running low:')} ${a.items.map((i) => `${i.itemName} (${num(i.stock)} ${i.unitLabel})`).join(', ')}`;
+  }
+  return t('{item}: {stock} {unit} left, Rs {price}.', {
+    item: a.itemName, stock: num(a.stock), unit: a.unitLabel, price: num(a.price)
+  });
+}
+
+window.startCommand = () => {
+  if (!speechSupported()) {
+    state.cmd.error = t('This phone cannot listen — type what you want instead.');
+    return render();
+  }
+  const Rec = window.SpeechRecognition || window.webkitSpeechRecognition;
+  const rec = new Rec();
+  rec.lang = state.voiceLang || 'ne-NP';
+  rec.interimResults = true;
+  rec.continuous = false;
+  state.cmd = { ...state.cmd, listening: true, heard: '', error: '', plan: null };
+  render();
+
+  rec.onresult = (ev) => {
+    let text = '';
+    for (let i = 0; i < ev.results.length; i += 1) text += ev.results[i][0].transcript;
+    state.cmd.heard = text;
+    const line = $('#cmd-heard');
+    if (line) line.textContent = text;
+    if (ev.results[ev.results.length - 1].isFinal) sendCommand(text);
+  };
+  rec.onerror = (ev) => {
+    state.cmd.listening = false;
+    state.cmd.error = ev.error === 'not-allowed'
+      ? t('Microphone blocked — allow it in your browser, or type it instead.')
+      : t('Could not hear that. Try again, or type it.');
+    render();
+  };
+  rec.onend = () => { state.cmd.listening = false; render(); };
+  try { rec.start(); } catch (e) { state.cmd.listening = false; render(); }
+  state.cmdRec = rec;
+};
+
+window.stopCommand = () => {
+  if (state.cmdRec) { try { state.cmdRec.stop(); } catch (e) { /* already stopped */ } }
+  state.cmd.listening = false;
+  render();
+};
+
+async function sendCommand(text) {
+  try {
+    state.cmd.busy = true;
+    const plan = await api(`/api/partner/stores/${state.activeStore}/voice/command`, {
+      method: 'POST', body: { text }
+    });
+    state.cmd.busy = false;
+    state.cmd.listening = false;
+    state.cmd.plan = plan;
+    // A question is finished business: answer it out loud and get out of the way.
+    if (plan.answers.length && !plan.actions.length && !plan.questions.length) {
+      speak(plan.answers.map(answerText).join('. '));
+    }
+    render();
+  } catch (e) {
+    state.cmd.busy = false;
+    state.cmd.error = e.message;
+    render();
+  }
+}
+
+window.typeCommand = () => {
+  const el = $('#cmd-typed');
+  if (el && el.value.trim()) {
+    state.cmd.heard = el.value.trim();
+    sendCommand(el.value.trim());
+  }
+};
+
+// Answering "which dal?" turns the question into a normal action. The server
+// re-checks every field on apply, so building it here is safe.
+window.pickChoice = (qIndex, itemId) => {
+  const plan = state.cmd.plan;
+  if (!plan) return;
+  const q = plan.questions[qIndex];
+  const choice = q.choices.find((c) => c.id === itemId);
+  if (!choice) return;
+  const qty = q.qty === null || q.qty === undefined ? 1 : q.qty;
+  const after = q.intent === 'sold' ? choice.stock - qty
+    : q.intent === 'restock' ? choice.stock + qty
+      : qty;
+  plan.actions.push({
+    intent: q.intent, itemId: choice.id, itemName: choice.name, unit: choice.unit,
+    unitLabel: choice.unitLabel, stock: choice.stock, qty, after, price: q.price
+  });
+  plan.questions.splice(qIndex, 1);
+  render();
+};
+
+window.dismissPlan = () => { state.cmd.plan = null; state.cmd.heard = ''; render(); };
+
+window.applyPlan = async () => {
+  const plan = state.cmd.plan;
+  if (!plan || !plan.actions.length || state.cmd.busy) return;
+  try {
+    state.cmd.busy = true;
+    render();
+    const out = await api(`/api/partner/stores/${state.activeStore}/voice/apply`, {
+      method: 'POST', body: { planId: plan.planId, actions: plan.actions }
+    });
+    state.cmd.busy = false;
+    state.cmd.plan = null;
+    state.cmd.heard = '';
+    const shopToggled = out.done.find((d) => d.intent === 'open' || d.intent === 'close');
+    const said = out.done.length === 1 && !shopToggled
+      ? t('{item} done.', { item: out.done[0].itemName })
+      : t('{n} things done.', { n: num(out.done.length) });
+    toast(out.failed.length ? t('{n} done, {f} could not be', { n: num(out.done.length), f: num(out.failed.length) }) : said);
+    speak(said);
+    await loadInventory(state.activeStore);
+    render();
+  } catch (e) {
+    state.cmd.busy = false;
+    toast(e.message, true);
+    render();
+  }
+};
+
+// The single control this screen is built around.
+function commandCard() {
+  const c = state.cmd;
+  const plan = c.plan;
+  const lang = (state.voiceLang || 'ne-NP') === 'ne-NP' ? 'नेपाली' : 'English';
+  return `
+  <div class="card" style="border-color:var(--accent)">
+    <div class="row">
+      <div style="font-weight:900">${t('Just say it 🎤')}</div>
+      <button class="btn ghost compact" onclick="toggleVoiceLang()">${lang}</button>
+    </div>
+    <div class="muted small" style="margin:6px 0 12px">
+      ${t('Speak like you would to a helper —')}
+      “<b style="color:var(--text)">चिनी दुई किलो बिक्री भयो</b>”,
+      “<b style="color:var(--text)">चामल दश किलो आयो</b>”,
+      “<b style="color:var(--text)">चिनी कति छ</b>”.
+    </div>
+    ${c.listening
+      ? `<button class="btn danger mic-btn listening" onclick="stopCommand()">${t('● Listening… tap when done')}</button>
+         <div class="muted small" id="cmd-heard" style="margin-top:8px;min-height:20px">${esc(c.heard || '')}</div>`
+      : `<button class="btn mic-btn" onclick="startCommand()" ${c.busy ? 'disabled' : ''}>${c.busy ? t('Thinking…') : t('🎤 Tap and speak')}</button>`}
+    ${c.error ? `<div class="muted small" style="color:#fca5a5;margin-top:8px">${esc(c.error)}</div>` : ''}
+    ${plan ? planBlock(plan) : ''}
+    <div class="divider"></div>
+    <label class="field" style="margin:0"><span>${t('…or type it')}</span>
+      <input id="cmd-typed" placeholder="${t('chini 2 kilo bikri bhayo')}" onkeydown="if(event.key==='Enter')typeCommand()" />
+    </label>
+    <button class="btn ghost compact" style="margin-top:8px" onclick="typeCommand()">${t('Do it')}</button>
+  </div>`;
+}
+
+// What it understood, laid out so a glance is enough to say yes.
+function planBlock(plan) {
+  const heard = plan.heard ? `<div class="muted small" style="margin-top:10px">${t('Heard:')} “${esc(plan.heard)}”</div>` : '';
+  const answers = plan.answers.map((a) => `
+    <div class="card" style="margin-top:8px;border-color:var(--accent)">
+      <div style="font-weight:800">${esc(answerText(a))}</div>
+    </div>`).join('');
+  const questions = plan.questions.map((q, i) => `
+    <div class="card" style="margin-top:8px;border-color:#a16207">
+      <div style="font-weight:800">${t('Which one did you mean?')}</div>
+      <div class="muted small" style="margin:4px 0 8px">“${esc(q.spoken)}”</div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap">
+        ${q.choices.map((c) => `
+          <button class="btn ghost compact" onclick="pickChoice(${i},'${c.id}')">
+            ${esc(c.name)} · ${num(c.stock)} ${esc(c.unitLabel)}
+          </button>`).join('')}
+      </div>
+    </div>`).join('');
+  const problems = plan.problems.map((p) => `
+    <div class="muted small" style="color:#fca5a5;margin-top:8px">${problemLine(p)}</div>`).join('');
+  const actions = plan.actions.length ? `
+    <div class="card" style="margin-top:8px">
+      ${plan.actions.map((a, i) => `
+        <div class="row" style="align-items:flex-start;${i ? 'margin-top:10px' : ''}">
+          <div class="grow">${actionLine(a)}</div>
+          <button class="btn ghost compact" onclick="dropAction(${i})">✕</button>
+        </div>`).join('')}
+      <button class="btn" style="margin-top:12px" onclick="applyPlan()" ${state.cmd.busy ? 'disabled' : ''}>
+        ${t('✓ Yes, do it')}
+      </button>
+      <button class="btn ghost compact" style="margin-top:6px" onclick="dismissPlan()">${t('Cancel')}</button>
+    </div>` : '';
+  const nothing = !plan.actions.length && !plan.answers.length && !plan.questions.length && !plan.problems.length
+    ? `<div class="muted small" style="margin-top:8px">${t('Did not catch that. Try naming the item, how many, and what happened.')}</div>`
+    : '';
+  return `${heard}${answers}${questions}${actions}${problems}${nothing}`;
+}
+
+window.dropAction = (i) => {
+  if (!state.cmd.plan) return;
+  state.cmd.plan.actions.splice(i, 1);
+  render();
 };
 
 /* ---------------- voice entry ---------------- */
@@ -2629,6 +2892,7 @@ function subsView() {
 
 function stockTab(inv) {
   return `
+    ${commandCard()}
     ${aiCard()}
     ${voiceCard()}
     ${draftsCard()}

@@ -10,6 +10,7 @@ const { STORE_COMMISSION_PCT, STORE_SERVICE_FEE } = require('../fees');
 const { coordsFor } = require('../places');
 const { resolveLocation } = require('../geo');
 const { parseItemSpeech } = require('../voiceParse');
+const { parseCommands } = require('../voiceCommand');
 const { cleanupPhoto } = require('../photoAI');
 const events = require('../events');
 const { logAudit } = require('../audit');
@@ -471,6 +472,222 @@ router.post('/partner/stores/:id/ai/inventory', authPartner, async (req, res) =>
   } catch (err) {
     res.status(502).json({ error: 'The AI assistant could not be reached — try again.' });
   }
+});
+
+/* ---------------- shopkeeper: voice commands ---------------- */
+
+// Speaking is the whole point of this feature, so the split is deliberate:
+// PLAN resolves what was said against the shop's real shelves and writes
+// nothing; APPLY performs a plan the shopkeeper has seen.
+//
+// The confirm step is not ceremony. Speech recognition mishears numbers more
+// than anything else ("पन्ध्र" / "पचास"), and a silent wrong stock movement is
+// exactly the failure that makes a shopkeeper abandon the feature and go back
+// to tapping. One glance, one tap, for the whole sentence.
+
+const VOICE_MAX_ACTIONS = 20;
+const applied = new Set(); // plan ids already run — see the nonce note below
+
+// A plan can only be applied once. Voice runs on a phone in a shop: a flaky
+// tap or a retried request must never sell the same two kilos twice.
+function planUsed(planId) {
+  if (applied.has(planId)) return true;
+  applied.add(planId);
+  if (applied.size > 5000) {
+    for (const id of applied) {
+      applied.delete(id);
+      if (applied.size <= 2500) break;
+    }
+  }
+  return false;
+}
+
+function itemBrief(item) {
+  return {
+    itemId: item.id,
+    itemName: item.name,
+    unit: item.unit,
+    unitLabel: (UNITS[item.unit] || UNITS.each).label,
+    stock: item.stock,
+    price: item.price
+  };
+}
+
+// Turn one parsed command into something the shopkeeper can confirm, refuse, or
+// read as an answer. Structured, never a sentence: the partner app phrases it
+// through its own Nepali dictionary so the language toggle keeps working.
+function planCommand(store, cmd) {
+  if (cmd.intent === 'open' || cmd.intent === 'close') {
+    return { kind: 'action', intent: cmd.intent, shop: true };
+  }
+  if (cmd.intent === 'low') {
+    const low = store.items
+      .filter((i) => !i.archived && (Number(i.stock) || 0) <= lowStockThreshold(i))
+      .sort((a, b) => (Number(a.stock) || 0) - (Number(b.stock) || 0))
+      .slice(0, 10)
+      .map(itemBrief);
+    return { kind: 'answer', intent: 'low', items: low };
+  }
+  if (cmd.needsPick) {
+    return {
+      kind: 'question',
+      intent: cmd.intent,
+      spoken: cmd.spoken,
+      qty: cmd.qty,
+      price: cmd.price,
+      choices: cmd.needsPick.map((c) => ({ ...c, unitLabel: (UNITS[c.unit] || UNITS.each).label }))
+    };
+  }
+  if (cmd.intent === 'add' && cmd.kind === 'new') {
+    if (!cmd.price) return { kind: 'problem', reason: 'need_price', spoken: cmd.spoken };
+    return {
+      kind: 'action',
+      intent: 'add',
+      name: cmd.spoken,
+      qty: cmd.qty === null ? 0 : cmd.qty,
+      unit: cmd.unit || 'each',
+      price: cmd.price
+    };
+  }
+  if (cmd.error === 'not_found' || !cmd.itemId) {
+    return { kind: 'problem', reason: 'not_found', spoken: cmd.spoken };
+  }
+
+  const item = itemIn(store, cmd.itemId);
+  if (!item || item.archived) return { kind: 'problem', reason: 'not_found', spoken: cmd.spoken };
+  const brief = itemBrief(item);
+
+  if (cmd.intent === 'ask') return { kind: 'answer', intent: 'ask', ...brief };
+
+  if (cmd.intent === 'price') {
+    if (!cmd.price) return { kind: 'problem', reason: 'need_price', spoken: cmd.spoken, ...brief };
+    return { kind: 'action', intent: 'price', ...brief, price: cmd.price, was: item.price };
+  }
+
+  // Saying an item with no number almost always means one of it: "चिनी बिक्री
+  // भयो" is one sale, not an unspecified amount.
+  const qty = cmd.qty === null ? 1 : cmd.qty;
+  if (!Number.isFinite(qty) || qty <= 0 || qty > 100000) {
+    return { kind: 'problem', reason: 'bad_qty', spoken: cmd.spoken, ...brief };
+  }
+
+  if (cmd.intent === 'sold') {
+    if ((Number(item.stock) || 0) < qty) {
+      return { kind: 'problem', reason: 'not_enough', ...brief, qty };
+    }
+    return { kind: 'action', intent: 'sold', ...brief, qty, after: item.stock - qty };
+  }
+  if (cmd.intent === 'restock') {
+    return { kind: 'action', intent: 'restock', ...brief, qty, after: item.stock + qty };
+  }
+  if (cmd.intent === 'count') {
+    return { kind: 'action', intent: 'count', ...brief, qty, after: qty };
+  }
+  return { kind: 'problem', reason: 'not_understood', spoken: cmd.spoken };
+}
+
+router.post('/partner/stores/:id/voice/command', authPartner, (req, res) => {
+  const store = manageableStore(req, res, { helpersAllowed: false });
+  if (!store) return;
+  const text = String((req.body || {}).text || '').trim();
+  if (!text) return res.status(400).json({ error: 'Say what you want to do.' });
+
+  const { commands } = parseCommands(text.slice(0, MAX_SPEECH_CHARS), store);
+  const planned = commands.slice(0, VOICE_MAX_ACTIONS).map((c) => planCommand(store, c));
+  res.json({
+    planId: uid(),
+    heard: text,
+    actions: planned.filter((p) => p.kind === 'action'),
+    answers: planned.filter((p) => p.kind === 'answer'),
+    questions: planned.filter((p) => p.kind === 'question'),
+    problems: planned.filter((p) => p.kind === 'problem')
+  });
+});
+
+// The plan the client sends back states intent; every value in it is checked
+// again here. A confirmed plan is still a request from a browser.
+router.post('/partner/stores/:id/voice/apply', authPartner, (req, res) => {
+  const store = manageableStore(req, res, { helpersAllowed: false });
+  if (!store) return;
+  const body = req.body || {};
+  const planId = String(body.planId || '');
+  if (!planId) return res.status(400).json({ error: 'Say it again — that instruction expired.' });
+  const actions = Array.isArray(body.actions) ? body.actions.slice(0, VOICE_MAX_ACTIONS) : [];
+  if (!actions.length) return res.status(400).json({ error: 'Nothing to do.' });
+  if (planUsed(planId)) {
+    return res.status(409).json({ error: 'That was already done — say it again to repeat it.' });
+  }
+
+  const actor = actorFrom(req);
+  const done = [];
+  const failed = [];
+  for (const a of actions) {
+    const intent = String(a && a.intent);
+    if (intent === 'open' || intent === 'close') {
+      store.open = intent === 'open';
+      done.push({ intent, open: store.open });
+      continue;
+    }
+    if (intent === 'add') {
+      const result = addItem(store, { name: a.name, price: a.price, unit: a.unit, stock: a.qty }, actor);
+      if (result.error) failed.push({ intent, name: a.name, error: result.error });
+      else done.push({ intent, itemId: result.item.id, itemName: result.item.name, after: result.item.stock });
+      continue;
+    }
+
+    const item = itemIn(store, String(a && a.itemId));
+    if (!item || item.archived) {
+      failed.push({ intent, error: 'not_found' });
+      continue;
+    }
+    if (intent === 'price') {
+      const p = Math.round(Number(a.price));
+      if (!Number.isFinite(p) || p < 1 || p > 100000) {
+        failed.push({ intent, itemName: item.name, error: 'bad_price' });
+        continue;
+      }
+      // A price change moves no stock, so without this it would leave no trace
+      // at all — same reasoning as the spoken-restock path above.
+      logAudit({
+        actor: { role: actor.actorKind, id: actor.actorId, email: actor.actorName },
+        action: 'store.item.price_change',
+        targetType: 'store_item',
+        targetId: item.id,
+        meta: { storeId: store.id, name: item.name, from: item.price, to: p, via: 'voice' }
+      });
+      item.price = p;
+      item.updatedAt = Date.now();
+      search.indexItem(store, item);
+      done.push({ intent, itemId: item.id, itemName: item.name, price: p });
+      continue;
+    }
+
+    const qty = Number(a.qty);
+    if (!Number.isFinite(qty) || qty <= 0 || qty > 100000) {
+      failed.push({ intent, itemName: item.name, error: 'bad_qty' });
+      continue;
+    }
+    if (intent === 'sold') {
+      if ((Number(item.stock) || 0) < qty) {
+        failed.push({ intent, itemName: item.name, error: 'not_enough', stock: item.stock });
+        continue;
+      }
+      moveStock(store, item, { qty: -qty, reason: 'sale_counter', ...actor });
+    } else if (intent === 'restock') {
+      moveStock(store, item, { qty, reason: 'restock', ...actor });
+    } else if (intent === 'count') {
+      const delta = qty - (Number(item.stock) || 0);
+      if (delta !== 0) moveStock(store, item, { qty: delta, reason: 'stock_take', ...actor });
+    } else {
+      failed.push({ intent, itemName: item.name, error: 'not_understood' });
+      continue;
+    }
+    done.push({ intent, itemId: item.id, itemName: item.name, after: item.stock });
+  }
+
+  save();
+  events.publish(`partner:${store.ownerId}`, { topic: 'stores' });
+  res.json({ done, failed, stats: storeStats(store), open: store.open !== false });
 });
 
 /* ---------------- shopkeeper: helpers ---------------- */

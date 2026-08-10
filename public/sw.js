@@ -1,4 +1,4 @@
-const CACHE = 'sewago-static-v8';
+const CACHE = 'sewago-static-v9';
 const ASSETS = [
   '/',
   '/driver',
