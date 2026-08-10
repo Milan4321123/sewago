@@ -306,9 +306,15 @@ function scoreItem(queryTokens, item) {
   if (shared) {
     // Every spoken word landing in the name is a strong signal; extra words in
     // the shop's own name (brand, size) should not be punished much.
+    // Coverage carries most of the weight: how much of what they SAID this item
+    // accounts for. Precision (how much of the item's own name was hit) has to
+    // stay minor, or a long rambling sentence sharing one word with a one-word
+    // item name scores like a real match — "aaja bihana dherai grahak aaye,
+    // chini ta sakinai lagyo…" resolving confidently to "Sugar" on the strength
+    // of a single token, with nothing left over to suggest anything was missed.
     const coverage = shared / q.size;
     const precision = shared / it.size;
-    return Math.min(1, 0.6 * coverage + 0.4 * precision + (coverage === 1 ? 0.15 : 0));
+    return Math.min(1, 0.65 * coverage + 0.35 * precision + (coverage === 1 ? 0.15 : 0));
   }
 
   const qs = [...q].join(' ');
@@ -445,6 +451,11 @@ function splitClauses(tokens) {
  * resolved to, so the caller can show the shopkeeper exactly what is about to
  * happen and get one confirmation for the batch.
  */
+// People pause, and speech recognition turns the pause into a comma. Without
+// treating that as a boundary, "chini bikri bhayo, chamal aayo" is one long
+// clause and only the first verb is ever seen.
+const SEGMENT_SPLIT = /[,;।|\n]+/;
+
 function parseCommands(text, store) {
   const items = (store && store.items) || [];
   const allTokens = tokenize(text);
@@ -461,7 +472,10 @@ function parseCommands(text, store) {
   }
 
   const commands = [];
-  for (const clause of splitClauses(allTokens)) {
+  const clauses = String(text)
+    .split(SEGMENT_SPLIT)
+    .flatMap((segment) => splitClauses(tokenize(segment)));
+  for (const clause of clauses) {
     const intent = detectIntent(clause);
     const { qty, unit, price, rest } = extractNumbers(clause);
     const nameTokens = meaningTokens(rest);

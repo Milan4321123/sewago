@@ -810,6 +810,28 @@ test('a new item close to one already stocked is asked about, not merged', async
   assert.equal(same.data.actions[0].after, 15);
 });
 
+test('a pause is a boundary, and a rambling sentence admits what it missed', async () => {
+  // Two bugs found when a real rambling sentence was tried.
+  //
+  // Commas were thrown away with the rest of the punctuation, so everything
+  // after the first verb was swallowed into one clause and never seen.
+  const shop = await shopWithStock('Ramailo Kirana');
+  const commas = await shop.say('chini dui kilo bikri bhayo, chamal das kilo aayo');
+  assert.deepEqual(commas.data.actions.map((a) => [a.intent, a.itemName, a.qty]),
+    [['sold', 'Sugar', 2], ['restock', 'Chamal Basmati', 10]],
+    'a comma separates two jobs exactly like "र" does');
+
+  // And a long sentence sharing ONE word with a one-word item name scored as a
+  // confident match: "…grahak aaye, chini ta sakinai lagyo…" became a flat
+  // "restock Sugar" with nothing flagged — so the shopkeeper got a confident
+  // wrong answer, and the model was never consulted because nothing looked
+  // unexplained.
+  const rambling = await shop.say('aaja bihana dherai grahak aaye chini ta sakinai lagyo sabun pani thorai matra bachyo');
+  const restocks = rambling.data.actions.filter((a) => a.intent === 'restock');
+  assert.deepEqual(restocks, [], 'one word out of eleven is not a confident match');
+  assert.ok(rambling.data.problems.length > 0, 'what it could not place has to be visible, not silently dropped');
+});
+
 test('a question is answered, never acted on', async () => {
   const shop = await shopWithStock('Sodhne Kirana');
   const plan = await shop.say('चिनी कति छ');
