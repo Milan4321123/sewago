@@ -643,11 +643,23 @@ router.post('/partner/stores/:id/voice/command', authPartner, async (req, res) =
   // place a sentence and a model is configured, ask it — but put the answer
   // through the same resolver, so the shop's own record still decides which
   // item is meant and whether it is too ambiguous to act on.
-  if (!wasUnderstood(planned) && ai.aiEnabled() && !aiRateLimited(req.partner.id)) {
+  // Ask the model when the local reading is empty OR only partial. A sentence
+  // where some clauses landed and others did not is the rambling case it is
+  // best at, and shipping the local half would quietly drop the rest of what
+  // the shopkeeper said.
+  const score = (rows) => ({
+    gaps: rows.filter((p) => p.kind === 'problem').length,
+    useful: rows.filter((p) => p.kind !== 'problem').length
+  });
+  const local = score(planned);
+  if ((!wasUnderstood(planned) || local.gaps > 0) && ai.aiEnabled() && !aiRateLimited(req.partner.id)) {
     try {
       const { commands: raw } = await ai.draftCommands({ text: heard, store });
       const aiPlanned = planAll(commandsFromFields(raw, store));
-      if (wasUnderstood(aiPlanned)) {
+      const remote = score(aiPlanned);
+      // Only switch when the second reading is genuinely better: it must place
+      // at least as much and leave no more unexplained than the local one did.
+      if (wasUnderstood(aiPlanned) && remote.gaps <= local.gaps && remote.useful >= local.useful) {
         planned = aiPlanned;
         usedAi = true;
       }

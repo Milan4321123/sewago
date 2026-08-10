@@ -1,4 +1,7 @@
 const Anthropic = require('@anthropic-ai/sdk');
+const gemini = require('./gemini');
+const anthropicAdapter = require('./anthropicAdapter');
+const { runCommandAgent } = require('./aiAgent');
 const { UNITS, reorderSuggestions } = require('./stores');
 
 // Agentic inventory assistant for shopkeepers.
@@ -55,8 +58,26 @@ const SYSTEM_PROMPT = [
   'changes they did not ask for. Set "note" to ONE short sentence explaining what you did.'
 ].join('\n');
 
+// Which model provider this server has, if any.
+//
+// Gemini wins a tie on purpose: its free tier is what makes an AI assistant
+// realistic for a neighbourhood shop in Kathmandu, and this feature is worth
+// nothing to them if it only works on a paid plan. AI_PROVIDER forces one.
+function provider() {
+  const forced = String(process.env.AI_PROVIDER || '').toLowerCase();
+  if (forced === 'gemini') return gemini.enabled() ? 'gemini' : null;
+  if (forced === 'anthropic') return anthropicAdapter.enabled() ? 'anthropic' : null;
+  if (gemini.enabled()) return 'gemini';
+  if (anthropicAdapter.enabled()) return 'anthropic';
+  return null;
+}
+
+function adapterFor(name) {
+  return name === 'gemini' ? gemini : anthropicAdapter;
+}
+
 function aiEnabled() {
-  return !!process.env.ANTHROPIC_API_KEY;
+  return provider() !== null;
 }
 
 // Compact one-line-per-item picture of the shop, plus the reorder maths the
@@ -82,6 +103,7 @@ function inventorySummary(store) {
  * turns them into a 502.
  */
 async function draftInventory({ prompt, store }) {
+  if (provider() === 'gemini') return draftInventoryGemini({ prompt, store });
   // Constructed per-call: new Anthropic() throws when the key is missing, and
   // aiEnabled() is the gate the route checks first.
   const client = new Anthropic();
@@ -108,79 +130,66 @@ async function draftInventory({ prompt, store }) {
   return { items: parsed.items, note: parsed.note };
 }
 
-/* ---------------- spoken commands the local grammar could not place --------- */
-
-// The offline parser in ./voiceCommand handles the sentences a shopkeeper says
-// a hundred times a day, and handles them with no key and no network. This is
-// only for the rest: an unusual phrasing, a sentence that rambles, a mix of
-// three languages in one breath.
-//
-// The model's job is deliberately small — name the item and say what happened.
-// It never sees ids and never decides anything: which shelf line that name
-// means, whether two lines are too alike to choose between, and whether the
-// numbers are sane are all settled locally afterwards, against the shop's own
-// record. So a bad guess here becomes a question or a refusal, never a wrong
-// stock movement.
-const COMMANDS_SCHEMA = {
-  type: 'object',
-  additionalProperties: false,
-  required: ['commands'],
-  properties: {
-    commands: {
-      type: 'array',
+// Same job on Gemini. Structured output arrives as a tool call rather than a
+// JSON body — one tool, called once, which is the shape Gemini is happiest
+// producing and needs no fence-stripping either.
+const DRAFT_ITEMS_TOOL = {
+  name: 'propose_items',
+  description: 'Return the draft item rows for the shopkeeper to review.',
+  parameters: {
+    type: 'object',
+    properties: {
+      note: { type: 'string', description: 'One short sentence on what you did.' },
       items: {
-        type: 'object',
-        additionalProperties: false,
-        required: ['intent', 'item'],
-        properties: {
-          intent: { enum: ['sold', 'restock', 'count', 'price', 'add', 'ask', 'low', 'open', 'close'] },
-          // Copied from the inventory listing when it names something already
-          // stocked; otherwise whatever the shopkeeper called it.
-          item: { type: 'string' },
-          qty: { type: 'number' },
-          unit: { enum: ['each', 'kg', 'g', 'l', 'ml', 'packet', 'dozen', 'bottle', 'sack'] },
-          price: { type: 'integer' }
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            name: { type: 'string' },
+            unit: { type: 'string', enum: Object.keys(UNITS) },
+            price: { type: 'integer' },
+            stock: { type: 'number' },
+            category: { type: 'string' }
+          },
+          required: ['name', 'unit', 'price', 'stock']
         }
       }
-    }
+    },
+    required: ['items']
   }
 };
 
-const COMMAND_PROMPT = [
-  'You turn one spoken sentence from a Nepali kirana shopkeeper into commands on their shop.',
-  'They speak Nepali, romanized Nepali and English, often mixed inside one sentence.',
-  '',
-  'Intents: sold (stock leaves), restock (stock arrives), count (the shelf was counted and',
-  'this is the new total), price (new selling price), add (something not stocked yet),',
-  'ask (how much of an item is left), low (what is running out), open/close (the shop).',
-  '',
-  'Rules:',
-  '- One sentence can carry several commands. Return one per thing that happened.',
-  '- When the shopkeeper means something already in the inventory below, copy that item',
-  '  name EXACTLY as listed. Do not translate it and do not tidy it up.',
-  '- Only set qty/price to numbers actually said. Never invent them.',
-  '- If the sentence is not an instruction about the shop, return an empty list.'
-].join('\n');
-
-/**
- * Best-effort commands for a sentence the local grammar could not place.
- * Returns { commands } — possibly empty. Callers resolve the names themselves.
- */
-async function draftCommands({ text, store }) {
-  const client = new Anthropic();
-  const response = await client.messages.create({
-    model: 'claude-opus-5',
-    max_tokens: 1024,
-    output_config: { format: { type: 'json_schema', schema: COMMANDS_SCHEMA } },
-    system: COMMAND_PROMPT,
-    messages: [
-      { role: 'user', content: `${inventorySummary(store)}\n\nShopkeeper said:\n${text}` }
-    ]
+async function draftInventoryGemini({ prompt, store }) {
+  const reply = await gemini.chat({
+    system: SYSTEM_PROMPT,
+    history: [gemini.userTurn(`${inventorySummary(store)}\n\nShopkeeper's request:\n${prompt}`)],
+    tools: [DRAFT_ITEMS_TOOL],
+    maxTokens: 4096
   });
-  if (response.stop_reason === 'refusal') return { commands: [] };
-  const block = response.content.find((b) => b.type === 'text');
-  if (!block) return { commands: [] };
-  return { commands: JSON.parse(block.text).commands || [] };
+  const call = reply.calls.find((c) => c.name === 'propose_items');
+  if (!call) return { error: 'The assistant returned nothing usable — try again.' };
+  const items = Array.isArray(call.args.items) ? call.args.items : [];
+  return { items, note: call.args.note || '' };
 }
 
-module.exports = { aiEnabled, draftInventory, draftCommands };
+/* ---------------- spoken messages the local grammar could not place -------- */
+
+/**
+ * Best-effort commands for a message the local grammar could not place.
+ *
+ * Runs the grounded loop in ./aiAgent: the model searches the shop's shelves,
+ * reads back real names and counts, then proposes actions BY NAME. Those names
+ * are resolved locally afterwards, so nothing here can reach an item id or move
+ * stock on its own.
+ *
+ * Returns { commands } — possibly empty, which simply means the local reading
+ * stands.
+ */
+async function draftCommands({ text, store }) {
+  const name = provider();
+  if (!name) return { commands: [] };
+  const { actions } = await runCommandAgent({ text, store, adapter: adapterFor(name) });
+  return { commands: Array.isArray(actions) ? actions : [] };
+}
+
+module.exports = { aiEnabled, provider, draftInventory, draftCommands };
