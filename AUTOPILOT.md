@@ -53,6 +53,6 @@ All three worktree branches (`claude/zealous-ishizaka-c363de`, `claude/upbeat-en
 - **Delete the merged branches?** `claude/zealous-ishizaka-c363de`, `claude/upbeat-engelbart-6bf40a`, `claude/confident-neumann-d0f9ec` and their worktrees are fully merged into main.
 - **Nepali as the default partner language** (English one tap away, persisted). Recommendation: keep — confirm before production since existing partners see the flip.
 - **storeOrders retention** — cap in-memory like stockMoves and accept history loss, or archival export first? Recommendation: cap + weekly JSON archive alongside the backup job.
-- `ANTHROPIC_API_KEY` not set in `.env` — partner AI-inventory returns 503 until added.
+- `ANTHROPIC_API_KEY` not set in `.env` — two features stay dormant: partner AI-inventory (returns 503) and the model fallback for spoken commands the local grammar cannot place. Speaking to the shop works fully without a key; the fallback only widens which phrasings are understood.
 - Confirm the Supabase `app_records` migration ran in production and `DATA_STORE=supabase_rows` is live.
 - Live provider credentials pending: Khalti/eSewa, Twilio, Resend; Render deploy + APK build are owner-only.
