@@ -10,9 +10,10 @@ const { STORE_COMMISSION_PCT, STORE_SERVICE_FEE } = require('../fees');
 const { coordsFor } = require('../places');
 const { resolveLocation } = require('../geo');
 const { parseItemSpeech } = require('../voiceParse');
-const { parseCommands } = require('../voiceCommand');
+const { parseCommands, commandsFromFields } = require('../voiceCommand');
 const { cleanupPhoto } = require('../photoAI');
 const events = require('../events');
+const logger = require('../logger');
 const { logAudit } = require('../audit');
 const {
   UNITS, MAX_ITEMS_PER_STORE, isUnit, storeById, itemIn, storeIsLive, storeIsOpen,
@@ -586,17 +587,48 @@ function planCommand(store, cmd) {
   return { kind: 'problem', reason: 'not_understood', spoken: cmd.spoken };
 }
 
-router.post('/partner/stores/:id/voice/command', authPartner, (req, res) => {
+// Did the local grammar actually place the sentence, or just fail politely?
+// A lone "not found" means it heard words but matched nothing — worth a second
+// opinion; a real action or answer never is.
+function wasUnderstood(planned) {
+  return planned.some((p) => p.kind === 'action' || p.kind === 'answer' || p.kind === 'question');
+}
+
+router.post('/partner/stores/:id/voice/command', authPartner, async (req, res) => {
   const store = manageableStore(req, res, { helpersAllowed: false });
   if (!store) return;
   const text = String((req.body || {}).text || '').trim();
   if (!text) return res.status(400).json({ error: 'Say what you want to do.' });
+  const heard = text.slice(0, MAX_SPEECH_CHARS);
 
-  const { commands } = parseCommands(text.slice(0, MAX_SPEECH_CHARS), store);
-  const planned = commands.slice(0, VOICE_MAX_ACTIONS).map((c) => planCommand(store, c));
+  const { commands } = parseCommands(heard, store);
+  let planned = commands.slice(0, VOICE_MAX_ACTIONS).map((c) => planCommand(store, c));
+  let usedAi = false;
+
+  // The offline grammar covers what a shopkeeper says all day. When it cannot
+  // place a sentence and a model is configured, ask it — but put the answer
+  // through the same resolver, so the shop's own record still decides which
+  // item is meant and whether it is too ambiguous to act on.
+  if (!wasUnderstood(planned) && ai.aiEnabled() && !aiRateLimited(req.partner.id)) {
+    try {
+      const { commands: raw } = await ai.draftCommands({ text: heard, store });
+      const resolved = commandsFromFields(raw, store).slice(0, VOICE_MAX_ACTIONS);
+      const aiPlanned = resolved.map((c) => planCommand(store, c));
+      if (wasUnderstood(aiPlanned)) {
+        planned = aiPlanned;
+        usedAi = true;
+      }
+    } catch (err) {
+      // A model that is slow, down or over quota must never break speaking to
+      // the shop — the local reading still stands.
+      logger.warn('voice_ai_fallback_failed', { storeId: store.id, err: err.message });
+    }
+  }
+
   res.json({
     planId: uid(),
     heard: text,
+    usedAi,
     actions: planned.filter((p) => p.kind === 'action'),
     answers: planned.filter((p) => p.kind === 'answer'),
     questions: planned.filter((p) => p.kind === 'question'),

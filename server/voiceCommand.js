@@ -429,39 +429,74 @@ function parseCommands(text, store) {
     }
     if (!nameTokens.length) continue; // nothing nameable in this clause
 
-    const spoken = nameTokens.join(' ');
-    const resolved = resolveItem(nameTokens, items);
-
     // No verb at all: "चिनी कति" is a question, and a bare item with a count is
     // a stock-take ("चिनी पन्ध्र") — the two most common things said with no verb.
-    let effective = intent;
-    if (!effective) effective = qty !== null ? 'count' : 'ask';
-
-    const base = {
-      intent: effective,
-      kind: effective === 'ask' ? 'query' : 'stock',
-      spoken,
-      qty,
-      unit,
-      price
-    };
-
-    if (resolved.item) {
-      commands.push({ ...base, itemId: resolved.item.id, itemName: resolved.item.name, unitOf: resolved.item.unit });
-    } else if (resolved.choices) {
-      commands.push({ ...base, needsPick: resolved.choices.map((i) => ({ id: i.id, name: i.name, unit: i.unit, stock: i.stock })) });
-    } else if (effective === 'add' || (price !== null && qty !== null)) {
-      // Not on the shelves and priced — the shopkeeper is listing something new.
-      commands.push({ ...base, intent: 'add', kind: 'new' });
-    } else {
-      commands.push({ ...base, error: 'not_found' });
-    }
+    const effective = intent || (qty !== null ? 'count' : 'ask');
+    commands.push(resolveClause({ intent: effective, nameTokens, qty, unit, price }, items));
   }
   return { commands };
 }
 
+// Turn one understood clause into a resolved command. Shared by the spoken
+// grammar above and the model-assisted path below, so a sentence that needed
+// help arrives downstream in exactly the same shape as one that did not — and
+// gets the same refusal to guess between two similar items.
+function resolveClause({ intent, nameTokens, qty = null, unit = null, price = null }, items) {
+  const spoken = nameTokens.join(' ');
+  const resolved = resolveItem(nameTokens, items);
+  const base = {
+    intent,
+    kind: intent === 'ask' ? 'query' : 'stock',
+    spoken,
+    qty,
+    unit,
+    price
+  };
+  if (resolved.item) {
+    return { ...base, itemId: resolved.item.id, itemName: resolved.item.name, unitOf: resolved.item.unit };
+  }
+  if (resolved.choices) {
+    return { ...base, needsPick: resolved.choices.map((i) => ({ id: i.id, name: i.name, unit: i.unit, stock: i.stock })) };
+  }
+  if (intent === 'add' || (price !== null && qty !== null)) {
+    // Not on the shelves and priced — the shopkeeper is listing something new.
+    return { ...base, intent: 'add', kind: 'new' };
+  }
+  return { ...base, error: 'not_found' };
+}
+
+/**
+ * Build resolved commands from fields a model produced.
+ *
+ * The model only has to name the item and the intent; every check that protects
+ * the shelf — does this item exist here, is it ambiguous, is the number sane —
+ * still happens locally against the shop's own record.
+ */
+function commandsFromFields(rows, store) {
+  const items = (store && store.items) || [];
+  const out = [];
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const intent = String((row && row.intent) || '');
+    if (intent === 'open' || intent === 'close') { out.push({ intent, kind: 'shop' }); continue; }
+    if (intent === 'low') { out.push({ intent: 'low', kind: 'query' }); continue; }
+    const name = String((row && row.item) || '').trim();
+    if (!name || !intent) continue;
+    const qty = Number(row.qty);
+    const price = Number(row.price);
+    out.push(resolveClause({
+      intent,
+      nameTokens: tokenize(name),
+      qty: Number.isFinite(qty) && qty > 0 ? qty : null,
+      unit: row.unit || null,
+      price: Number.isFinite(price) && price > 0 ? price : null
+    }, items));
+  }
+  return out;
+}
+
 module.exports = {
   parseCommands,
+  commandsFromFields,
   resolveItem,
   scoreItem,
   MATCH_FLOOR

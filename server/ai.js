@@ -108,4 +108,79 @@ async function draftInventory({ prompt, store }) {
   return { items: parsed.items, note: parsed.note };
 }
 
-module.exports = { aiEnabled, draftInventory };
+/* ---------------- spoken commands the local grammar could not place --------- */
+
+// The offline parser in ./voiceCommand handles the sentences a shopkeeper says
+// a hundred times a day, and handles them with no key and no network. This is
+// only for the rest: an unusual phrasing, a sentence that rambles, a mix of
+// three languages in one breath.
+//
+// The model's job is deliberately small — name the item and say what happened.
+// It never sees ids and never decides anything: which shelf line that name
+// means, whether two lines are too alike to choose between, and whether the
+// numbers are sane are all settled locally afterwards, against the shop's own
+// record. So a bad guess here becomes a question or a refusal, never a wrong
+// stock movement.
+const COMMANDS_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['commands'],
+  properties: {
+    commands: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['intent', 'item'],
+        properties: {
+          intent: { enum: ['sold', 'restock', 'count', 'price', 'add', 'ask', 'low', 'open', 'close'] },
+          // Copied from the inventory listing when it names something already
+          // stocked; otherwise whatever the shopkeeper called it.
+          item: { type: 'string' },
+          qty: { type: 'number' },
+          unit: { enum: ['each', 'kg', 'g', 'l', 'ml', 'packet', 'dozen', 'bottle', 'sack'] },
+          price: { type: 'integer' }
+        }
+      }
+    }
+  }
+};
+
+const COMMAND_PROMPT = [
+  'You turn one spoken sentence from a Nepali kirana shopkeeper into commands on their shop.',
+  'They speak Nepali, romanized Nepali and English, often mixed inside one sentence.',
+  '',
+  'Intents: sold (stock leaves), restock (stock arrives), count (the shelf was counted and',
+  'this is the new total), price (new selling price), add (something not stocked yet),',
+  'ask (how much of an item is left), low (what is running out), open/close (the shop).',
+  '',
+  'Rules:',
+  '- One sentence can carry several commands. Return one per thing that happened.',
+  '- When the shopkeeper means something already in the inventory below, copy that item',
+  '  name EXACTLY as listed. Do not translate it and do not tidy it up.',
+  '- Only set qty/price to numbers actually said. Never invent them.',
+  '- If the sentence is not an instruction about the shop, return an empty list.'
+].join('\n');
+
+/**
+ * Best-effort commands for a sentence the local grammar could not place.
+ * Returns { commands } — possibly empty. Callers resolve the names themselves.
+ */
+async function draftCommands({ text, store }) {
+  const client = new Anthropic();
+  const response = await client.messages.create({
+    model: 'claude-opus-5',
+    max_tokens: 1024,
+    output_config: { format: { type: 'json_schema', schema: COMMANDS_SCHEMA } },
+    system: COMMAND_PROMPT,
+    messages: [
+      { role: 'user', content: `${inventorySummary(store)}\n\nShopkeeper said:\n${text}` }
+    ]
+  });
+  if (response.stop_reason === 'refusal') return { commands: [] };
+  const block = response.content.find((b) => b.type === 'text');
+  if (!block) return { commands: [] };
+  return { commands: JSON.parse(block.text).commands || [] };
+}
+
+module.exports = { aiEnabled, draftInventory, draftCommands };
