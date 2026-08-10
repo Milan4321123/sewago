@@ -15,7 +15,11 @@
 // behind an in-country proxy can point elsewhere.
 const DEFAULT_ENDPOINT = 'https://generativelanguage.googleapis.com/v1beta/models';
 const endpoint = () => process.env.GEMINI_ENDPOINT || DEFAULT_ENDPOINT;
-const model = () => process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+// An alias, not a pinned version. Google retires specific models to new users
+// without warning — "gemini-2.5-flash is no longer available to new users" is
+// exactly how this first broke — and a shop should not need a code change to
+// keep working. `-latest` always resolves to the current flash model.
+const model = () => process.env.GEMINI_MODEL || 'gemini-flash-latest';
 
 function apiKey() {
   return process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || '';
@@ -49,7 +53,7 @@ function toGeminiSchema(schema) {
  * plus any tool calls it wants made, and the content block to append to the
  * history so the next turn sees what it said.
  */
-async function chat({ system, history, tools = [], maxTokens = 1024, timeoutMs = 20000 }) {
+async function chat({ system, history, tools = [], maxTokens = 2048, timeoutMs = 20000 }) {
   const body = {
     contents: history,
     generationConfig: {
@@ -98,7 +102,14 @@ async function chat({ system, history, tools = [], maxTokens = 1024, timeoutMs =
   const parts = (candidate && candidate.content && candidate.content.parts) || [];
   const calls = parts
     .filter((p) => p.functionCall)
-    .map((p) => ({ name: p.functionCall.name, args: p.functionCall.args || {} }));
+    // Gemini 3.x tags each call with an id and matches the response on it;
+    // older versions match on name alone. Only carry the key when it exists, so
+    // a call object never has an `id: undefined` to trip up comparisons.
+    .map((p) => {
+      const call = { name: p.functionCall.name, args: p.functionCall.args || {} };
+      if (p.functionCall.id) call.id = p.functionCall.id;
+      return call;
+    });
   const text = parts.filter((p) => typeof p.text === 'string').map((p) => p.text).join('').trim();
   return { text, calls, content: candidate && candidate.content ? candidate.content : { role: 'model', parts } };
 }
@@ -109,7 +120,13 @@ async function chat({ system, history, tools = [], maxTokens = 1024, timeoutMs =
 const userTurn = (text) => ({ role: 'user', parts: [{ text }] });
 const toolResult = (call, response) => ({
   role: 'user',
-  parts: [{ functionResponse: { name: call.name, response } }]
+  parts: [{
+    functionResponse: {
+      ...(call.id ? { id: call.id } : {}),
+      name: call.name,
+      response
+    }
+  }]
 });
 
 module.exports = { enabled, chat, userTurn, toolResult, model };

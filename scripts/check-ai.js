@@ -33,6 +33,36 @@ const STORE = {
 
 const SENTENCE = 'aaja bihana dherai grahak aaye, chini ta sakinai lagyo, sabun pani thorai matra bachyo';
 
+// Which models this key is actually entitled to. Model availability changes
+// under you — pinned versions get closed to new users — so the fix for a 404 is
+// to ask rather than to guess.
+async function listModels() {
+  const key = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || '';
+  const base = process.env.GEMINI_ENDPOINT || 'https://generativelanguage.googleapis.com/v1beta/models';
+  const res = await fetch(`${base}?key=${encodeURIComponent(key)}&pageSize=200`);
+  if (!res.ok) return [];
+  const data = await res.json();
+  return (data.models || [])
+    .filter((m) => (m.supportedGenerationMethods || []).includes('generateContent'))
+    .map((m) => m.name.replace(/^models\//, ''))
+    // Image, speech, music and robotics variants cannot answer a shopkeeper.
+    .filter((n) => !/(image|tts|lyria|robotics|computer-use|embedding)/i.test(n));
+}
+
+// The free tier's per-minute allowance is small. Worth saying plainly, because
+// it is the one failure that is not a misconfiguration — and the app is built
+// so it does not matter: the local grammar answers, the model is only ever a
+// second opinion.
+function explain(message) {
+  if (/RESOURCE_EXHAUSTED|quota|rate.?limit/i.test(message)) {
+    console.log(info('That is the free tier\'s per-minute quota, not a broken setup.'));
+    console.log(info('Wait a minute and run this again. In the app it is harmless:'));
+    console.log(info('the local Nepali grammar still answers, and the model is skipped.'));
+    return true;
+  }
+  return false;
+}
+
 async function main() {
   console.log('\nSewaGo — AI assistant check\n');
 
@@ -61,16 +91,28 @@ async function main() {
     try {
       const reply = await gemini.chat({
         history: [gemini.userTurn('Reply with the single word: OK')],
-        maxTokens: 16
+        // Not 16: current models spend part of the budget thinking before they
+        // emit anything, and a tight cap comes back blank — which reads like a
+        // failure when the call actually succeeded.
+        maxTokens: 256
       });
-      console.log(ok(`Reached Gemini (${gemini.model()}) — replied ${JSON.stringify(reply.text.slice(0, 40))}`));
+      const said = reply.text ? JSON.stringify(reply.text.slice(0, 40)) : '(no text, but the call succeeded)';
+      console.log(ok(`Reached Gemini (${gemini.model()}) — replied ${said}`));
     } catch (err) {
       console.log(bad(`Could not reach Gemini: ${err.message}`));
-      if (/API_KEY_INVALID|API key not valid/i.test(err.message)) {
+      if (explain(err.message)) { /* said above */ } else if (/API_KEY_INVALID|API key not valid/i.test(err.message)) {
         console.log(info('The key itself was rejected. Re-copy it from https://aistudio.google.com/apikey'));
-      } else if (/is not found|NOT_FOUND/i.test(err.message)) {
-        console.log(info(`Your key cannot reach "${gemini.model()}". Try another, e.g.:`));
-        console.log(info('  GEMINI_MODEL=gemini-2.0-flash'));
+      } else if (/is not found|NOT_FOUND|no longer available/i.test(err.message)) {
+        // Guessing a replacement wastes everyone's time — ask the key itself.
+        console.log(info(`Your key cannot reach "${gemini.model()}". Asking Google what it can reach…`));
+        const usable = await listModels().catch(() => []);
+        if (usable.length) {
+          console.log(info('Models available to this key (text-capable):'));
+          for (const m of usable.slice(0, 12)) console.log(info(`  ${m}`));
+          console.log(info(''));
+          console.log(info('Unset GEMINI_MODEL in .env to use the default alias (gemini-flash-latest),'));
+          console.log(info(`or pin one, e.g.  GEMINI_MODEL=${usable[0]}`));
+        }
       } else if (/SERVICE_DISABLED|has not been used/i.test(err.message)) {
         console.log(info('Enable the Generative Language API for this key\'s Google project.'));
       }
@@ -109,7 +151,7 @@ async function main() {
     // And the safety boundary those proposals still have to pass.
     const resolved = commandsFromFields(actions, STORE);
     for (const c of resolved) {
-      if (c.kind === 'query' || c.kind === 'shop') {
+      if (c.kind === 'shop' || c.intent === 'low') {
         console.log(info(`  ${c.intent} (about the shop itself)`));
         continue;
       }
@@ -120,7 +162,9 @@ async function main() {
     }
     console.log(`\n${ok('Working. The shop can be talked to.')}\n`);
   } catch (err) {
-    console.log(bad(`The tool loop failed: ${err.message}\n`));
+    console.log(bad(`The tool loop failed: ${err.message}`));
+    explain(err.message);
+    console.log('');
     process.exitCode = 1;
   }
 }

@@ -190,6 +190,10 @@ test('the Gemini request is shaped the way Google expects', async () => {
     });
 
     assert.match(calledUrl, /generativelanguage\.googleapis\.com/);
+    // The default must stay an ALIAS, never a pinned version: Google closes
+    // specific models to new users without notice, and that is exactly how this
+    // broke in the field ("gemini-2.5-flash is no longer available to new users").
+    assert.match(calledUrl, /gemini-[a-z-]*latest:/, 'default model must be a -latest alias');
     assert.match(calledUrl, /:generateContent\?key=test-key$/);
     assert.equal(sent.systemInstruction.parts[0].text, 'be useful');
     assert.equal(sent.generationConfig.temperature, 0, 'stock movements must not vary run to run');
