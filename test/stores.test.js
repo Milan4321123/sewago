@@ -832,6 +832,26 @@ test('a pause is a boundary, and a rambling sentence admits what it missed', asy
   assert.ok(rambling.data.problems.length > 0, 'what it could not place has to be visible, not silently dropped');
 });
 
+test('a shopkeeper narrating — “आज मैले … किनेर ल्याएको” — is understood', async () => {
+  // Reported from real use. Stock arriving is usually described as buying it,
+  // and the sentence is told as a little story: who, when, then the goods. None
+  // of "आज", "मैले", "किनेर" or "ल्याएको" were known words, so all four ended up
+  // inside the item name and nothing matched.
+  const shop = await shopWithStock('Kinera Lyayeko Kirana');
+  const told = await shop.say('आज मैले चिनी किनेर ल्याएको दुई किलो');
+  assert.equal(told.data.actions.length, 1, JSON.stringify(told.data));
+  assert.equal(told.data.actions[0].intent, 'restock');
+  assert.equal(told.data.actions[0].itemName, 'Sugar');
+  assert.equal(told.data.actions[0].qty, 2);
+  assert.equal(told.data.actions[0].after, 42);
+
+  // "पनि" (also) and "पानी" (water) are different words that transliterate the
+  // same way, so the filler list carries only the Devanagari spelling of "also"
+  // — otherwise a shop selling water could never be told about it.
+  const alsoCame = await shop.say('चिनी पनि आयो');
+  assert.equal(alsoCame.data.actions[0].itemName, 'Sugar', '“पनि” must not be read as water');
+});
+
 test('a question is answered, never acted on', async () => {
   const shop = await shopWithStock('Sodhne Kirana');
   const plan = await shop.say('चिनी कति छ');

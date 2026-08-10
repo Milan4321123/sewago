@@ -40,8 +40,13 @@ const INTENT_WORDS = {
     'bikri', 'bikyo', 'bech', 'bechen', 'becheko', 'gayo', 'gaye', 'sold', 'sell', 'sale', 'out'
   ],
   restock: [
-    'आयो', 'आए', 'आएको', 'ल्याएँ', 'ल्याए', 'थपियो', 'थप', 'थपें', 'भित्रियो', 'लोड',
-    'aayo', 'aaye', 'aayeko', 'lyaye', 'thap', 'thapiyo', 'thapen',
+    'आयो', 'आए', 'आएको', 'ल्याएँ', 'ल्याए', 'ल्याएको', 'ल्याइयो', 'ल्याउनु',
+    'थपियो', 'थप', 'थपें', 'भित्रियो', 'लोड',
+    // Stock arriving is very often described as buying it: "किनेर ल्याएको"
+    // (bought and brought). Leaving these out sent the verb into the item name.
+    'किनें', 'किनेँ', 'किनेको', 'किनेर', 'किन्यो', 'किन्न',
+    'aayo', 'aaye', 'aayeko', 'lyaye', 'lyaeko', 'lyaayeko', 'lyaiyo',
+    'kinen', 'kineko', 'kiner', 'kinera', 'kinyo', 'bought', 'buy',
     'restock', 'came', 'arrived', 'received', 'stocked', 'delivery'
   ],
   price: [
@@ -76,6 +81,14 @@ const FILLER = new Set([
   'भयो', 'भए', 'भो', 'bhayo', 'bhaye', 'bho', 'हो', 'ho', 'छ', 'chha', 'cha', 'छन्',
   'गर', 'गर्नु', 'गरिदेऊ', 'gar', 'garnu', 'garidew', 'देऊ', 'dew', 'दे',
   'को', 'का', 'की', 'ko', 'ka', 'ki', 'लाई', 'lai', 'मा', 'ma',
+  // Who and when. A shopkeeper narrates — "आज मैले … ल्याएको" — and every one
+  // of these words used to end up inside the item's name.
+  'आज', 'aaja', 'aaj', 'हिजो', 'hijo', 'भोलि', 'bholi', 'बिहान', 'bihana', 'बेलुका',
+  'मैले', 'maile', 'मैँले', 'हामीले', 'म', 'मेरो', 'mero', 'हाम्रो',
+  'यो', 'yo', 'त्यो', 'tyo', 'नै', 'nai', 'ता', 'मात्र', 'matra', 'सबै', 'जम्मा',
+  // "पनि" (also) only in Devanagari: romanised "pani" is how people write
+  // पानी (water), and the shop sells one of those.
+  'पनि',
   'please', 'the', 'a', 'is', 'are', 'me', 'my', 'to', 'of', 'now', 'today'
 ]);
 
