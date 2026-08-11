@@ -3585,6 +3585,66 @@ function itemBars(rows) {
 // come with real timestamps and are bucketed by the PHONE's clock, so "10 AM"
 // means 10 AM in the shop, wherever the server lives. One switch flips the
 // whole report between today / this week / this month — per item every time.
+// The one number a shopkeeper cannot get from his cash box: of everything that
+// sold, how much stays his. Counter sales are his entirely; app orders carry
+// SewaGo's commission, so the two are shown separately rather than blended.
+function takeHomeCard(tot) {
+  if (!tot || !tot.revenue) return '';
+  const commission = tot.commission || 0;
+  return `
+  <div class="card" style="border-color:var(--accent)">
+    <div class="muted small">${t('You keep')}</div>
+    <div style="font-size:26px;font-weight:900;color:var(--accent)">${money(tot.takeHome || 0)}</div>
+    <div class="muted small" style="margin-top:4px">
+      ${t('of {total} sold', { total: money(tot.revenue || 0) })}${
+        commission ? ` · ${t('SewaGo took {n}', { n: money(commission) })}` : ` · ${t('all of it — counter sales carry no commission')}`}
+    </div>
+    ${tot.walkinUnits ? `<div class="muted small" style="margin-top:6px">${t('Counter sales are valued at today\'s shelf price.')}</div>` : ''}
+  </div>`;
+}
+
+// Which shelf earns. Bars, not a table — the ranking is the whole message.
+function insightCategories(categories) {
+  const rows = (categories || []).filter((c) => c.revenue > 0);
+  if (rows.length < 2) return '';
+  const max = Math.max(...rows.map((r) => r.revenue), 1);
+  return `
+  <div class="card">
+    <div style="font-weight:900">${t('Which shelf earns')} 🧺</div>
+    ${rows.map((r) => `
+      <div class="cat-bar-row">
+        <span class="cat-bar-label">${esc(t(r.category))}</span>
+        <span class="hbar-track"><div style="width:${Math.round((r.revenue / max) * 100)}%"></div></span>
+        <b>${money(r.revenue)}</b>
+      </div>`).join('')}
+  </div>`;
+}
+
+// Am I doing better than last week? One arrow, no chart.
+function weekArrow(week) {
+  if (!week || (!week.units && !week.lastUnits)) return '';
+  const now = week.units || 0;
+  const before = week.lastUnits || 0;
+  const pct = before > 0 ? Math.round(((now - before) / before) * 100) : null;
+  const up = now >= before;
+  return `
+  <div class="card">
+    <div style="font-weight:900">${t('This week against last')} 📈</div>
+    <div class="row" style="margin-top:8px">
+      <div>
+        <div style="font-size:22px;font-weight:900">${now}</div>
+        <div class="muted small">${t('sold in the last 7 days')}</div>
+      </div>
+      <div class="rt">
+        <div style="font-size:15px;font-weight:900;color:${up ? 'var(--accent)' : 'var(--danger)'}">
+          ${pct === null ? '—' : `${up ? '↑' : '↓'} ${Math.abs(pct)}%`}
+        </div>
+        <div class="muted small">${t('last week {n}', { n: before })}</div>
+      </div>
+    </div>
+  </div>`;
+}
+
 function insightsView() {
   const ins = state.insights;
   if (!ins) return `<div class="empty">${t('Loading…')}</div>`;
@@ -3674,6 +3734,12 @@ function insightsView() {
       <div class="muted small">${t('{n} app orders', { n: tot.orders || 0 })}</div>
     </div>
   </div>
+
+  ${takeHomeCard(tot)}
+
+  ${insightCategories(ins.categories)}
+
+  ${weekArrow(ins.week)}
 
   <div class="card">
     <div style="font-weight:900">${t('When things sold today')} 🕐</div>

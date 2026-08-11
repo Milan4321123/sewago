@@ -1581,6 +1581,23 @@ a.link { text-decoration: none; }
   cursor: pointer;
 }
 
+/* "Which shelf earns" — label, bar, amount on one line each. */
+.cat-bar-row {
+  display: grid;
+  grid-template-columns: minmax(72px, 88px) minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  margin-top: 9px;
+  font-size: 12px;
+}
+.cat-bar-label {
+  color: var(--muted);
+  font-weight: 750;
+  overflow-wrap: anywhere;
+}
+.cat-bar-row .hbar-track { margin-top: 0; }
+.cat-bar-row b { font-size: 12px; white-space: nowrap; }
+
 /* Assistant entry strip — sits BELOW the shelf so the goods come first.
    Two buttons, two jobs: say something, or draft a whole supplier bill. */
 .assist-strip {

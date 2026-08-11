@@ -283,6 +283,44 @@ function salesInsights(store, sinceMs) {
   }
   items.sort((a, b) => b.revenue30 - a.revenue30 || b.qty30 - a.qty30);
 
+  // WHAT THE SHOP ACTUALLY KEEPS. Turnover is the number a shopkeeper already
+  // knows from the cash box; what he cannot work out is how much of it stays
+  // his after SewaGo's cut. Only app orders carry a commission — a walk-in sale
+  // over the counter is his entirely — so the two are counted separately and
+  // the walk-in half stays labelled an estimate (counter sales record no price).
+  let appRevenue = 0;
+  let commission = 0;
+  for (const id of orderIds) {
+    const order = ordersById.get(id);
+    if (!order) continue;
+    appRevenue += Number(order.subtotal) || 0;
+    commission += Number(order.commission) || 0;
+  }
+
+  // WHICH SHELF EARNS. The same per-item revenue, grouped the way the shelf is
+  // organised, so "snacks earn more than rice" is answerable at a glance.
+  const byCategory = new Map();
+  for (const row of topItems) {
+    const item = itemsById.get(row.itemId);
+    const key = (item && item.category) || 'Other';
+    byCategory.set(key, (byCategory.get(key) || 0) + row.revenue);
+  }
+  const categories = [...byCategory.entries()]
+    .map(([category, rev]) => ({ category, revenue: Math.round(rev) }))
+    .sort((a, b) => b.revenue - a.revenue);
+
+  // THIS WEEK AGAINST LAST. One arrow says more than a chart: the daily buckets
+  // already hold 30 days, so the comparison is free.
+  const unitsIn = (from, to) => {
+    let n = 0;
+    for (let i = from; i < to; i += 1) {
+      for (const item of store.items) n += ((item.salesDaily || {})[dayKeys[i]] || 0);
+    }
+    return Math.round(n * 10) / 10;
+  };
+  const thisWeek = unitsIn(0, 7);
+  const lastWeek = unitsIn(7, 14);
+
   return {
     since,
     totals: {
@@ -290,8 +328,15 @@ function salesInsights(store, sinceMs) {
       revenue: Math.round(revenue),
       orders: orderIds.size,
       walkinUnits: Math.round(walkinUnits * 100) / 100,
-      orderUnits: Math.round(orderUnits * 100) / 100
+      orderUnits: Math.round(orderUnits * 100) / 100,
+      // Everything the shop keeps: every counter rupee, plus app sales less
+      // the commission booked on them.
+      takeHome: Math.round(revenue - commission),
+      commission: Math.round(commission),
+      appRevenue: Math.round(appRevenue)
     },
+    categories,
+    week: { units: thisWeek, lastUnits: lastWeek },
     topItems,
     events,
     daily,

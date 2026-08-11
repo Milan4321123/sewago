@@ -187,6 +187,53 @@ test('counter sales and restocks keep the number on screen matching the shelf', 
   assert.ok(reasons.includes('initial_count'));
 });
 
+test('insights say what the shop KEEPS, and which shelf earned it', async () => {
+  // Turnover is the number a shopkeeper already knows from the cash box. What
+  // he cannot work out is how much stays his once SewaGo has taken its cut.
+  const shop = await openShop();
+  const mk = (name, price, category) => api(`/partner/stores/${shop.storeId}/items`, {
+    method: 'POST', token: shop.token, body: { name, unit: 'kg', price, stock: 50, category }
+  });
+  const rice = (await mk('Insight Chamal', 100, 'Rice & Grains')).data.item.id;
+  const snack = (await mk('Insight Chips', 50, 'Snacks')).data.item.id;
+
+  // One app order (carries commission) and one counter sale (does not).
+  const { token: cust } = await registerUser('insight-buyer');
+  const order = await api('/store-orders', {
+    method: 'POST', token: cust,
+    body: { storeId: shop.storeId, items: [{ itemId: rice, qty: 4 }], payment: 'wallet' }
+  });
+  assert.equal(order.status, 200, JSON.stringify(order.data));
+  await api(`/partner/store-orders/${order.data.order.id}/accept`, { method: 'POST', token: shop.token });
+  await api(`/partner/stores/${shop.storeId}/items/${snack}/sold`, {
+    method: 'POST', token: shop.token, body: { qty: 2 }
+  });
+
+  const ins = await api(`/partner/stores/${shop.storeId}/insights?since=${Date.now() - 3600000}`, { token: shop.token });
+  const tot = ins.data.totals;
+  // 4 kg rice at 100 through the app + 2 kg chips at 50 over the counter.
+  assert.equal(tot.revenue, 500, 'turnover counts both channels');
+  // Commission is 8% of the order subtotal on this test server; the counter
+  // sale carries none, so take-home is everything minus that one commission.
+  assert.equal(tot.commission, 32, '8% of the Rs 400 app order');
+  assert.equal(tot.takeHome, 468, 'the shop keeps the counter sale whole and the app sale less commission');
+  assert.equal(tot.takeHome + tot.commission, tot.revenue, 'the split always adds back up');
+
+  // And the same money grouped the way the shelf is organised.
+  const cats = Object.fromEntries(ins.data.categories.map((c) => [c.category, c.revenue]));
+  assert.equal(cats['Rice & Grains'], 400);
+  assert.equal(cats.Snacks, 100);
+  assert.equal(
+    ins.data.categories.reduce((n, c) => n + c.revenue, 0), tot.revenue,
+    'every rupee lands on exactly one shelf'
+  );
+
+  // This week against last, from the daily buckets.
+  assert.ok(ins.data.week, 'the week comparison is present');
+  assert.equal(ins.data.week.units, 6, 'six units moved in the last seven days');
+  assert.equal(ins.data.week.lastUnits, 0, 'nothing the week before on a fresh shop');
+});
+
 test('a shopkeeper can fix, recategorise and retire an item; a helper cannot', async () => {
   // The app could never change any of this until now, so a mis-heard voice item
   // was permanent and nothing could be filed into a category - which is what the
