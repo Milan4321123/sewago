@@ -62,6 +62,7 @@ const state = {
   activeStore: null, // store id -> opens the full-screen inventory manager
   inventory: null, // { items, stats, units, open, status }
   invSearch: '',
+  invCategory: 'all', // all | low | an item category
   invTab: 'stock', // stock | reorder | subs | insights
   reorder: null,
   insights: null, // today's sales, fetched when the insights tab opens
@@ -71,6 +72,7 @@ const state = {
   subReqs: {}, // storeId -> { requests, pendingByItem }
   subAccept: '', // subscription request id with the price inline-form open
   itemForm: null, // { id, kind:'restock'|'price'|'sub' } inline-form on an item row
+  itemPhotoBusy: '', // item id whose shelf photo is uploading
   drafts: null, // { source:'voice'|'ai', note, items:[…] } — the shared review table
   aiBusy: false,
   aiDisabled: false, // server said the AI assistant is not configured
@@ -2015,14 +2017,16 @@ async function loadStores() {
 
 async function loadInventory() {
   if (!state.activeStore) return;
-  const q = state.invSearch ? `?q=${encodeURIComponent(state.invSearch)}` : '';
-  state.inventory = await api(`/api/partner/stores/${state.activeStore}/inventory${q}`);
+  // Keep one complete shelf locally. Search and category taps must feel
+  // instant and must never replace the focused input after every letter.
+  state.inventory = await api(`/api/partner/stores/${state.activeStore}/inventory`);
 }
 
 window.openStore = async (id) => {
   state.activeStore = id;
   state.invTab = 'stock';
   state.invSearch = '';
+  state.invCategory = 'all';
   try {
     await loadInventory();
     // Badge on the Subscriptions tab — best-effort, never blocks the shelves.
@@ -2031,9 +2035,10 @@ window.openStore = async (id) => {
   } catch (e) { toast(e.message, true); }
 };
 
-window.closeStore = () => {
+window.closeStore = (shouldRender = true) => {
   state.activeStore = null;
   state.inventory = null;
+  state.invCategory = 'all';
   state.insights = null;
   state.voice = { listening: false, heard: '', error: '' };
   state.cmd = { listening: false, heard: '', error: '', busy: false, plan: null };
@@ -2042,7 +2047,12 @@ window.closeStore = () => {
   state.subAccept = '';
   state.helperForm = false;
   state.helperInvite = null;
-  render();
+  if (shouldRender) render();
+};
+
+window.openShopOrders = () => {
+  closeStore(false);
+  setTab('orders');
 };
 
 window.setInvTab = async (tab) => {
@@ -2221,43 +2231,11 @@ function answerText(a) {
 }
 
 window.startCommand = () => {
-  if (!speechSupported()) {
-    state.cmd.error = t('This phone cannot listen — type what you want instead.');
-    return render();
-  }
-  const Rec = window.SpeechRecognition || window.webkitSpeechRecognition;
-  const rec = new Rec();
-  rec.lang = state.voiceLang || 'ne-NP';
-  rec.interimResults = true;
-  rec.continuous = false;
-  state.cmd = { ...state.cmd, listening: true, heard: '', error: '', plan: null };
-  render();
-
-  rec.onresult = (ev) => {
-    let text = '';
-    for (let i = 0; i < ev.results.length; i += 1) text += ev.results[i][0].transcript;
-    state.cmd.heard = text;
-    const line = $('#cmd-heard');
-    if (line) line.textContent = text;
-    if (ev.results[ev.results.length - 1].isFinal) sendCommand(text);
-  };
-  rec.onerror = (ev) => {
-    state.cmd.listening = false;
-    state.cmd.error = ev.error === 'not-allowed'
-      ? t('Microphone blocked — allow it in your browser, or type it instead.')
-      : t('Could not hear that. Try again, or type it.');
-    render();
-  };
-  rec.onend = () => { state.cmd.listening = false; render(); };
-  try { rec.start(); } catch (e) { state.cmd.listening = false; render(); }
-  state.cmdRec = rec;
+  state.cmd.plan = null;
+  startSpeechSession('cmd', sendCommand);
 };
 
-window.stopCommand = () => {
-  if (state.cmdRec) { try { state.cmdRec.stop(); } catch (e) { /* already stopped */ } }
-  state.cmd.listening = false;
-  render();
-};
+window.stopCommand = () => stopSpeechSession('cmd', sendCommand);
 
 async function sendCommand(text) {
   try {
@@ -2447,44 +2425,135 @@ function speechSupported() {
   return !!(window.SpeechRecognition || window.webkitSpeechRecognition);
 }
 
-window.startVoice = () => {
+// Chrome may end Web Speech after only a few seconds of initial silence. A
+// shopkeeper should be able to tap first, turn to the shelf, and then speak, so
+// transparently restart recognition for a generous window. Speech is kept on
+// screen until the shopkeeper taps done, matching the button's promise.
+const SPEECH_START_WINDOW_MS = 30000;
+
+function speechError(target, error) {
+  if (error === 'not-allowed' || error === 'service-not-allowed') {
+    return target === 'cmd'
+      ? t('Microphone blocked — allow it in your browser, or type it instead.')
+      : t('Microphone blocked — allow it in your browser, or type the item.');
+  }
+  return target === 'cmd'
+    ? t('Could not hear that. Try again, or type it.')
+    : t('Could not hear that. Try again, or type the item.');
+}
+
+function startSpeechSession(target, onText) {
   if (!speechSupported()) {
-    state.voice.error = t('This phone cannot listen — type the item instead.');
+    state[target].error = target === 'cmd'
+      ? t('This phone cannot listen — type what you want instead.')
+      : t('This phone cannot listen — type the item instead.');
     return render();
   }
+
+  // Stop an older recognizer before replacing it (for example after a fast
+  // double tap). Its guarded finish callback will then do nothing.
+  const old = state[`${target}Rec`];
+  if (old && old._cancel) old._cancel();
+
   const Rec = window.SpeechRecognition || window.webkitSpeechRecognition;
   const rec = new Rec();
+  const deadline = Date.now() + SPEECH_START_WINDOW_MS;
+  let finished = false;
+  let timer;
+  let savedText = '';
+
   rec.lang = state.voiceLang || 'ne-NP';
   rec.interimResults = true;
-  rec.continuous = false;
-  state.voice = { ...state.voice, listening: true, heard: '', error: '' };
-  render();
+  // The UI says "tap when done", so do not let the browser decide that a
+  // short pause means the whole shop command is finished.
+  rec.continuous = true;
+  state[target] = { ...state[target], listening: true, heard: '', error: '' };
+  state[`${target}Rec`] = rec;
+
+  const finish = ({ text = '', error = '' } = {}) => {
+    if (finished) return;
+    finished = true;
+    clearTimeout(timer);
+    state[target].listening = false;
+    if (error) state[target].error = error;
+    if (state[`${target}Rec`] === rec) state[`${target}Rec`] = null;
+    try { rec.stop(); } catch (e) { /* already stopped */ }
+    render();
+    if (text.trim()) onText(text.trim());
+  };
+
+  rec._cancel = () => {
+    finished = true;
+    clearTimeout(timer);
+    try { rec.abort(); } catch (e) { /* already stopped */ }
+  };
+  rec._finishWithHeard = () => finish({ text: state[target].heard || '' });
 
   rec.onresult = (ev) => {
-    let text = '';
-    for (let i = 0; i < ev.results.length; i += 1) text += ev.results[i][0].transcript;
-    state.voice.heard = text;
-    const line = $('#voice-heard');
+    let finalText = '';
+    let interimText = '';
+    for (let i = 0; i < ev.results.length; i += 1) {
+      const part = ev.results[i][0].transcript.trim();
+      if (ev.results[i].isFinal) finalText += `${part} `;
+      else interimText += `${part} `;
+    }
+    const text = `${savedText} ${finalText}${interimText}`.trim();
+    state[target].heard = text;
+    const line = $(`#${target === 'cmd' ? 'cmd' : 'voice'}-heard`);
     if (line) line.textContent = text;
-    if (ev.results[ev.results.length - 1].isFinal) submitVoiceText(text);
   };
+
   rec.onerror = (ev) => {
-    state.voice.listening = false;
-    state.voice.error = ev.error === 'not-allowed'
-      ? t('Microphone blocked — allow it in your browser, or type the item.')
-      : t('Could not hear that. Try again, or type the item.');
-    render();
+    // Silence and brief speech-service/network interruptions are retryable.
+    // onend restarts the recognizer instead of flashing an error immediately.
+    if (['no-speech', 'network', 'aborted'].includes(ev.error) && Date.now() < deadline) return;
+    if (ev.error === 'aborted' && finished) return;
+    finish({ error: speechError(target, ev.error) });
   };
-  rec.onend = () => { state.voice.listening = false; render(); };
-  try { rec.start(); } catch (e) { state.voice.listening = false; render(); }
-  state.voiceRec = rec;
+
+  rec.onend = () => {
+    if (finished) return;
+    if (Date.now() < deadline) {
+      savedText = state[target].heard.trim();
+      setTimeout(() => {
+        if (finished) return;
+        try { rec.start(); } catch (e) {
+          finish({ error: speechError(target, 'start-failed') });
+        }
+      }, 150);
+      return;
+    }
+    finish({
+      text: state[target].heard || '',
+      error: state[target].heard.trim() ? '' : speechError(target, 'no-speech')
+    });
+  };
+
+  timer = setTimeout(() => finish({
+    text: state[target].heard || '',
+    error: state[target].heard.trim() ? '' : speechError(target, 'no-speech')
+  }), SPEECH_START_WINDOW_MS);
+
+  render();
+  try { rec.start(); } catch (e) {
+    finish({ error: speechError(target, 'start-failed') });
+  }
+}
+
+function stopSpeechSession(target, onText) {
+  const rec = state[`${target}Rec`];
+  if (rec && rec._finishWithHeard) return rec._finishWithHeard();
+  const heard = String(state[target].heard || '').trim();
+  state[target].listening = false;
+  render();
+  if (heard) onText(heard);
+}
+
+window.startVoice = () => {
+  startSpeechSession('voice', submitVoiceText);
 };
 
-window.stopVoice = () => {
-  if (state.voiceRec) { try { state.voiceRec.stop(); } catch (e) { /* already stopped */ } }
-  state.voice.listening = false;
-  render();
-};
+window.stopVoice = () => stopSpeechSession('voice', submitVoiceText);
 
 window.toggleVoiceLang = () => {
   state.voiceLang = (state.voiceLang || 'ne-NP') === 'ne-NP' ? 'en-IN' : 'ne-NP';
@@ -2708,9 +2777,142 @@ window.confirmSubPrice = async (itemId) => {
   } catch (e) { toast(e.message, true); }
 };
 
-window.searchInventory = async () => {
-  state.invSearch = ($('#inv-search') || {}).value || '';
-  try { await loadInventory(); renderKeepingForms(); } catch (e) { toast(e.message, true); }
+function normalizedShelfText(value) {
+  return String(value || '')
+    .toLocaleLowerCase()
+    .normalize('NFKD')
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .trim();
+}
+
+// Search ranking is deliberately predictable: exact/prefix matches first,
+// then a word prefix, then ordinary containment. The category remains useful
+// search context without outranking the actual product name.
+function shelfSearchRank(item, rawQuery) {
+  const q = normalizedShelfText(rawQuery);
+  if (!q) return 0;
+  const name = normalizedShelfText(item.name);
+  const category = normalizedShelfText(item.category);
+  if (name === q) return 0;
+  if (name.startsWith(q)) return 1;
+  if (name.split(' ').some((word) => word.startsWith(q))) return 2;
+  if (name.includes(q)) return 3;
+  if (category.startsWith(q)) return 4;
+  if (category.includes(q)) return 5;
+  return Infinity;
+}
+
+function visibleInventoryItems() {
+  const items = ((state.inventory && state.inventory.items) || []).slice();
+  const category = state.invCategory || 'all';
+  const filtered = items.filter((item) => {
+    if (category === 'low' && !item.low) return false;
+    if (!['all', 'low'].includes(category) && (item.category || 'Other') !== category) return false;
+    return Number.isFinite(shelfSearchRank(item, state.invSearch));
+  });
+  return filtered.sort((a, b) => {
+    const rank = shelfSearchRank(a, state.invSearch) - shelfSearchRank(b, state.invSearch);
+    if (rank) return rank;
+    return Number(b.low) - Number(a.low) || a.name.localeCompare(b.name);
+  });
+}
+
+function categoryCounts() {
+  const items = (state.inventory && state.inventory.items) || [];
+  const counts = new Map();
+  for (const item of items) {
+    const category = item.category || 'Other';
+    counts.set(category, (counts.get(category) || 0) + 1);
+  }
+  return counts;
+}
+
+function categoryChips() {
+  const items = (state.inventory && state.inventory.items) || [];
+  const counts = categoryCounts();
+  const low = items.filter((item) => item.low).length;
+  const chips = [
+    ['all', t('All'), items.length],
+    ...(low ? [['low', t('Low stock'), low]] : []),
+    ...[...counts.entries()]
+      .sort((a, b) => a[0].localeCompare(b[0]))
+      .map(([category, count]) => [category, t(category), count])
+  ];
+  return chips.map(([value, label, count]) => `
+    <button class="category-chip ${state.invCategory === value ? 'active' : ''}"
+      onclick="setInvCategory(decodeURIComponent('${encodeURIComponent(value)}'))">${esc(label)} <b>${count}</b></button>`).join('');
+}
+
+function inventoryResults() {
+  const items = visibleInventoryItems();
+  const total = ((state.inventory && state.inventory.items) || []).length;
+  const summary = state.invSearch || state.invCategory !== 'all'
+    ? t('{n} of {total} items', { n: items.length, total })
+    : t('{n} items', { n: total });
+  return `
+    <div class="inventory-results-head">
+      <span id="inventory-count">${summary}</span>
+      ${(state.invSearch || state.invCategory !== 'all') ? `<button class="link" onclick="clearInventoryFilters()">${t('Clear')}</button>` : ''}
+    </div>
+    <div class="inventory-list">
+      ${items.length ? items.map(itemRow).join('') : `
+      <div class="empty compact-empty"><div class="big">🔎</div>${t('No matching items. Keep typing or clear the filters.')}</div>`}
+    </div>`;
+}
+
+function updateInventoryBrowser() {
+  const categories = $('#inventory-categories');
+  const results = $('#inventory-results');
+  const clear = $('#inventory-search-clear');
+  if (categories) categories.innerHTML = categoryChips();
+  if (results) results.innerHTML = inventoryResults();
+  if (clear) clear.classList.toggle('hidden', !state.invSearch);
+}
+
+window.searchInventory = (event) => {
+  state.invSearch = event && event.target ? event.target.value : (($('#inv-search') || {}).value || '');
+  updateInventoryBrowser();
+};
+
+window.setInvCategory = (category) => {
+  state.invCategory = category || 'all';
+  updateInventoryBrowser();
+};
+
+window.clearInventoryFilters = () => {
+  state.invSearch = '';
+  state.invCategory = 'all';
+  const input = $('#inv-search');
+  if (input) {
+    input.value = '';
+    input.focus({ preventScroll: true });
+  }
+  updateInventoryBrowser();
+};
+
+window.inventorySearchKey = (event) => {
+  if (event.key === 'Escape') clearInventoryFilters();
+};
+
+window.pickItemPhoto = async (event, itemId) => {
+  const file = (event.target.files || [])[0];
+  if (!file) return;
+  state.itemPhotoBusy = itemId;
+  updateInventoryBrowser();
+  try {
+    const blob = await downscaleImage(file, 900, 0.82);
+    const photo = await uploadPhotoBlob(blob);
+    const result = await api(`/api/partner/stores/${state.activeStore}/items/${itemId}/photo`, {
+      method: 'POST', body: { photo }
+    });
+    await loadInventory();
+    toast(result.item && result.item.cleaned ? t('Photo cleaned and saved ✨') : t('Photo saved 📷'));
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    state.itemPhotoBusy = '';
+    updateInventoryBrowser();
+  }
 };
 
 /* ---------------- helpers (staff) ---------------- */
@@ -2768,6 +2970,7 @@ function helperBlock() {
 function itemRow(i) {
   const stock = Number(i.stock) || 0;
   const out = stock <= 0;
+  const photoBusy = state.itemPhotoBusy === i.id;
   const asks = ((state.subReqs[state.activeStore] || {}).pendingByItem || {})[i.id] || 0;
   // The level bar answers "do I need to buy this?" at a glance. Full means a
   // comfortable three times the low-stock mark; the colour is the verdict:
@@ -2779,25 +2982,34 @@ function itemRow(i) {
   const level = out || stock <= mark ? 'low' : stock <= mark * 2 ? 'mid' : 'ok';
   const numColor = level === 'low' ? 'var(--danger)' : level === 'mid' ? 'var(--amber)' : 'var(--text)';
   return `
-  <div class="card" style="${level === 'low' ? 'border-color:#7f1d1d' : level === 'mid' ? 'border-color:#a16207' : ''}">
-    <div class="row">
-      <div class="grow">
-        <div style="font-weight:800">${esc(i.name)}</div>
-        <div class="muted small">
-          ${money(i.price)} / ${esc(t(i.unitLabel))}${i.subscribePrice ? ` · 🔁 ${money(i.subscribePrice)} ${t('for subscribers')}` : ''}
+  <div class="card inventory-item ${level}" data-item-id="${esc(i.id)}">
+    <div class="inventory-item-main">
+      <label class="item-photo ${i.photo ? 'has-photo' : ''} ${photoBusy ? 'busy' : ''}" title="${t('Add or change photo')}">
+        ${i.photo
+          ? `<img src="${esc(i.photo)}" alt="${esc(i.name)}" />`
+          : `<span class="item-photo-placeholder">${photoBusy ? '…' : '📦'}</span>`}
+        <span class="item-photo-camera">${photoBusy ? '⏳' : '📷'}</span>
+        <input type="file" accept="image/*" capture="environment" ${photoBusy ? 'disabled' : ''}
+          onchange="pickItemPhoto(event, '${i.id}')" />
+      </label>
+      <div class="inventory-item-copy">
+        <div class="inventory-item-name">${esc(i.name)}</div>
+        <div class="inventory-item-meta">
+          ${money(i.price)} / ${esc(t(i.unitLabel))}${i.subscribePrice ? ` · 🔁 ${money(i.subscribePrice)}` : ''}
         </div>
+        ${i.category ? `<button class="item-category" onclick="setInvCategory(decodeURIComponent('${encodeURIComponent(i.category)}'))">${esc(t(i.category))}</button>` : `<span class="item-category muted">${t('Other')}</span>`}
       </div>
-      <div style="text-align:right">
-        <div style="font-size:20px;font-weight:900;color:${numColor}">${i.stock}</div>
-        <div class="muted small">${esc(t(i.unitLabel))} ${t('left')}</div>
+      <div class="inventory-stock" style="--stock-color:${numColor}">
+        <strong>${i.stock}</strong>
+        <span>${esc(t(i.unitLabel))} ${t('left')}</span>
         <div class="stock-meter ${level}"><div style="width:${pct}%"></div></div>
       </div>
     </div>
     ${out ? `<div class="muted small" style="color:#fca5a5;margin-top:6px">${t('Out of stock — customers cannot order it')}</div>`
       : level === 'low' ? `<div class="muted small" style="color:#fca5a5;margin-top:6px">${t('Running low — reorder soon')}</div>` : ''}
     ${asks ? `<div class="muted small" style="color:var(--accent);margin-top:6px">🔁 ${t('{n} customers asking to subscribe — see the Subscriptions tab', { n: asks })}</div>` : ''}
-    <div style="display:flex;gap:6px;margin-top:10px;flex-wrap:wrap">
-      <button class="btn compact" onclick="markSold('${i.id}', 1)" ${out ? 'disabled' : ''}>${t('Sold 1')}</button>
+    <div class="inventory-item-actions">
+      <button class="btn compact sold-action" onclick="markSold('${i.id}', 1)" ${out ? 'disabled' : ''}>✓ ${t('Sold 1')}</button>
       <button class="btn ghost compact" onclick="openItemForm('${i.id}','restock')">${t('+ Stock')}</button>
       <button class="btn ghost compact" onclick="openItemForm('${i.id}','price')">${t('Price')}</button>
       <button class="btn ghost compact" title="${t('Subscriber price')}" onclick="openItemForm('${i.id}','sub')">🔁</button>
@@ -2925,11 +3137,19 @@ function stockTab(inv) {
     ${aiCard()}
     ${voiceCard()}
     ${draftsCard()}
-    <label class="field" style="margin-top:12px"><span>${t('Find an item')}</span>
-      <input id="inv-search" value="${esc(state.invSearch)}" placeholder="${t('Search your shelves')}" oninput="searchInventory()" />
-    </label>
-    ${inv.items.length ? inv.items.map(itemRow).join('')
-      : `<div class="empty"><div class="big">📦</div>${state.invSearch ? t('Nothing matches that.') : t('No items yet — speak your first one above.')}</div>`}
+    <section class="inventory-browser" aria-label="${t('Browse inventory')}">
+      <div class="inventory-browser-controls">
+        <div class="inventory-search-wrap">
+          <span aria-hidden="true">⌕</span>
+          <input id="inv-search" value="${esc(state.invSearch)}" autocomplete="off" spellcheck="false"
+            placeholder="${t('Type a name — results appear instantly')}" oninput="searchInventory(event)" onkeydown="inventorySearchKey(event)" />
+          <button id="inventory-search-clear" class="inventory-search-clear ${state.invSearch ? '' : 'hidden'}"
+            onclick="clearInventoryFilters()" aria-label="${t('Clear search')}">✕</button>
+        </div>
+        <div class="category-strip" id="inventory-categories">${categoryChips()}</div>
+      </div>
+      <div id="inventory-results" aria-live="polite">${inventoryResults()}</div>
+    </section>
     <div class="divider"></div>
     ${helperBlock()}`;
 }
@@ -2940,6 +3160,8 @@ function inventoryView() {
   if (!inv) return `<div class="empty">${t('Loading…')}</div>`;
   const st = inv.stats || {};
   const subsPending = pendingSubCount(state.activeStore);
+  const liveOrders = state.storeOrders.filter((o) => o.storeId === state.activeStore && ['placed', 'accepted', 'ready'].includes(o.status));
+  const newOrders = liveOrders.filter((o) => o.status === 'placed').length;
   return `
     <header class="topbar">
       <button class="btn ghost compact" onclick="closeStore()">${t('← Shops')}</button>
@@ -2956,6 +3178,16 @@ function inventoryView() {
         </div>
         <button class="btn ghost compact" onclick="toggleShopOpen(${inv.open ? 'false' : 'true'})">${inv.open ? t('Close shop') : t('Open shop')}</button>
       </div>
+
+      ${liveOrders.length ? `
+      <button class="shop-order-alert ${newOrders ? 'urgent' : ''}" onclick="openShopOrders()">
+        <span class="shop-order-alert-icon">${newOrders ? '🔔' : '📦'}</span>
+        <span class="grow">
+          <strong>${newOrders ? t('{n} new orders need you', { n: newOrders }) : t('{n} orders in progress', { n: liveOrders.length })}</strong>
+          <small>${newOrders ? t('Tap to accept before the customer waits') : t('Open the order inbox')}</small>
+        </span>
+        <span aria-hidden="true">→</span>
+      </button>` : ''}
 
       ${store.locPinned ? '' : `
       <div class="card" style="border-color:var(--accent);margin-bottom:12px">

@@ -15,6 +15,15 @@ const { UNITS, reorderSuggestions } = require('./stores');
 // Structured outputs pin the response to ITEMS_SCHEMA, so the reply text is
 // guaranteed-valid JSON — no fence-stripping, no retry-on-parse-error loops.
 
+// A small stable taxonomy keeps AI-created items useful as navigation chips.
+// Free-form labels quickly fragment into "Drinks", "Beverages", "Cold drink",
+// etc., which looks intelligent in a draft but makes the actual shop harder to
+// browse. "Other" is an honest fallback when none of these fit.
+const INVENTORY_CATEGORIES = [
+  'Rice & Grains', 'Spices & Oil', 'Snacks', 'Drinks', 'Dairy & Eggs',
+  'Vegetables', 'Household', 'Personal Care', 'Baby & Health', 'Other'
+];
+
 // The model may only answer in this shape. Units mirror ./stores UNITS.
 const ITEMS_SCHEMA = {
   type: 'object',
@@ -33,7 +42,7 @@ const ITEMS_SCHEMA = {
           unit: { enum: ['each', 'kg', 'g', 'l', 'ml', 'packet', 'dozen', 'bottle', 'sack'] },
           price: { type: 'integer' },
           stock: { type: 'number' },
-          category: { type: 'string' }
+          category: { type: 'string', enum: INVENTORY_CATEGORIES }
         }
       }
     }
@@ -53,6 +62,8 @@ const SYSTEM_PROMPT = [
   '  exactly so the rows merge into the existing lines, set stock to the suggested reorder',
   '  quantity, and keep the current price.',
   '- Adjust PRICES: reuse the existing name and unit exactly, set the new price, stock 0.',
+  `- CATEGORY: always choose exactly one of: ${INVENTORY_CATEGORIES.join(', ')}.`,
+  '  Use the product itself and the shop context, not just one ambiguous word in its name.',
   '',
   'Every row is a draft the shopkeeper reviews before saving — never invent restocks or price',
   'changes they did not ask for. Set "note" to ONE short sentence explaining what you did.'
@@ -149,7 +160,7 @@ const DRAFT_ITEMS_TOOL = {
             unit: { type: 'string', enum: Object.keys(UNITS) },
             price: { type: 'integer' },
             stock: { type: 'number' },
-            category: { type: 'string' }
+            category: { type: 'string', enum: INVENTORY_CATEGORIES }
           },
           required: ['name', 'unit', 'price', 'stock']
         }

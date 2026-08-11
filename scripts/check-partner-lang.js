@@ -43,7 +43,10 @@ const DYNAMIC_KEYS = [
   // t(status.toUpperCase()) — businessKycStatus
   'PENDING', 'APPROVED', 'REJECTED',
   // unit labels (server UNITS + client UNIT_LABELS feed t())
-  'pcs', 'kg', 'g', 'litre', 'ml', 'packet', 'dozen', 'bottle', 'sack', 'bora'
+  'pcs', 'kg', 'g', 'litre', 'ml', 'packet', 'dozen', 'bottle', 'sack', 'bora',
+  // categoryChips() / itemRow() — category values come from inventory data
+  'Rice & Grains', 'Spices & Oil', 'Snacks', 'Drinks', 'Dairy & Eggs',
+  'Vegetables', 'Household', 'Personal Care', 'Baby & Health'
 ];
 
 // Every literal first argument of a t( call, both quote styles, unescaped.

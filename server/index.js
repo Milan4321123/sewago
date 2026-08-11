@@ -92,7 +92,7 @@ app.use((req, res, next) => {
     'X-Content-Type-Options': 'nosniff',
     'X-Frame-Options': 'DENY',
     'Referrer-Policy': 'no-referrer',
-    'Permissions-Policy': 'geolocation=(self), camera=(), microphone=(), payment=()',
+    'Permissions-Policy': 'geolocation=(self), camera=(), microphone=(self), payment=()',
     'Content-Security-Policy': CSP
   });
   if (config.isProduction && config.trustProxy) {
