@@ -55,6 +55,7 @@ const state = {
   confirmReject: '', // order id with the reject inline-form open
   confirmRemove: '', // listing id with the remove inline-form open
   confirmArchive: '', // item id whose "retire this item" confirmation is open
+  showPastOrders: false, // in-shop Orders tab: finished orders expanded
   pickupFor: '', // store order id with the pickup-code inline-form open
   groupSplit: '', // group order id with the who-pays-what breakdown open
   // General store (kirana) inventory
@@ -2057,16 +2058,16 @@ window.closeStore = (shouldRender = true) => {
   if (shouldRender) render();
 };
 
-window.openShopOrders = () => {
-  closeStore(false);
-  setTab('orders');
-};
+// The alert at the top of a shop now opens that shop's own order tab instead
+// of throwing the shopkeeper out to the account-wide list.
+window.openShopOrders = () => setInvTab('orders');
 
 window.setInvTab = async (tab) => {
   state.invTab = tab;
   state.itemForm = null;
   render();
   try {
+    if (tab === 'orders') await loadStoreOrders();
     if (tab === 'reorder') state.reorder = await api(`/api/partner/stores/${state.activeStore}/reorder`);
     if (tab === 'subs') await loadSubscribeRequests();
     if (tab === 'insights') {
@@ -3376,6 +3377,33 @@ function subsView() {
 
 /* ---------------- inventory takeover ---------------- */
 
+// Orders for THIS shop, without leaving it. They used to live only in the
+// account-wide Orders page, merged with restaurant orders from a different
+// business — so working a shop meant leaving it, filtering by eye, and coming
+// back. Live ones first, because those are the ones a customer is waiting on.
+function shopOrdersTab() {
+  const mine = state.storeOrders.filter((o) => o.storeId === state.activeStore);
+  const live = mine.filter((o) => ['placed', 'accepted', 'ready'].includes(o.status));
+  const past = mine.filter((o) => !['placed', 'accepted', 'ready'].includes(o.status));
+  if (!mine.length) {
+    return `<div class="empty"><div class="big">🧾</div>${t('No orders yet. They appear here the moment a customer buys.')}</div>`;
+  }
+  return `
+    ${live.length
+      ? live.map(storeOrderCard).join('')
+      : `<div class="empty compact-empty"><div class="big">✅</div>${t('Nothing waiting — every order is dealt with.')}</div>`}
+    ${past.length ? `
+      <button class="btn ghost compact" style="margin-top:12px" onclick="togglePastOrders()">
+        ${state.showPastOrders ? t('Hide past orders') : t('Past orders ({n})', { n: past.length })}
+      </button>
+      ${state.showPastOrders ? past.slice(0, 20).map(storeOrderCard).join('') : ''}` : ''}`;
+}
+
+window.togglePastOrders = () => {
+  state.showPastOrders = !state.showPastOrders;
+  render();
+};
+
 // THE SHELF COMES FIRST. This tab used to open with three assistant cards
 // stacked above the goods — measured on a 375x812 phone, the search box sat
 // 1,238px down and the first item 1,383px down, so a shopkeeper scrolled past
@@ -3485,12 +3513,14 @@ function inventoryView() {
       </div>
 
       <div class="pipe-tabs">
+        <button class="${state.invTab === 'orders' ? 'active' : ''}" onclick="setInvTab('orders')">${t('Order')}${newOrders ? ` <b class="tab-badge">${newOrders}</b>` : ''}</button>
         <button class="${state.invTab === 'stock' ? 'active' : ''}" onclick="setInvTab('stock')">${t('Stock')}</button>
         <button class="${state.invTab === 'reorder' ? 'active' : ''}" onclick="setInvTab('reorder')">${t('To buy')}${state.reorder && state.reorder.suggestions.length ? ` <b class="tab-badge">${state.reorder.suggestions.length}</b>` : ''}</button>
         <button class="${state.invTab === 'subs' ? 'active' : ''}" onclick="setInvTab('subs')">${t('Subs')}${subsPending ? ` <b class="tab-badge">${subsPending}</b>` : ''}</button>
-        <button class="${state.invTab === 'insights' ? 'active' : ''}" onclick="setInvTab('insights')">📊 ${t('Insights')}</button>
+        <button class="${state.invTab === 'insights' ? 'active' : ''}" onclick="setInvTab('insights')">${t('Insights')}</button>
       </div>
 
+      ${state.invTab === 'orders' ? shopOrdersTab() : ''}
       ${state.invTab === 'stock' ? stockTab(inv) : ''}
       ${state.invTab === 'reorder' ? reorderView() : ''}
       ${state.invTab === 'subs' ? subsView() : ''}
