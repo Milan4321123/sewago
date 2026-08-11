@@ -1530,6 +1530,31 @@ a.link { text-decoration: none; }
   cursor: pointer;
 }
 .inventory-search-clear.hidden { display: none; }
+/* Assistant entry strip — sits BELOW the shelf so the goods come first.
+   Two buttons, two jobs: say something, or draft a whole supplier bill. */
+.assist-strip {
+  display: flex;
+  gap: 8px;
+  margin: 14px 0 0;
+}
+.assist-tab {
+  flex: 1;
+  padding: 11px 10px;
+  border: 1px solid var(--border);
+  border-radius: 13px;
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--muted);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 800;
+  cursor: pointer;
+}
+.assist-tab.active {
+  border-color: rgba(52, 211, 153, 0.5);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
 .category-strip {
   display: flex;
   gap: 7px;

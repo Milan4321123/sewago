@@ -2,17 +2,10 @@
   "version": "0.0.1",
   "configurations": [
     {
-      "name": "sewago",
-      "runtimeExecutable": "npm",
-      "runtimeArgs": ["start"],
-      "port": 4000,
-      "autoPort": true
-    },
-    {
       "name": "sewago-local",
       "runtimeExecutable": "npm",
       "runtimeArgs": ["run", "dev"],
-      "port": 4000,
+      "port": 4010,
       "autoPort": true
     }
   ]

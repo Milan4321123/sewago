@@ -79,6 +79,7 @@ const state = {
   helperForm: false,
   helperInvite: null, // { code, name } from a fresh helper invite
   voice: { listening: false, heard: '', error: '' },
+  assistOpen: null, // which assistant card is expanded below the shelf: 'say' | 'many' | null
   // The spoken-command flow: what was heard, and the plan awaiting a yes.
   cmd: { listening: false, heard: '', error: '', busy: false, plan: null }
 };
@@ -2151,6 +2152,7 @@ window.aiGenerate = async () => {
       : { source: 'ai', note: d.note || '', items: rows };
     state.aiBusy = false;
     render();
+    showDrafts();
   } catch (e) {
     state.aiBusy = false;
     if (e.status === 503) state.aiDisabled = true; // not configured — hide the card
@@ -2572,7 +2574,16 @@ async function submitVoiceText(text) {
     state.voice.listening = false;
     state.voice.heard = '';
     render();
+    showDrafts();
   } catch (e) { toast(e.message, true); }
+}
+
+// The draft table sits above the shelf, so a draft produced from the assistant
+// strip at the bottom would otherwise land off-screen and look like nothing
+// happened. Bring it into view.
+function showDrafts() {
+  const card = document.querySelector('.drafts-card');
+  if (card) card.scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
 window.typeVoiceLine = () => {
@@ -2617,7 +2628,7 @@ function draftsCard() {
   const units = (state.inventory && state.inventory.units) || {};
   const warn = (row, f) => ((row.needsReview || []).includes(f) ? 'warn' : '');
   return `
-  <div class="card" style="border-color:var(--accent);margin-top:12px">
+  <div class="card drafts-card" style="border-color:var(--accent);margin-top:12px">
     <div style="font-weight:900">${d.source === 'ai' ? t('🤖 AI draft — check before saving') : t('Check before saving')}</div>
     ${d.note ? `<div class="muted small" style="margin-top:4px">${esc(d.note)}</div>` : ''}
     <div class="muted small" style="margin-top:4px">${t("Nothing is saved yet — fix any cell, drop rows you don't want.")}</div>
@@ -3131,11 +3142,14 @@ function subsView() {
 
 /* ---------------- inventory takeover ---------------- */
 
+// THE SHELF COMES FIRST. This tab used to open with three assistant cards
+// stacked above the goods — measured on a 375x812 phone, the search box sat
+// 1,238px down and the first item 1,383px down, so a shopkeeper scrolled past
+// a screen and a half of robot boxes to reach his own stock every single time.
+// The assistants are still one tap away in the strip below the shelf; drafts
+// they produce jump back to the top, because a draft needs a decision.
 function stockTab(inv) {
   return `
-    ${commandCard()}
-    ${aiCard()}
-    ${voiceCard()}
     ${draftsCard()}
     <section class="inventory-browser" aria-label="${t('Browse inventory')}">
       <div class="inventory-browser-controls">
@@ -3150,9 +3164,32 @@ function stockTab(inv) {
       </div>
       <div id="inventory-results" aria-live="polite">${inventoryResults()}</div>
     </section>
+    ${assistStrip()}
     <div class="divider"></div>
     ${helperBlock()}`;
 }
+
+// One entry point for every way of talking to the shop, so the shelf is not
+// buried under three always-open cards. Two jobs, two buttons:
+//   "Say it"    — the command agent: sold / received / price / how many / open
+//                 / close, spoken or typed, always confirmed before it writes.
+//   "Add many"  — bulk drafting from a supplier bill: speak the lines or type
+//                 them, review the table, save. Both feed the same draft table.
+function assistStrip() {
+  const open = state.assistOpen;
+  return `
+  <div class="assist-strip">
+    <button class="assist-tab ${open === 'say' ? 'active' : ''}" onclick="toggleAssist('say')">🎤 ${t('Say it')}</button>
+    <button class="assist-tab ${open === 'many' ? 'active' : ''}" onclick="toggleAssist('many')">📋 ${t('Add many')}</button>
+  </div>
+  ${open === 'say' ? commandCard() : ''}
+  ${open === 'many' ? `${aiCard()}${voiceCard()}` : ''}`;
+}
+
+window.toggleAssist = (which) => {
+  state.assistOpen = state.assistOpen === which ? null : which;
+  renderKeepingForms();
+};
 
 function inventoryView() {
   const inv = state.inventory;

@@ -530,6 +530,8 @@ window.SEWAGO_NE = {
 
   /* ---- speaking to the shop ---- */
   'Just say it 🎤': 'भन्नुहोस् मात्र 🎤',
+  'Say it': 'भन्नुहोस्',
+  'Add many': 'धेरै थप्नुहोस्',
   'Speak like you would to a helper —': 'सहयोगीलाई भनेजस्तै भन्नुहोस् —',
   '🎤 Tap and speak': '🎤 थिच्नुहोस् र बोल्नुहोस्',
   'Thinking…': 'सोच्दै…',
