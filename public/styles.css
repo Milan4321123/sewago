@@ -1606,32 +1606,49 @@ a.link { text-decoration: none; }
   color: var(--accent);
 }
 
-.category-strip {
-  display: flex;
-  gap: 7px;
-  margin-top: 8px;
-  padding: 1px 1px 3px;
-  overflow-x: auto;
-  scrollbar-width: none;
-  scroll-snap-type: x proximity;
+/* Shelves down the left, goods beside them. The rail replaced a horizontally
+   scrolling chip strip where only about two and a half of ten shelves were
+   reachable on a 375px phone without swiping sideways. */
+.shelf-split {
+  display: grid;
+  grid-template-columns: 74px minmax(0, 1fr);
+  gap: 8px;
+  margin-top: 10px;
+  align-items: start;
 }
-.category-strip::-webkit-scrollbar { display: none; }
+.category-rail {
+  position: sticky;
+  top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
 .category-chip {
-  flex: 0 0 auto;
-  padding: 8px 11px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 5px;
+  width: 100%;
+  padding: 8px 7px;
   border: 1px solid var(--border);
-  border-radius: 999px;
+  border-radius: 10px;
   background: rgba(255, 255, 255, 0.05);
   color: var(--muted);
   font: inherit;
-  font-size: 12px;
+  font-size: 10.5px;
   font-weight: 750;
-  white-space: nowrap;
+  line-height: 1.2;
+  text-align: left;
   cursor: pointer;
-  scroll-snap-align: start;
+}
+.category-chip > span {
+  min-width: 0;
+  /* Never ellipsis here: "मसला ..." and "मासु ..." are the same chip to a
+     reader. Two lines of the real name cost less than a guess. */
+  overflow-wrap: anywhere;
 }
 .category-chip b {
-  margin-left: 3px;
+  flex: 0 0 auto;
   color: inherit;
   font-size: 10px;
   opacity: 0.78;
@@ -1653,22 +1670,25 @@ a.link { text-decoration: none; }
 .inventory-results-head .link { padding: 4px 0; font-size: 12px; }
 .compact-empty { padding-top: 28px; padding-bottom: 28px; }
 
+/* Compact by design: the shelf is a list to scan, not a set of posters. The
+   pane is ~250px wide beside the rail, so the photo, meter and action row all
+   shrink and roughly four times as many items fit on one screen. */
 .inventory-item {
-  padding: 12px;
-  margin-bottom: 9px;
+  padding: 9px;
+  margin-bottom: 7px;
 }
 .inventory-item.low { border-color: rgba(248, 113, 113, 0.42); }
 .inventory-item.mid { border-color: rgba(251, 191, 36, 0.35); }
 .inventory-item-main {
   display: grid;
-  grid-template-columns: 58px minmax(0, 1fr) auto;
+  grid-template-columns: 38px minmax(0, 1fr) auto;
   align-items: center;
-  gap: 11px;
+  gap: 8px;
 }
 .item-photo {
   position: relative;
-  width: 58px;
-  height: 58px;
+  width: 38px;
+  height: 38px;
   display: grid;
   place-items: center;
   overflow: hidden;
@@ -1696,12 +1716,13 @@ a.link { text-decoration: none; }
 .item-photo.busy { opacity: 0.7; pointer-events: none; }
 .inventory-item-copy { min-width: 0; }
 .inventory-item-name {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
   overflow: hidden;
-  font-size: 14px;
+  font-size: 13.5px;
   font-weight: 850;
   line-height: 1.25;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 .inventory-item-meta { margin-top: 3px; color: var(--muted); font-size: 12px; }
 .item-category {
@@ -1726,11 +1747,16 @@ a.link { text-decoration: none; }
 .inventory-stock > span { display: block; margin-top: 4px; color: var(--muted); font-size: 10px; white-space: nowrap; }
 .inventory-item-actions {
   display: grid;
-  grid-template-columns: minmax(92px, 1.6fr) repeat(3, auto);
-  gap: 6px;
-  margin-top: 10px;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 5px;
+  margin-top: 8px;
 }
-.inventory-item-actions .btn { min-height: 38px; padding: 8px 11px; }
+.inventory-item-actions .btn {
+  min-height: 36px;
+  padding: 7px 7px;
+  font-size: 11.5px;
+  white-space: nowrap;
+}
 .inventory-item-actions .sold-action { white-space: nowrap; }
 
 .stock-meter {
@@ -1750,12 +1776,13 @@ a.link { text-decoration: none; }
 .stock-meter.mid > div { background: var(--amber); }
 .stock-meter.low > div { background: var(--danger); }
 
+/* These overrides were written when an item row had the whole screen width.
+   Beside the shelf rail the row is ~250px at EVERY phone size, so growing the
+   photo back and letting Sold span its own line just costs three items a
+   screen. Only the sticky-header offset still applies. */
 @media (max-width: 380px) {
   .inventory-browser-controls { top: calc(65px + env(safe-area-inset-top, 0px)); }
-  .inventory-item-main { grid-template-columns: 50px minmax(0, 1fr) auto; gap: 9px; }
-  .item-photo { width: 50px; height: 50px; border-radius: 12px; }
-  .inventory-item-actions { grid-template-columns: 1fr 1fr 44px; }
-  .inventory-item-actions .sold-action { grid-column: 1 / -1; }
+  .shelf-split { grid-template-columns: 68px minmax(0, 1fr); gap: 7px; }
 }
 
 /* Insights — tiny CSS-only charts a cheap phone renders instantly.

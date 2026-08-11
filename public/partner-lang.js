@@ -534,6 +534,8 @@ window.SEWAGO_NE = {
   'Sold': 'बिक्री भयो',
   'Fix this item': 'यो सामान मिलाउनुहोस्',
   'Shelf': 'शेल्फ',
+  'Shelves': 'शेल्फहरू',
+  'More': 'थप',
   'Tell me when it drops below': 'यति भन्दा कम भए भन्नुहोस्',
   'leave blank to work it out from sales': 'खाली छोड्दा बिक्री हेरेर आफैं हिसाब गर्छ',
   'Retire this item? Customers stop seeing it. Your sales history is kept.': 'यो सामान हटाउने? ग्राहकले देख्दैनन्। तपाईंको बिक्री रेकर्ड रहन्छ।',

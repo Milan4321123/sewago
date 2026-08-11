@@ -2827,6 +2827,15 @@ function itemInlineForm(i) {
   // Everything about an item that the server already accepts but the app could
   // never change: a mis-heard name was permanent, and nothing could be filed
   // into a category or retired from the shelf.
+  if (f.kind === 'more') {
+    return `
+    <div class="inline-form">
+      <button class="btn ghost compact" onclick="openItemForm('${i.id}','price')">${t('Price')}</button>
+      <button class="btn ghost compact" onclick="openItemForm('${i.id}','sub')">🔁 ${t('Subscriber price')}</button>
+      <button class="btn ghost compact" onclick="openItemForm('${i.id}','edit')">${t('Fix this item')}</button>
+      <button class="btn ghost compact" onclick="closeItemForm()">${t('Cancel')}</button>
+    </div>`;
+  }
   if (f.kind === 'edit') {
     return `
     <div class="inline-form item-edit">
@@ -3040,20 +3049,28 @@ function categoryCounts() {
   return counts;
 }
 
+// A RAIL, NOT A STRIP. This used to be a horizontally-scrolling row of chips:
+// on a 375px phone about two and a half of ten shelves were reachable without
+// swiping sideways, and the shopkeeper had to remember what was off-screen.
+// Down the left, every shelf is visible at once and the items sit beside it.
+// Order is fixed (the vocabulary's own order, then Other) so a shelf never
+// moves position as counts change — muscle memory is the whole point.
 function categoryChips() {
   const items = (state.inventory && state.inventory.items) || [];
   const counts = categoryCounts();
   const low = items.filter((item) => item.low).length;
+  const known = SHELF_CATEGORIES.filter((c) => counts.has(c)).map((c) => [c, t(c), counts.get(c)]);
+  const other = counts.has('Other') ? [['Other', t('Other'), counts.get('Other')]] : [];
   const chips = [
     ['all', t('All'), items.length],
     ...(low ? [['low', t('Low stock'), low]] : []),
-    ...[...counts.entries()]
-      .sort((a, b) => a[0].localeCompare(b[0]))
-      .map(([category, count]) => [category, t(category), count])
+    ...known,
+    ...other
   ];
   return chips.map(([value, label, count]) => `
     <button class="category-chip ${state.invCategory === value ? 'active' : ''}"
-      onclick="setInvCategory(decodeURIComponent('${encodeURIComponent(value)}'))">${esc(label)} <b>${count}</b></button>`).join('');
+      onclick="setInvCategory(decodeURIComponent('${encodeURIComponent(value)}'))">
+      <span>${esc(label)}</span><b>${count}</b></button>`).join('');
 }
 
 function inventoryResults() {
@@ -3092,6 +3109,13 @@ window.searchInventory = (event) => {
 window.setInvCategory = (category) => {
   state.invCategory = category || 'all';
   updateInventoryBrowser();
+  // Filtering shortens the page under the reader. Scrolled halfway down a long
+  // shelf, picking a category used to leave you below every remaining row,
+  // staring at the bottom of a list you had not seen the top of.
+  const browser = document.querySelector('.inventory-browser');
+  if (browser && browser.getBoundingClientRect().top < 0) {
+    browser.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
 };
 
 window.clearInventoryFilters = () => {
@@ -3233,9 +3257,7 @@ function itemRow(i) {
            </div>`
         : `<button class="btn compact sold-action" onclick="sellQty('${i.id}', 1)" ${out ? 'disabled' : ''}>✓ ${t('Sold 1')}</button>`}
       <button class="btn ghost compact" onclick="openItemForm('${i.id}','restock')">${t('+ Stock')}</button>
-      <button class="btn ghost compact" onclick="openItemForm('${i.id}','price')">${t('Price')}</button>
-      <button class="btn ghost compact" title="${t('Subscriber price')}" onclick="openItemForm('${i.id}','sub')">🔁</button>
-      <button class="btn ghost compact" title="${t('Fix this item')}" onclick="openItemForm('${i.id}','edit')">⋯</button>
+      <button class="btn ghost compact" title="${t('More')}" onclick="openItemForm('${i.id}','more')">⋯</button>
     </div>
     ${itemInlineForm(i)}
   </div>`;
@@ -3372,9 +3394,11 @@ function stockTab(inv) {
           <button id="inventory-search-clear" class="inventory-search-clear ${state.invSearch ? '' : 'hidden'}"
             onclick="clearInventoryFilters()" aria-label="${t('Clear search')}">✕</button>
         </div>
-        <div class="category-strip" id="inventory-categories">${categoryChips()}</div>
       </div>
-      <div id="inventory-results" aria-live="polite">${inventoryResults()}</div>
+      <div class="shelf-split">
+        <nav class="category-rail" id="inventory-categories" aria-label="${t('Shelves')}">${categoryChips()}</nav>
+        <div class="shelf-items" id="inventory-results" aria-live="polite">${inventoryResults()}</div>
+      </div>
     </section>
     ${assistStrip()}
     <div class="divider"></div>
