@@ -80,6 +80,10 @@ const state = {
   helperInvite: null, // { code, name } from a fresh helper invite
   voice: { listening: false, heard: '', error: '' },
   assistOpen: null, // which assistant card is expanded below the shelf: 'say' | 'many' | null
+  pendingSell: {},  // itemId -> { qty, was } counter sales tapped but not yet sent
+  sellTimers: {},   // itemId -> debounce timer for the above
+  shelfOrder: [],   // frozen item order, so a row never moves under the thumb mid-sale
+  shelfStale: 0,    // items that went low since the order was frozen (offer a re-sort)
   // The spoken-command flow: what was heard, and the plan awaiting a yes.
   cmd: { listening: false, heard: '', error: '', busy: false, plan: null }
 };
@@ -2021,6 +2025,7 @@ async function loadInventory() {
   // Keep one complete shelf locally. Search and category taps must feel
   // instant and must never replace the focused input after every letter.
   state.inventory = await api(`/api/partner/stores/${state.activeStore}/inventory`);
+  freezeShelfOrder();
 }
 
 window.openStore = async (id) => {
@@ -2701,13 +2706,92 @@ window.commitDrafts = async () => {
 
 /* ---------------- stock actions ---------------- */
 
-window.markSold = async (itemId, qty) => {
-  try {
-    await api(`/api/partner/stores/${state.activeStore}/items/${itemId}/sold`, { method: 'POST', body: { qty: qty || 1 } });
-    await loadInventory();
-    render();
-  } catch (e) { toast(e.message, true); }
+// Recording a counter sale has to cost nothing, or it does not get recorded.
+//
+// The old path was one tap = one unit = one blocking round trip = a full
+// re-GET of the entire shelf = a full re-render of the app. Selling three kilos
+// of rice meant three of those, and because a sale can flip an item to "low"
+// and the shelf sorts low-first, the row jumped out from under the thumb
+// between taps — so the second tap landed on a different item.
+//
+// Now: the number moves immediately, the taps pile up locally, and ONE request
+// goes out when the shopkeeper stops tapping. The server is the referee — if it
+// refuses (not enough stock), the local guess is rolled back and the real number
+// is shown. Never auto-retry: /sold is not idempotent, so a retried request
+// would sell the same goods twice.
+const SELL_DEBOUNCE_MS = 900;
+
+function itemById(id) {
+  return ((state.inventory && state.inventory.items) || []).find((i) => i.id === id);
+}
+
+window.sellQty = (itemId, delta) => {
+  const item = itemById(itemId);
+  if (!item) return;
+  const pending = state.pendingSell[itemId] || { qty: 0, was: item.stock };
+  const next = pending.qty + delta;
+  if (next < 0) return;                       // never "un-sell" past where we started
+  if (delta > 0 && item.stock <= 0) return;   // nothing left on the shelf
+  pending.qty = next;
+  state.pendingSell[itemId] = pending;
+  item.stock = Math.round((pending.was - next) * 100) / 100;
+  updateInventoryBrowser();
+
+  clearTimeout(state.sellTimers[itemId]);
+  state.sellTimers[itemId] = setTimeout(() => flushSell(itemId), SELL_DEBOUNCE_MS);
 };
+
+async function flushSell(itemId) {
+  const pending = state.pendingSell[itemId];
+  if (!pending || !pending.qty) {
+    delete state.pendingSell[itemId];
+    updateInventoryBrowser();
+    return;
+  }
+  const qty = pending.qty;
+  const was = pending.was;
+  delete state.pendingSell[itemId];
+  const storeId = state.activeStore;
+  try {
+    const res = await api(`/api/partner/stores/${storeId}/items/${itemId}/sold`, {
+      method: 'POST', body: { qty }
+    });
+    if (state.activeStore !== storeId) return; // shopkeeper walked away mid-flight
+    patchItem(res);
+    toast(`${t('Sold')} ${qty} ✓`);
+  } catch (e) {
+    if (state.activeStore !== storeId) return;
+    const item = itemById(itemId);
+    if (item) item.stock = was; // undo the optimistic drop straight away
+    updateInventoryBrowser();
+    toast(e.message, true);
+    // A refusal usually means this shelf is stale — someone sold the same goods
+    // on another phone. Rolling back to our own last guess would keep showing a
+    // number the server disagrees with, so go and get the real one.
+    try {
+      await loadInventory();
+      if (state.activeStore === storeId) updateInventoryBrowser();
+    } catch (_) { /* offline: the rolled-back number is the best we have */ }
+  }
+}
+
+// Every stock write returns the new item and the shop totals, so there is never
+// a reason to re-download the whole shelf to learn a number we were just told.
+function patchItem(res) {
+  const item = res && res.item && itemById(res.item.id);
+  if (item) {
+    for (const field of ['stock', 'price', 'subscribePrice', 'name', 'unit', 'category']) {
+      if (res.item[field] !== undefined) item[field] = res.item[field];
+    }
+    // The write endpoints return the stored item, which carries no computed
+    // low-stock verdict — recompute it here or a restocked row stays red.
+    item.low = (Number(item.stock) || 0) <= (Number(item.lowStockAt) || 0);
+  }
+  if (res && res.stats && state.inventory) state.inventory.stats = res.stats;
+  updateInventoryBrowser();
+}
+
+window.markSold = (itemId) => sellQty(itemId, 1);
 
 // Inline-form expansions on item rows — restock / price / subscriber price all
 // open right under the row that triggered them, one at a time.
@@ -2756,35 +2840,32 @@ window.confirmRestock = async (itemId) => {
   const qty = Number((($(`#if-qty-${itemId}`) || {}).value || ''));
   if (!qty) return toast(t('Enter how many came in.'), true);
   try {
-    await api(`/api/partner/stores/${state.activeStore}/items/${itemId}/restock`, { method: 'POST', body: { qty } });
+    const res = await api(`/api/partner/stores/${state.activeStore}/items/${itemId}/restock`, { method: 'POST', body: { qty } });
     state.itemForm = null;
-    await loadInventory();
+    patchItem(res);
     toast(t('Stock updated ✓'));
-    render();
   } catch (e) { toast(e.message, true); }
 };
 
 window.confirmPrice = async (itemId) => {
   const price = Number((($(`#if-price-${itemId}`) || {}).value || ''));
   try {
-    await api(`/api/partner/stores/${state.activeStore}/items/${itemId}`, { method: 'PATCH', body: { price } });
+    const res = await api(`/api/partner/stores/${state.activeStore}/items/${itemId}`, { method: 'PATCH', body: { price } });
     state.itemForm = null;
-    await loadInventory();
+    patchItem(res);
     toast(t('Price updated ✓'));
-    render();
   } catch (e) { toast(e.message, true); }
 };
 
 window.confirmSubPrice = async (itemId) => {
   const raw = (($(`#if-sub-${itemId}`) || {}).value || '').trim();
   try {
-    await api(`/api/partner/stores/${state.activeStore}/items/${itemId}`, {
+    const res = await api(`/api/partner/stores/${state.activeStore}/items/${itemId}`, {
       method: 'PATCH', body: { subscribePrice: raw ? Number(raw) : 0 }
     });
     state.itemForm = null;
-    await loadInventory();
+    patchItem(res);
     toast(raw ? t('Subscriber price set — regulars pay less ✓') : t('Subscriber price removed'));
-    render();
   } catch (e) { toast(e.message, true); }
 };
 
@@ -2824,9 +2905,52 @@ function visibleInventoryItems() {
   return filtered.sort((a, b) => {
     const rank = shelfSearchRank(a, state.invSearch) - shelfSearchRank(b, state.invSearch);
     if (rank) return rank;
+    // While the shopkeeper is working the shelf, hold the order still. Selling
+    // an item can flip it to "low", and a low-first sort would then teleport
+    // that row to the top mid-sale — so the next tap hits someone else's stock.
+    // The order is re-frozen whenever the shelf is genuinely reloaded.
+    const frozen = state.shelfOrder;
+    if (frozen.length) {
+      const ai = frozen.indexOf(a.id);
+      const bi = frozen.indexOf(b.id);
+      if (ai !== -1 && bi !== -1) return ai - bi;
+      if (ai !== -1) return -1;
+      if (bi !== -1) return 1;
+    }
     return Number(b.low) - Number(a.low) || a.name.localeCompare(b.name);
   });
 }
+
+// The frozen order is taken from a clean sort, so a fresh load always opens
+// with the items that need attention on top.
+function freezeShelfOrder() {
+  const items = ((state.inventory && state.inventory.items) || []).slice();
+  state.shelfOrder = items
+    .sort((a, b) => Number(b.low) - Number(a.low) || a.name.localeCompare(b.name))
+    .map((i) => i.id);
+  state.shelfStale = 0;
+}
+
+// Items that dropped to "low" since the order was frozen. Surfaced as a chip
+// rather than a silent re-sort, so a stockout is never hidden but the shelf
+// also never moves without the shopkeeper asking.
+function countShelfStale() {
+  const frozen = state.shelfOrder;
+  if (!frozen.length) return 0;
+  const items = (state.inventory && state.inventory.items) || [];
+  let n = 0;
+  for (let i = 1; i < frozen.length; i += 1) {
+    const item = items.find((x) => x.id === frozen[i]);
+    const prev = items.find((x) => x.id === frozen[i - 1]);
+    if (item && prev && item.low && !prev.low) n += 1;
+  }
+  return n;
+}
+
+window.resortShelf = () => {
+  freezeShelfOrder();
+  updateInventoryBrowser();
+};
 
 function categoryCounts() {
   const items = (state.inventory && state.inventory.items) || [];
@@ -2860,11 +2984,13 @@ function inventoryResults() {
   const summary = state.invSearch || state.invCategory !== 'all'
     ? t('{n} of {total} items', { n: items.length, total })
     : t('{n} items', { n: total });
+  const stale = countShelfStale();
   return `
     <div class="inventory-results-head">
       <span id="inventory-count">${summary}</span>
       ${(state.invSearch || state.invCategory !== 'all') ? `<button class="link" onclick="clearInventoryFilters()">${t('Clear')}</button>` : ''}
     </div>
+    ${stale ? `<button class="resort-chip" onclick="resortShelf()">↕ ${t('{n} items went low — sort again', { n: stale })}</button>` : ''}
     <div class="inventory-list">
       ${items.length ? items.map(itemRow).join('') : `
       <div class="empty compact-empty"><div class="big">🔎</div>${t('No matching items. Keep typing or clear the filters.')}</div>`}
@@ -2981,6 +3107,7 @@ function helperBlock() {
 function itemRow(i) {
   const stock = Number(i.stock) || 0;
   const out = stock <= 0;
+  const pendingQty = (state.pendingSell[i.id] || {}).qty || 0;
   const photoBusy = state.itemPhotoBusy === i.id;
   const asks = ((state.subReqs[state.activeStore] || {}).pendingByItem || {})[i.id] || 0;
   // The level bar answers "do I need to buy this?" at a glance. Full means a
@@ -3020,7 +3147,13 @@ function itemRow(i) {
       : level === 'low' ? `<div class="muted small" style="color:#fca5a5;margin-top:6px">${t('Running low — reorder soon')}</div>` : ''}
     ${asks ? `<div class="muted small" style="color:var(--accent);margin-top:6px">🔁 ${t('{n} customers asking to subscribe — see the Subscriptions tab', { n: asks })}</div>` : ''}
     <div class="inventory-item-actions">
-      <button class="btn compact sold-action" onclick="markSold('${i.id}', 1)" ${out ? 'disabled' : ''}>✓ ${t('Sold 1')}</button>
+      ${pendingQty
+        ? `<div class="sell-stepper" role="group" aria-label="${t('Sold')}">
+             <button onclick="sellQty('${i.id}', -1)" aria-label="−">−</button>
+             <b>${pendingQty}</b>
+             <button onclick="sellQty('${i.id}', 1)" ${out ? 'disabled' : ''} aria-label="+">+</button>
+           </div>`
+        : `<button class="btn compact sold-action" onclick="sellQty('${i.id}', 1)" ${out ? 'disabled' : ''}>✓ ${t('Sold 1')}</button>`}
       <button class="btn ghost compact" onclick="openItemForm('${i.id}','restock')">${t('+ Stock')}</button>
       <button class="btn ghost compact" onclick="openItemForm('${i.id}','price')">${t('Price')}</button>
       <button class="btn ghost compact" title="${t('Subscriber price')}" onclick="openItemForm('${i.id}','sub')">🔁</button>

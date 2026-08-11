@@ -1530,6 +1530,57 @@ a.link { text-decoration: none; }
   cursor: pointer;
 }
 .inventory-search-clear.hidden { display: none; }
+/* Counter-sale stepper — replaces "Sold 1" on a row the moment the first unit
+   is tapped, so a three-kilo sale is three taps in the SAME place. Sized to the
+   same height as the button it replaces so the row never changes height. */
+.sell-stepper {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px;
+  border: 1px solid rgba(52, 211, 153, 0.5);
+  border-radius: 11px;
+  background: var(--accent-soft);
+}
+.sell-stepper button {
+  width: 34px;
+  height: 30px;
+  border: none;
+  border-radius: 9px;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--accent);
+  font: inherit;
+  font-size: 17px;
+  font-weight: 900;
+  cursor: pointer;
+}
+.sell-stepper button:disabled { opacity: 0.4; }
+.sell-stepper button:active { transform: scale(0.92); }
+.sell-stepper b {
+  min-width: 26px;
+  text-align: center;
+  color: var(--accent);
+  font-size: 15px;
+  font-weight: 900;
+}
+
+/* Offered, never forced: the shelf order is frozen while the shopkeeper works
+   it, so this chip is how a newly-low item asks to be moved up. */
+.resort-chip {
+  display: block;
+  width: 100%;
+  margin: 0 0 8px;
+  padding: 8px 10px;
+  border: 1px dashed rgba(251, 191, 36, 0.5);
+  border-radius: 11px;
+  background: transparent;
+  color: var(--amber);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 750;
+  cursor: pointer;
+}
+
 /* Assistant entry strip — sits BELOW the shelf so the goods come first.
    Two buttons, two jobs: say something, or draft a whole supplier bill. */
 .assist-strip {

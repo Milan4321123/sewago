@@ -187,6 +187,54 @@ test('counter sales and restocks keep the number on screen matching the shelf', 
   assert.ok(reasons.includes('initial_count'));
 });
 
+test('a multi-unit counter sale is recorded as ONE sale, and feeds the sales figures', async () => {
+  // The shelf UI records a three-kilo sale as a single qty-3 sale. The other
+  // multi-unit route a shopkeeper might reach for - a negative "+ Stock" - is
+  // filed as reason 'correction', which moveStock deliberately EXCLUDES from
+  // salesDaily/soldTotal. Recording sales that way would silently starve the
+  // reorder maths and every insight, so pin the difference here.
+  const shop = await openShop();
+  const created = await api(`/partner/stores/${shop.storeId}/items`, {
+    method: 'POST', token: shop.token, body: { name: 'Chamal', unit: 'kg', price: 95, stock: 20 }
+  });
+  const itemId = created.data.item.id;
+
+  const sold = await api(`/partner/stores/${shop.storeId}/items/${itemId}/sold`, {
+    method: 'POST', token: shop.token, body: { qty: 3 }
+  });
+  assert.equal(sold.status, 200, JSON.stringify(sold.data));
+  assert.equal(sold.data.item.stock, 17, 'three kilos left the shelf');
+
+  const moves = await api(`/partner/stores/${shop.storeId}/moves`, { token: shop.token });
+  const sales = moves.data.moves.filter((m) => m.itemId === itemId && m.reason === 'sale_counter');
+  assert.equal(sales.length, 1, 'one sale, not three separate one-unit rows');
+  assert.equal(sales[0].qty, -3, 'and it carries the whole quantity');
+
+  // It reaches the sales figures the reorder list and insights are built on.
+  const insights = await api(`/partner/stores/${shop.storeId}/insights?since=${Date.now() - 3600000}`, { token: shop.token });
+  const row = insights.data.topItems.find((x) => x.itemId === itemId);
+  assert.ok(row, 'the sale shows up in insights');
+  assert.equal(row.qty, 3, 'counted as three units sold, not one');
+
+  // A negative restock is a stock CORRECTION and must never be counted as a sale.
+  await api(`/partner/stores/${shop.storeId}/items/${itemId}/restock`, {
+    method: 'POST', token: shop.token, body: { qty: -2 }
+  });
+  const after = await api(`/partner/stores/${shop.storeId}/insights?since=${Date.now() - 3600000}`, { token: shop.token });
+  assert.equal(
+    after.data.topItems.find((x) => x.itemId === itemId).qty, 3,
+    'a correction adjusts the shelf without inflating sales'
+  );
+
+  // Overselling is still refused outright, and leaves the shelf untouched.
+  const tooMany = await api(`/partner/stores/${shop.storeId}/items/${itemId}/sold`, {
+    method: 'POST', token: shop.token, body: { qty: 999 }
+  });
+  assert.equal(tooMany.status, 400);
+  const shelf = await api(`/partner/stores/${shop.storeId}/inventory`, { token: shop.token });
+  assert.equal(shelf.data.items.find((i) => i.id === itemId).stock, 15, 'refused sale changed nothing');
+});
+
 test("a customer's order view carries the receipt, never the shop's economics", async () => {
   const shop = await openShop();
   const created = await api(`/partner/stores/${shop.storeId}/items`, {
