@@ -54,6 +54,7 @@ const state = {
   activeListing: null, // { kind:'restaurants'|'hotels', id } -> full-screen editor
   confirmReject: '', // order id with the reject inline-form open
   confirmRemove: '', // listing id with the remove inline-form open
+  confirmArchive: '', // item id whose "retire this item" confirmation is open
   pickupFor: '', // store order id with the pickup-code inline-form open
   groupSplit: '', // group order id with the who-pays-what breakdown open
   // General store (kirana) inventory
@@ -2650,7 +2651,7 @@ function draftsCard() {
           ${Object.entries(units).map(([k, u]) => `<option value="${k}" ${k === row.unit ? 'selected' : ''}>${t(u.label)}</option>`).join('')}
         </select>
         <input id="dr-price-${i}" class="${warn(row, 'price')}" type="number" value="${row.price ?? ''}" placeholder="Rs" />
-        <input id="dr-cat-${i}" value="${esc(row.category || '')}" placeholder="${t('Category')}" />
+        ${categoryOptions(row.category || '', `dr-cat-${i}`)}
       </div>
     </div>`).join('')}
     <button class="btn" style="margin-top:12px" onclick="commitDrafts()">${t('Add all {n} to inventory', { n: d.items.length })}</button>
@@ -2806,9 +2807,46 @@ window.closeItemForm = () => {
   render();
 };
 
+// A fixed vocabulary, not free text. Free text becomes "Drinks", "Cold drink"
+// and "Beverage" within a month, and the category rail — the whole point of
+// having categories — stops working. All nine are already translated.
+const SHELF_CATEGORIES = [
+  'Rice & Grains', 'Spices & Oil', 'Snacks', 'Drinks', 'Dairy & Eggs',
+  'Vegetables', 'Household', 'Personal Care', 'Baby & Health'
+];
+
+function categoryOptions(selected, id) {
+  const opts = SHELF_CATEGORIES.map((c) =>
+    `<option value="${esc(c)}" ${c === selected ? 'selected' : ''}>${esc(t(c))}</option>`).join('');
+  return `<select id="${id}"><option value="">${t('Other')}</option>${opts}</select>`;
+}
+
 function itemInlineForm(i) {
   const f = state.itemForm;
   if (!f || f.id !== i.id) return '';
+  // Everything about an item that the server already accepts but the app could
+  // never change: a mis-heard name was permanent, and nothing could be filed
+  // into a category or retired from the shelf.
+  if (f.kind === 'edit') {
+    return `
+    <div class="inline-form item-edit">
+      <span>${t('Fix this item')}</span>
+      <label class="field"><span>${t('Name')}</span>
+        <input id="ie-name-${i.id}" value="${esc(i.name)}" /></label>
+      <label class="field"><span>${t('Shelf')}</span>
+        ${categoryOptions(i.category || '', `ie-cat-${i.id}`)}</label>
+      <label class="field"><span>${t('Tell me when it drops below')}</span>
+        <input id="ie-low-${i.id}" type="number" step="1" min="0" value="${i.lowStockAt || ''}"
+          placeholder="${t('leave blank to work it out from sales')}" /></label>
+      <button class="btn" onclick="saveItemEdit('${i.id}')">${t('Save')}</button>
+      <button class="btn ghost" onclick="closeItemForm()">${t('Cancel')}</button>
+      ${state.confirmArchive === i.id
+        ? `<div class="muted small" style="margin-top:10px">${t('Retire this item? Customers stop seeing it. Your sales history is kept.')}</div>
+           <button class="btn danger" onclick="archiveItem('${i.id}')">${t('Yes, retire it')}</button>
+           <button class="btn ghost" onclick="setConfirmArchive('')">${t('Back')}</button>`
+        : `<button class="btn ghost compact" style="margin-top:10px" onclick="setConfirmArchive('${i.id}')">${t('Retire this item…')}</button>`}
+    </div>`;
+  }
   if (f.kind === 'restock') {
     return `
     <div class="inline-form">
@@ -2835,6 +2873,46 @@ function itemInlineForm(i) {
     <button class="btn ghost" onclick="closeItemForm()">${t('Cancel')}</button>
   </div>`;
 }
+
+window.setConfirmArchive = (id) => {
+  state.confirmArchive = id;
+  renderKeepingForms();
+};
+
+window.saveItemEdit = async (itemId) => {
+  const name = (($(`#ie-name-${itemId}`) || {}).value || '').trim();
+  if (!name) return toast(t('An item needs a name.'), true);
+  const rawLow = (($(`#ie-low-${itemId}`) || {}).value || '').trim();
+  const body = {
+    name,
+    category: (($(`#ie-cat-${itemId}`) || {}).value || ''),
+    // Blank means "work it out from how fast it sells" — the server's own
+    // default — so send 0 rather than a number the shopkeeper did not choose.
+    lowStockAt: rawLow === '' ? 0 : Number(rawLow)
+  };
+  try {
+    const res = await api(`/api/partner/stores/${state.activeStore}/items/${itemId}`, { method: 'PATCH', body });
+    state.itemForm = null;
+    state.confirmArchive = '';
+    // A rename or recategorise changes where the row belongs, so take the
+    // whole shelf again and re-freeze the order.
+    await loadInventory();
+    patchItem(res);
+    toast(t('Saved ✓'));
+    render();
+  } catch (e) { toast(e.message, true); }
+};
+
+window.archiveItem = async (itemId) => {
+  try {
+    await api(`/api/partner/stores/${state.activeStore}/items/${itemId}`, { method: 'DELETE' });
+    state.itemForm = null;
+    state.confirmArchive = '';
+    await loadInventory();
+    toast(t('Item retired — customers no longer see it'));
+    render();
+  } catch (e) { toast(e.message, true); }
+};
 
 window.confirmRestock = async (itemId) => {
   const qty = Number((($(`#if-qty-${itemId}`) || {}).value || ''));
@@ -3157,6 +3235,7 @@ function itemRow(i) {
       <button class="btn ghost compact" onclick="openItemForm('${i.id}','restock')">${t('+ Stock')}</button>
       <button class="btn ghost compact" onclick="openItemForm('${i.id}','price')">${t('Price')}</button>
       <button class="btn ghost compact" title="${t('Subscriber price')}" onclick="openItemForm('${i.id}','sub')">🔁</button>
+      <button class="btn ghost compact" title="${t('Fix this item')}" onclick="openItemForm('${i.id}','edit')">⋯</button>
     </div>
     ${itemInlineForm(i)}
   </div>`;

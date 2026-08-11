@@ -187,6 +187,50 @@ test('counter sales and restocks keep the number on screen matching the shelf', 
   assert.ok(reasons.includes('initial_count'));
 });
 
+test('a shopkeeper can fix, recategorise and retire an item; a helper cannot', async () => {
+  // The app could never change any of this until now, so a mis-heard voice item
+  // was permanent and nothing could be filed into a category - which is what the
+  // category rail is built on.
+  const shop = await openShop();
+  const created = await api(`/partner/stores/${shop.storeId}/items`, {
+    method: 'POST', token: shop.token, body: { name: 'Chini', unit: 'kg', price: 100, stock: 12 }
+  });
+  const itemId = created.data.item.id;
+
+  const fixed = await api(`/partner/stores/${shop.storeId}/items/${itemId}`, {
+    method: 'PATCH', token: shop.token,
+    body: { name: 'Chini (Mauri)', category: 'Rice & Grains', lowStockAt: 4 }
+  });
+  assert.equal(fixed.status, 200, JSON.stringify(fixed.data));
+
+  const shelf = await api(`/partner/stores/${shop.storeId}/inventory`, { token: shop.token });
+  const row = shelf.data.items.find((i) => i.id === itemId);
+  assert.equal(row.name, 'Chini (Mauri)');
+  assert.equal(row.category, 'Rice & Grains');
+  assert.equal(row.lowStockAt, 4, 'the shopkeeper\'s own threshold wins over the computed one');
+  assert.equal(row.low, false, '12 kg is above the threshold of 4');
+
+  // A helper counts stock; they must not be able to rename or retire a line.
+  const invite = await api(`/partner/stores/${shop.storeId}/helpers`, {
+    method: 'POST', token: shop.token, body: { name: 'Counter helper' }
+  });
+  const helper = await registerUser('edit-helper');
+  await api('/stores/helper/join', { method: 'POST', token: helper.token, body: { code: invite.data.invite.code } });
+  const sneak = await api(`/partner/stores/${shop.storeId}/items/${itemId}`, {
+    method: 'PATCH', token: helper.token, body: { price: 1 }
+  });
+  assert.equal(sneak.status, 401, 'a customer/helper token cannot reach shopkeeper-only item edits');
+
+  // Retiring hides it from customers but keeps the shop's own history.
+  const retired = await api(`/partner/stores/${shop.storeId}/items/${itemId}`, { method: 'DELETE', token: shop.token });
+  assert.equal(retired.status, 200, JSON.stringify(retired.data));
+  const after = await api(`/partner/stores/${shop.storeId}/inventory`, { token: shop.token });
+  assert.ok(!after.data.items.find((i) => i.id === itemId), 'retired items leave the shelf');
+  const shopper = await registerUser('retire-watcher');
+  const front = await api(`/stores/${shop.storeId}`, { token: shopper.token });
+  assert.ok(!front.data.items.find((i) => i.id === itemId), 'and customers stop seeing it');
+});
+
 test('a multi-unit counter sale is recorded as ONE sale, and feeds the sales figures', async () => {
   // The shelf UI records a three-kilo sale as a single qty-3 sale. The other
   // multi-unit route a shopkeeper might reach for - a negative "+ Stock" - is
